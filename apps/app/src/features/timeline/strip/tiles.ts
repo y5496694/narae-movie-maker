@@ -1,0 +1,294 @@
+/**
+ * Which frames a clip's filmstrip needs, and where each one goes.
+ *
+ * All of the awkwardness here comes from one constraint: decoding a frame costs
+ * tens of milliseconds, and the timeline redraws on every scroll, zoom and
+ * drag. So the tile a given pixel wants must be **stable** — if it changed
+ * continuously with zoom, every frame of a zoom gesture would miss the cache and
+ * queue a fresh decode that arrives too late to be used.
+ *
+ * Quantising the source position fixes that. A tile addresses a rounded instant
+ * in the source file rather than an exact one, so panning a few pixels or
+ * nudging the zoom keeps asking for the same handful of frames.
+ *
+ * This module is pure: no decoder, no canvas, no DOM. It is where the real
+ * coverage lives.
+ */
+
+import { msToPxSigned, pxToMsSigned } from "../geometry";
+import { curveSourceAt, type SpeedCurve } from "../speedCurve";
+import { DEFAULT_FPS, frameToMs, msToFrame, normalizeFps } from "../frames";
+import { DEFAULT_TRACK_HEIGHT, MAX_TRACK_HEIGHT } from "../trackHeights";
+
+/**
+ * Rungs the quantum can take, in **frames**.
+ *
+ * A ladder rather than a continuous function so that zooming lands on the same
+ * rung across a range of scales, which is what makes cache keys survive a zoom.
+ *
+ * Frames rather than the round milliseconds this used to use — `[250, 500,
+ * 1000, ...]` — because 250ms was the finest rung and that is no longer fine
+ * enough. A tile is `clipH * aspect ≈ 71px` wide, so at the zoom where a frame
+ * is 50px one tile spans 24ms: fifteen consecutive tiles quantised to the same
+ * 250ms instant and the strip drew the same picture ten times in a row, under a
+ * grid claiming each column was a different frame.
+ *
+ * Powers of two, so a rung is always a whole number of frames and adjacent
+ * rungs stay far enough apart to be stable under a zoom nudge.
+ */
+export const TILE_QUANTA_FRAMES = [
+  1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096,
+] as const;
+
+export type FilmstripTile = {
+  /** Cache key: the frame this tile shows, at its decode rung. */
+  key: string;
+  localpath: string;
+  /** Quantised position in the source file, in source ms. */
+  sourceMs: number;
+  /**
+   * Where the tile's left edge sits at its natural width, which may be left of
+   * the clip: the first tile of a head-trimmed clip is cut, not shifted.
+   */
+  tileX: number;
+  /** The visible part of the tile, clipped to the clip. */
+  dx: number;
+  dy: number;
+  dw: number;
+  dh: number;
+  /**
+   * Horizontal fraction of the tile that is visible, 0..1.
+   *
+   * The last tile of a strip is nearly always cut off by the clip's edge, and
+   * the first one is whenever the head has been trimmed.
+   */
+  swFrac: number;
+};
+
+export type FilmstripPlan = {
+  tiles: FilmstripTile[];
+  quantum: number;
+  /** Natural width of one tile, before the last one is clipped. */
+  tileW: number;
+  /**
+   * The size to decode each tile at, which is not the size it is drawn at:
+   * the height is `decodeRungFor(clipH)` and the width follows the source's
+   * aspect at that height. `drawImage` scales it into `tileW x clipH`.
+   */
+  decodeW: number;
+  decodeH: number;
+};
+
+/**
+ * The heights tiles are decoded at.
+ *
+ * A row can be any whole height from 32 to 200, and a tile's cache key holds
+ * the height it was decoded at. Keyed by the row's own height, a resize drag
+ * would ask for a fresh decode of every frame on screen at every pixel it
+ * crossed. Keyed by a rung, a drag from one end of the range to the other
+ * crosses six, and a frame decoded at a rung serves every height up to it.
+ *
+ * The first rung is the default row height, so a row nobody resized decodes
+ * and keys exactly as it did before rows could be resized. The last is the
+ * tallest a row can be, so nothing is ever drawn larger than it was decoded.
+ * In between, steps of about 1.4x, so a tile is decoded at no more than about
+ * twice the pixels it is drawn at.
+ */
+export const FILMSTRIP_DECODE_RUNGS = [
+  DEFAULT_TRACK_HEIGHT,
+  56,
+  80,
+  112,
+  160,
+  MAX_TRACK_HEIGHT,
+] as const;
+
+/** The smallest rung at least `clipH` tall, or the top rung. */
+export function decodeRungFor(clipH: number): number {
+  for (const rung of FILMSTRIP_DECODE_RUNGS) {
+    if (rung >= clipH) {
+      return rung;
+    }
+  }
+  return FILMSTRIP_DECODE_RUNGS[FILMSTRIP_DECODE_RUNGS.length - 1];
+}
+
+/**
+ * The same frame at every other rung, best first, for drawing while the right
+ * one decodes.
+ *
+ * Larger rungs first, nearest first, because shrinking a bitmap looks better
+ * than enlarging one; then smaller ones, nearest first. A resize drag crosses
+ * into a new rung with every frame on screen already decoded at the last one,
+ * so this is what keeps the strip from flashing to flat colour at each rung.
+ */
+export function fallbackTileKeys(
+  localpath: string,
+  sourceMs: number,
+  rung: number,
+): string[] {
+  const larger = FILMSTRIP_DECODE_RUNGS.filter((r) => r > rung);
+  const smaller = FILMSTRIP_DECODE_RUNGS.filter((r) => r < rung).reverse();
+  return [...larger, ...smaller].map((r) => tileKey(localpath, sourceMs, r));
+}
+
+/**
+ * The largest rung that still fits inside one tile's worth of source time.
+ *
+ * It has to be *at most* the tile span, not at least: a quantum coarser than
+ * the spacing rounds neighbouring tiles onto the same instant, and the strip
+ * shows the same frame twice in a row instead of advancing.
+ *
+ * Below the finest rung there is nothing smaller to pick, so very zoomed-in
+ * strips do repeat frames — the right trade, since a tile there is a few pixels
+ * wide and each distinct frame costs a decode.
+ */
+export function chooseQuantumFrames(
+  spanMs: number,
+  fps: number = DEFAULT_FPS,
+): number {
+  const rate = normalizeFps(fps);
+  // Typed wider than the `as const` literal so the loop can assign into it.
+  let chosen: number = TILE_QUANTA_FRAMES[0];
+  for (const rung of TILE_QUANTA_FRAMES) {
+    if (frameToMs(rung, rate) <= spanMs) {
+      chosen = rung;
+    }
+  }
+  return chosen;
+}
+
+/** The same rung, expressed in source ms. */
+export function chooseQuantum(
+  spanMs: number,
+  fps: number = DEFAULT_FPS,
+): number {
+  return frameToMs(chooseQuantumFrames(spanMs, fps), normalizeFps(fps));
+}
+
+/** The cache key for one frame. Shared across clips cut from the same file. */
+export function tileKey(
+  localpath: string,
+  sourceMs: number,
+  tileH: number,
+): string {
+  return `${localpath}|${sourceMs}|${tileH}`;
+}
+
+export type FilmstripInput = {
+  localpath: string;
+  /** Clip rect on the canvas. */
+  clipX: number;
+  clipY: number;
+  clipW: number;
+  clipH: number;
+  /** Source ms shown at the clip's left edge. */
+  sourceInMs: number;
+  speed: number;
+  /** The clip's ramp, prepared, or absent for a constant rate. */
+  curve?: SpeedCurve | null;
+  /** Source width / height; controls how wide one frame is drawn. */
+  sourceAspect: number;
+  range: number;
+  /** Project frame rate; the quantum ladder is measured in frames. */
+  fps?: number;
+  /** Visible x window, so off-screen tiles are never requested. */
+  viewportX0: number;
+  viewportX1: number;
+};
+
+export function planFilmstrip(input: FilmstripInput): FilmstripPlan {
+  const {
+    localpath,
+    clipX,
+    clipY,
+    clipW,
+    clipH,
+    sourceInMs,
+    speed,
+    curve,
+    sourceAspect,
+    range,
+    viewportX0,
+    viewportX1,
+  } = input;
+
+  const fps = normalizeFps(input.fps);
+  const tileW = Math.max(1, Math.round(clipH * sourceAspect));
+  const decodeH = decodeRungFor(clipH);
+  const decodeW = Math.max(1, Math.round(decodeH * sourceAspect));
+  const tileSpanTimelineMs = pxToMsSigned(tileW, range);
+  // The mean rate is the right ladder for the clip as a whole: the quantum is
+  // one decision for the whole strip, and a ramp's own extremes would size it
+  // for footage most of the strip does not show.
+  const quantumFrames = chooseQuantumFrames(
+    Math.abs(tileSpanTimelineMs * speed),
+    fps,
+  );
+  const quantum = frameToMs(quantumFrames, fps);
+
+  // The grid is anchored where source time 0 would sit on the timeline, not at
+  // the clip's left edge. A head trim moves the edge and the trim point
+  // together, so this anchor stays put and the edge slides over a strip that
+  // does not move, the same way a tail trim already looked. Anchored at the
+  // edge instead, every tile rode along with it and the whole strip appeared
+  // to be pushed rather than cut.
+  //
+  // A ramped clip cannot have that anchor: a fixed pixel pitch no longer maps
+  // to a fixed source pitch, so "where source 0 would sit" is not one pixel
+  // that the whole strip can be laid out from. It is anchored at the edge
+  // instead and pays the re-decode on a head trim, which only ramped clips do.
+  const originX =
+    curve == null ? clipX - msToPxSigned(sourceInMs / speed, range) : clipX;
+  const clipRight = clipX + clipW;
+
+  // Only the indices that touch both the clip and the viewport. Cull before
+  // quantising: an off-screen tile should not even be asked for, or a long
+  // clip would queue hundreds of decodes nobody can see. The epsilon keeps a
+  // grid line that lands exactly on an edge from yielding a zero-width tile
+  // through floating-point noise.
+  const EPS = 1e-6;
+  const left = Math.max(clipX, viewportX0);
+  const right = Math.min(clipRight, viewportX1);
+  const first = Math.max(0, Math.floor((left - originX) / tileW + EPS));
+  const last = Math.ceil((right - originX) / tileW - EPS);
+
+  const tiles: FilmstripTile[] = [];
+
+  for (let i = first; i < last; i++) {
+    const tileX = originX + i * tileW;
+    const dx = Math.max(tileX, clipX);
+    const dw = Math.min(tileX + tileW, clipRight) - dx;
+    if (dw <= 0) {
+      continue;
+    }
+
+    const exactSourceMs =
+      curve == null
+        ? pxToMsSigned(i * tileW, range) * speed
+        : curveSourceAt(curve, sourceInMs, pxToMsSigned(i * tileW, range));
+    // Quantised through the frame index rather than by dividing milliseconds:
+    // one frame at 60fps is 16.666…ms, so `floor(ms / quantum) * quantum` drifts
+    // off the grid and gives two neighbouring tiles different keys for the same
+    // frame — which is exactly the cache miss this module exists to avoid.
+    const frame = Math.max(
+      0,
+      Math.floor(msToFrame(exactSourceMs, fps) / quantumFrames) * quantumFrames,
+    );
+    const sourceMs = frameToMs(frame, fps);
+
+    tiles.push({
+      key: tileKey(localpath, sourceMs, decodeH),
+      localpath,
+      sourceMs,
+      tileX,
+      dx,
+      dy: clipY,
+      dw,
+      dh: clipH,
+      swFrac: dw / tileW,
+    });
+  }
+
+  return { tiles, quantum, tileW, decodeW, decodeH };
+}

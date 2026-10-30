@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>CartCut Automatic Caption</title>
+
+    <!-- A Vite dev shell for working on this component alone; Electron never
+         loads it. In the app the component is part of the editor bundle —
+         apps/app/src/ui/control/Control.ts imports the source directly — so it
+         gets Bootstrap and the fonts from apps/app/index.html.
+         The CDN <link>s and <script>s that used to be here have gone: the app
+         has to run offline. `bootstrap` is undefined when this shell is served
+         on its own, which only affects the modals under `npm run dev`. -->
+
+    <link rel="stylesheet" href="./src/index.css" />
+    <script type="module" src="./src/app.ts"></script>
+  </head>
+  <body>
+    <simple-app></simple-app>
+  </body>
+</html>

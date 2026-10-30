@@ -1,0 +1,1168 @@
+import { describe, it, expect } from "vitest";
+import {
+  PLAYING_DRIFT_TOLERANCE_SEC,
+  RATE_LOOKAHEAD_MS,
+  applyIntent,
+  intentFor,
+  playbackRateFor,
+  syncPlayback,
+  type MediaHandle,
+} from "./playback";
+import { splitAt, withSpeedCurve } from "./clipEdit";
+import { sourceTimeAt, spanLength, speedAt, speedOf } from "./geometry";
+import { MAX_CURVE_POINTS, MIN_CURVE_GAP_MS } from "./speedCurve";
+import { seededRandom } from "./testing";
+import { moveClip } from "./clipOps";
+import {
+  SCHEMA_VERSION,
+  createTrack,
+  normalizeDocument,
+  type TimelineDocument,
+} from "./tracks";
+import { audioElement, imageElement, videoElement } from "../renderer/testing";
+import { cursorAtElapsed } from "./playbackClock";
+
+/** Stands in for a `<video>`; records everything this layer does to it. */
+function fakeVideo(over: Partial<MediaHandle> = {}) {
+  return {
+    currentTime: 0,
+    muted: false,
+    volume: 1,
+    playbackRate: 1,
+    paused: true,
+    play() {
+      (this as any).paused = false;
+    },
+    pause() {
+      (this as any).paused = true;
+    },
+    ...over,
+  };
+}
+
+/** A 10s source, 4s of it used from 2s in, sitting at 5s on the timeline. */
+function clip(over = {}) {
+  return videoElement({
+    startTime: 5000,
+    duration: 4000,
+    speed: 1,
+    trim: { startTime: 2000, endTime: 6000 },
+    sourceDuration: 10_000,
+    ...over,
+  });
+}
+
+function doc(elements: Record<string, any>): TimelineDocument {
+  return normalizeDocument({
+    schemaVersion: SCHEMA_VERSION,
+    tracks: [createTrack("v1", "video", 0)],
+    elements,
+  });
+}
+
+describe("intentFor", () => {
+  it("maps the playhead to the matching source frame", () => {
+    const intent = intentFor(clip(), 6000, true);
+    expect(intent.sourceTimeSec).toBe(3);
+    expect(intent.inWindow).toBe(true);
+  });
+
+  it("plays and unmutes only inside the clip's window", () => {
+    expect(intentFor(clip(), 6000, true)).toMatchObject({
+      muted: false,
+      playing: true,
+    });
+    expect(intentFor(clip(), 1000, true)).toMatchObject({
+      muted: true,
+      playing: false,
+    });
+    expect(intentFor(clip(), 20_000, true)).toMatchObject({
+      muted: true,
+      playing: false,
+    });
+  });
+
+  it("reports the clip's authored level", () => {
+    expect(intentFor(clip(), 6000, true).volume).toBe(1);
+    expect(intentFor(clip({ volumeDb: -6 }), 6000, true).volume).toBe(0.501187);
+    expect(intentFor(clip({ volumeDb: -60 }), 6000, true).volume).toBe(0);
+  });
+
+  it("reports the level independently of the window", () => {
+    // Level and mute are orthogonal: `muted` is positional and flips with the
+    // playhead, the level is document state and only the user changes it.
+    const mixed = clip({ volumeDb: -6 });
+    for (const cursor of [1000, 6000, 20_000]) {
+      expect(intentFor(mixed, cursor, true).volume).toBe(0.501187);
+    }
+  });
+
+  it("reports a level for a video whose audio has been detached", () => {
+    // Silenced by `muted`, but the level is kept — the clip is still rolling
+    // for its picture, and re-attaching later must not have lost it.
+    const detached = clip({ volumeDb: -6, audioDetached: true });
+    expect(intentFor(detached, 6000, true)).toMatchObject({
+      muted: true,
+      volume: 0.501187,
+      playing: true,
+    });
+  });
+
+  it("never asks for a negative position for a clip still ahead", () => {
+    // Browsers silently pin a negative currentTime to 0, which left the clip
+    // playing the wrong footage for the rest of the session.
+    const intent = intentFor(clip(), 0, true);
+    expect(intent.sourceTimeSec).toBeGreaterThanOrEqual(0);
+    expect(intent.sourceTimeSec).toBe(2);
+  });
+
+  it("parks a clip that has not started at its trim-in point", () => {
+    // So entering the window shows the right frame immediately.
+    expect(intentFor(clip(), 0, true).sourceTimeSec).toBe(2);
+  });
+
+  it("parks a finished clip at its trim-out point", () => {
+    expect(intentFor(clip(), 50_000, true).sourceTimeSec).toBe(6);
+  });
+
+  it("is silent everywhere when playback is stopped", () => {
+    expect(intentFor(clip(), 6000, false).playing).toBe(false);
+  });
+
+  it("carries the clip's rate", () => {
+    expect(intentFor(clip({ speed: 2 }), 6000, true).rate).toBe(2);
+  });
+
+  it("advances through the source at the clip's rate", () => {
+    // 4s of source at 2x occupies 2s of timeline: halfway is 1s in.
+    const fast = clip({ speed: 2 });
+    expect(intentFor(fast, 6000, true).sourceTimeSec).toBe(4);
+  });
+
+  it("treats the window as half-open, like every other span check", () => {
+    expect(intentFor(clip(), 5000, true).inWindow).toBe(true);
+    expect(intentFor(clip(), 8999, true).inWindow).toBe(true);
+    expect(intentFor(clip(), 9000, true).inWindow).toBe(false);
+  });
+
+  it("handles an audio clip the same way", () => {
+    const song = audioElement({
+      startTime: 1000,
+      duration: 2000,
+      trim: { startTime: 8000, endTime: 10_000 },
+      sourceDuration: 30_000,
+    });
+    expect(intentFor(song, 2000, true).sourceTimeSec).toBe(9);
+    expect(intentFor(song, 500, true).muted).toBe(true);
+  });
+});
+
+describe("a video whose audio has been detached", () => {
+  const detached = () => clip({ audioDetached: true });
+
+  it("is silent inside its own window", () => {
+    // Without this the preview plays the clip twice — once from the `<video>`
+    // handle and once from the audio clip that now owns the sound.
+    expect(intentFor(detached(), 6000, true).muted).toBe(true);
+  });
+
+  it("keeps rolling, because the picture comes off the same handle", () => {
+    // Muting and pausing are different decisions. Pausing here would freeze
+    // the frame the moment a user detached the audio.
+    const intent = intentFor(detached(), 6000, true);
+    expect(intent.playing).toBe(true);
+    expect(intent.inWindow).toBe(true);
+  });
+
+  it("still seeks to the frame the playhead asks for", () => {
+    expect(intentFor(detached(), 6000, true).sourceTimeSec).toBe(
+      intentFor(clip(), 6000, true).sourceTimeSec,
+    );
+  });
+
+  it("plays in sync with the audio clip that took its sound", () => {
+    // The twin copies `startTime`, `trim` and `speed`, so both handles are
+    // asked for the same source second at every cursor. This is the assertion
+    // that would catch a twin built from the wrong fields.
+    const video = clip({ speed: 2 });
+    const twin = audioElement({
+      startTime: video.startTime,
+      duration: video.duration,
+      trim: { ...video.trim },
+      sourceDuration: video.sourceDuration,
+      speed: video.speed,
+    });
+
+    for (const cursor of [5000, 5500, 6000, 6800]) {
+      expect(intentFor(twin, cursor, true).sourceTimeSec).toBe(
+        intentFor(video, cursor, true).sourceTimeSec,
+      );
+    }
+  });
+
+  it("silences the handle without silencing the twin", () => {
+    const video = detached();
+    const twin = audioElement({
+      startTime: video.startTime,
+      duration: video.duration,
+      trim: { ...video.trim },
+      sourceDuration: video.sourceDuration,
+    });
+
+    expect(intentFor(video, 6000, true).muted).toBe(true);
+    expect(intentFor(twin, 6000, true).muted).toBe(false);
+  });
+
+  it("stays silent when the flag is absent but the file has no audio", () => {
+    expect(intentFor(clip({ isExistAudio: false }), 6000, true).muted).toBe(
+      true,
+    );
+  });
+
+  it("leaves an ordinary video audible", () => {
+    expect(intentFor(clip(), 6000, true).muted).toBe(false);
+  });
+});
+
+describe("the drag-drift bug", () => {
+  it("shows the same footage after a clip is moved", () => {
+    // The bug: playback used a snapshot of the clip taken when the file
+    // loaded, so the error equalled the drag distance. Taking the live element
+    // makes that unrepresentable.
+    const before = clip();
+    const source = intentFor(before, 6000, true).sourceTimeSec;
+
+    const moved = { ...before, startTime: before.startTime + 3000 };
+    const after = intentFor(moved, 9000, true).sourceTimeSec;
+
+    expect(after).toBe(source);
+  });
+
+  it("stays correct however far the clip is dragged", () => {
+    const base = clip();
+    for (const shift of [100, 1000, 7500, 60_000]) {
+      const moved = { ...base, startTime: base.startTime + shift };
+      // The same offset into the clip must always be the same frame.
+      expect(intentFor(moved, 6000 + shift, true).sourceTimeSec).toBe(3);
+    }
+  });
+
+  it("survives a real move through clipOps", () => {
+    const base = doc({ a: clip({ trackId: "v1" }) });
+    const moved = moveClip(base, "a", 4000);
+    expect(intentFor(moved.elements.a, 10_000, true).sourceTimeSec).toBe(3);
+  });
+});
+
+describe("the audio-overlap bug", () => {
+  it("gives each half of a split its own source window", () => {
+    const parts = splitAt(clip(), 7000)!;
+    // Left half covers source 2..4s, right half 4..6s.
+    expect(intentFor(parts.left, 6000, true).sourceTimeSec).toBe(3);
+    expect(intentFor(parts.right, 8000, true).sourceTimeSec).toBe(5);
+  });
+
+  it("silences the half the playhead has left", () => {
+    // This is the actual complaint: after the cut, the first half kept
+    // sounding over the second.
+    const parts = splitAt(clip(), 7000)!;
+    const left = fakeVideo();
+    const right = fakeVideo();
+
+    const cut = doc({ a: parts.left, b: { ...parts.right, trackId: "v1" } });
+    syncPlayback(cut, 8000, true, { a: left, b: right });
+
+    expect(left.muted).toBe(true);
+    expect(left.paused).toBe(true);
+    expect(right.muted).toBe(false);
+    expect(right.paused).toBe(false);
+  });
+
+  it("never lets two handles sound at once", () => {
+    // Clips on a track cannot overlap, so at most one can be audible.
+    const parts = splitAt(clip(), 7000)!;
+    const handles = { a: fakeVideo(), b: fakeVideo() };
+    const cut = doc({ a: parts.left, b: { ...parts.right, trackId: "v1" } });
+
+    for (let t = 0; t <= 12_000; t += 250) {
+      syncPlayback(cut, t, true, handles);
+      const audible = Object.values(handles).filter(
+        (h) => !h.muted && !h.paused,
+      );
+      expect(audible.length).toBeLessThanOrEqual(1);
+    }
+  });
+
+  it("silences a clip the moment the playhead leaves it", () => {
+    const handle = fakeVideo();
+    const only = doc({ a: clip() });
+
+    syncPlayback(only, 6000, true, { a: handle });
+    expect(handle.muted).toBe(false);
+
+    syncPlayback(only, 9000, true, { a: handle });
+    expect(handle.muted).toBe(true);
+    expect(handle.paused).toBe(true);
+  });
+
+  it("silences a handle whose clip has been deleted", () => {
+    const handle = fakeVideo({ muted: false });
+    handle.play();
+
+    syncPlayback(doc({}), 1000, true, { a: handle });
+
+    expect(handle.muted).toBe(true);
+    expect(handle.paused).toBe(true);
+  });
+
+  it("leaves an orphaned handle's volume alone", () => {
+    // Muted and paused is already completely silent, and this branch has no
+    // change guard — it runs every frame — so a volume write here would cost
+    // one pointless assignment per frame per orphan, forever. The level lives
+    // in the document, so an undo re-derives it.
+    const handle = fakeVideo({ muted: false, volume: 0.5 });
+    syncPlayback(doc({}), 1000, true, { a: handle });
+    expect(handle.volume).toBe(0.5);
+  });
+});
+
+describe("applyIntent", () => {
+  it("seeks a paused handle exactly, so scrubbing moves the frame", () => {
+    const handle = fakeVideo({ currentTime: 3, paused: true });
+    applyIntent(handle, intentFor(clip(), 6100, false));
+    expect(handle.currentTime).toBeCloseTo(3.1);
+  });
+
+  it("leaves a rolling handle alone at the offset healthy playback has", () => {
+    // A media element settles a constant ~40ms behind the wall clock because
+    // starting playback costs a few frames. Correcting that is what made the
+    // picture judder: each seek starved the decoder into falling further
+    // behind, so we seeked again — about 23 times a second.
+    const handle = fakeVideo({ currentTime: 3 - 0.04, paused: false });
+    applyIntent(handle, intentFor(clip(), 6000, true));
+    expect(handle.currentTime).toBe(3 - 0.04);
+  });
+
+  it("pulls a rolling handle back only on a real desync", () => {
+    const handle = fakeVideo({ currentTime: 1.2, paused: false });
+    applyIntent(handle, intentFor(clip(), 6000, true));
+    expect(handle.currentTime).toBe(3);
+  });
+
+  it("takes the rolling tolerance boundary as stated", () => {
+    const under = fakeVideo({
+      currentTime: 3 + PLAYING_DRIFT_TOLERANCE_SEC * 0.9,
+      paused: false,
+    });
+    applyIntent(under, intentFor(clip(), 6000, true));
+    expect(under.currentTime).not.toBe(3);
+
+    const over = fakeVideo({
+      currentTime: 3 + PLAYING_DRIFT_TOLERANCE_SEC * 1.1,
+      paused: false,
+    });
+    applyIntent(over, intentFor(clip(), 6000, true));
+    expect(over.currentTime).toBe(3);
+  });
+
+  it("places a clip exactly when it is entered, not loosely", () => {
+    // The generous window is only for a handle already rolling. One starting
+    // up must land on its first frame, or the cut shows the wrong footage.
+    const handle = fakeVideo({ currentTime: 2, paused: true });
+    applyIntent(handle, intentFor(clip(), 6000, true));
+    expect(handle.currentTime).toBe(3);
+    expect(handle.paused).toBe(false);
+  });
+
+  it("does not rewrite rate or mute that already match", () => {
+    // These run for every clip on every animation frame, and a media element
+    // treats each assignment as a real state change.
+    let rateWrites = 0;
+    let muteWrites = 0;
+    let volumeWrites = 0;
+    let rate = 1;
+    let muted = false;
+    let volume = 1;
+    const handle: MediaHandle = {
+      currentTime: 3,
+      paused: false,
+      play() {},
+      pause() {},
+      get playbackRate() {
+        return rate;
+      },
+      set playbackRate(v: number) {
+        rate = v;
+        rateWrites++;
+      },
+      get muted() {
+        return muted;
+      },
+      set muted(v: boolean) {
+        muted = v;
+        muteWrites++;
+      },
+      get volume() {
+        return volume;
+      },
+      set volume(v: number) {
+        volume = v;
+        volumeWrites++;
+      },
+    };
+
+    for (let i = 0; i < 10; i++) {
+      applyIntent(handle, intentFor(clip(), 6000, true));
+    }
+    expect(rateWrites).toBe(0);
+    expect(muteWrites).toBe(0);
+    // `gainOf` is rounded precisely so this stays 0: an unrounded value that
+    // varied in its last bits would write on every frame, forever.
+    expect(volumeWrites).toBe(0);
+  });
+
+  it("does not write volume when a clip leaves its window", () => {
+    // The reason the intent's volume does not depend on `inWindow`. Crossing a
+    // boundary is a `muted` change and nothing else; if the level tracked the
+    // window it would be rewritten twice on every crossing.
+    let volumeWrites = 0;
+    let volume = 0.501187;
+    const handle: MediaHandle = {
+      currentTime: 3,
+      muted: false,
+      playbackRate: 1,
+      paused: false,
+      play() {},
+      pause() {},
+      get volume() {
+        return volume;
+      },
+      set volume(v: number) {
+        volume = v;
+        volumeWrites++;
+      },
+    };
+
+    const mixed = clip({ volumeDb: -6 });
+    applyIntent(handle, intentFor(mixed, 6000, true)); // inside
+    applyIntent(handle, intentFor(mixed, 20_000, true)); // past the end
+    applyIntent(handle, intentFor(mixed, 6000, true)); // back inside
+    expect(volumeWrites).toBe(0);
+    expect(handle.volume).toBe(0.501187);
+  });
+
+  it("seeks before starting playback", () => {
+    // Otherwise a handle entering its window emits a burst of audio from
+    // wherever it had run on to.
+    const seen: string[] = [];
+    const handle: MediaHandle = {
+      muted: false,
+      volume: 1,
+      playbackRate: 1,
+      paused: true,
+      get currentTime() {
+        return 0;
+      },
+      set currentTime(_v: number) {
+        seen.push("seek");
+      },
+      play() {
+        seen.push("play");
+      },
+      pause() {
+        seen.push("pause");
+      },
+    };
+
+    applyIntent(handle, intentFor(clip(), 6000, true));
+    expect(seen).toEqual(["seek", "play"]);
+  });
+
+  it("does not re-seek a parked handle every frame", () => {
+    // An out-of-window handle sits at a fixed point, so repeated syncs must be
+    // no-ops rather than a seek per animation frame.
+    let seeks = 0;
+    let value = 2;
+    const handle: MediaHandle = {
+      muted: false,
+      volume: 1,
+      playbackRate: 1,
+      paused: true,
+      get currentTime() {
+        return value;
+      },
+      set currentTime(v: number) {
+        value = v;
+        seeks++;
+      },
+      play() {},
+      pause() {},
+    };
+
+    for (let i = 0; i < 10; i++) {
+      applyIntent(handle, intentFor(clip(), 0, true));
+    }
+    expect(seeks).toBe(0);
+  });
+
+  it("sets the playback rate from the clip", () => {
+    const handle = fakeVideo();
+    applyIntent(handle, intentFor(clip({ speed: 2 }), 6000, true));
+    expect(handle.playbackRate).toBe(2);
+  });
+
+  it("sets the volume from the clip's level", () => {
+    const handle = fakeVideo();
+    applyIntent(handle, intentFor(clip({ volumeDb: -6 }), 6000, true));
+    expect(handle.volume).toBe(0.501187);
+    expect(handle.muted).toBe(false);
+  });
+
+  it("silences a clip at the floor without muting it", () => {
+    // Zero gain, not `muted`: mute is where the clip is, level is how loud it
+    // was set. Conflating them would leave nowhere to keep the user's choice.
+    const handle = fakeVideo();
+    applyIntent(handle, intentFor(clip({ volumeDb: -60 }), 6000, true));
+    expect(handle.volume).toBe(0);
+    expect(handle.muted).toBe(false);
+  });
+
+  it("pauses a handle that is playing when it should not be", () => {
+    const handle = fakeVideo({ paused: false });
+    applyIntent(handle, intentFor(clip(), 6000, false));
+    expect(handle.paused).toBe(true);
+  });
+
+  it("does not call play on a handle that is already playing", () => {
+    let plays = 0;
+    const handle: MediaHandle = {
+      currentTime: 3,
+      muted: false,
+      volume: 1,
+      playbackRate: 1,
+      paused: false,
+      play() {
+        plays++;
+      },
+      pause() {},
+    };
+    applyIntent(handle, intentFor(clip(), 6000, true));
+    expect(plays).toBe(0);
+  });
+});
+
+describe("a clip that plays to the end of its file", () => {
+  /**
+   * A `<video>` with the two behaviours of the real element this depends on,
+   * both measured in Chrome: `play()` on an ended element seeks back to the
+   * start, and assigning `currentTime` clears `ended` at once.
+   */
+  function realisticVideo() {
+    let time = 0;
+    const handle = {
+      ...fakeVideo(),
+      ended: false,
+      get currentTime() {
+        return time;
+      },
+      set currentTime(value: number) {
+        time = value;
+        handle.ended = false;
+      },
+      play() {
+        if (handle.ended) {
+          time = 0;
+          handle.ended = false;
+        }
+        handle.paused = false;
+      },
+    };
+    return {
+      handle,
+      /** What the element does by itself when its decode clock reaches the end. */
+      runToEnd(durationSec: number) {
+        time = durationSec;
+        handle.ended = true;
+        handle.paused = true;
+      },
+    };
+  }
+
+  // Out-point at the file's end: 8s of a 10s source from 2s in, at 5s, so the
+  // clip spans [5000, 13000) and its last 60fps frame starts at 12983.3.
+  const toTheEnd = () =>
+    clip({ duration: 8000, trim: { startTime: 2000, endTime: 10_000 } });
+  const FPS = 60;
+  const LAST_FRAME_MS = 12_983.333333333334;
+
+  /** Play from 12.9s, as the preview does, and let the handle reach the end. */
+  function playToTheEnd() {
+    const { handle, runToEnd } = realisticVideo();
+    const one = doc({ a: toTheEnd() });
+    const lastRequests = new Map<string, number>();
+
+    // Pressing play: one exact placement, then the handle rolls.
+    syncPlayback(one, 12_900, true, { a: handle }, undefined, lastRequests, undefined, FPS);
+    expect(handle.paused).toBe(false);
+
+    // It runs ahead of the floored playhead and finishes first.
+    runToEnd(10);
+    return { handle, one, lastRequests };
+  }
+
+  it("is not sent back to its first frame while the playhead is still inside it", () => {
+    const { handle, one, lastRequests } = playToTheEnd();
+
+    // The playhead's last frame inside the clip. Before the guard this repaint
+    // called `play()` on the ended handle and the spec rewound it to 0.
+    syncPlayback(one, LAST_FRAME_MS, true, { a: handle }, undefined, lastRequests, undefined, FPS);
+
+    expect(handle.currentTime).toBe(10);
+    expect(handle.ended).toBe(true);
+
+    // And not on the repaint after it either.
+    syncPlayback(one, LAST_FRAME_MS, true, { a: handle }, undefined, lastRequests, undefined, FPS);
+    expect(handle.currentTime).toBe(10);
+  });
+
+  it("still plays when the playhead is sent back into the clip", () => {
+    const { handle, one, lastRequests } = playToTheEnd();
+
+    // A click on the ruler mid-playback: 6000 on the timeline is 3s of source.
+    syncPlayback(one, 6000, true, { a: handle }, undefined, lastRequests, undefined, FPS);
+
+    expect(handle.paused).toBe(false);
+    expect(handle.currentTime).toBeGreaterThan(2.9);
+    expect(handle.currentTime).toBeLessThan(3.1);
+  });
+});
+
+describe("syncPlayback", () => {
+  it("handles a whole document in one pass", () => {
+    const a = fakeVideo();
+    const b = fakeVideo();
+    const two = doc({
+      a: clip({ startTime: 0, trackId: "v1" }),
+      b: clip({ startTime: 4000, trackId: "v1" }),
+    });
+
+    syncPlayback(two, 5000, true, { a, b });
+
+    expect(a.paused).toBe(true);
+    expect(b.paused).toBe(false);
+  });
+
+  it("ignores elements with no handle", () => {
+    const a = fakeVideo();
+    const two = doc({
+      a: clip({ startTime: 0, trackId: "v1" }),
+      other: imageElement({ trackId: "v1", startTime: 0, duration: 1000 }),
+    });
+    expect(() => syncPlayback(two, 500, true, { a })).not.toThrow();
+  });
+});
+
+/**
+ * A clip parked off the playhead must be seeked once, not once per repaint.
+ *
+ * This is modelled on the project that exposed it: twelve video clips, at most
+ * two of them under the playhead at a time, so ten handles sat parked while the
+ * preview repainted sixty times a second. Because the paused tolerance is zero
+ * and a seek lands on a frame boundary rather than on the millisecond asked
+ * for, every one of those repaints re-issued an identical seek — six hundred
+ * decoder flushes a second, against 3600x2338 120fps H.264 whose keyframes were
+ * up to eight seconds apart.
+ *
+ * The fake below reproduces the mechanism exactly: it snaps `currentTime` to a
+ * frame grid, which is what a real `<video>` does and what makes comparing
+ * `currentTime` to the request a permanently losing test.
+ */
+describe("a parked clip is not re-seeked on every repaint", () => {
+  /** A handle whose seeks land on a frame boundary, as a real one's do. */
+  function frameSnappingVideo(sourceFps: number) {
+    const step = 1 / sourceFps;
+    const handle = fakeVideo();
+    let seeks = 0;
+    return {
+      handle: new Proxy(handle, {
+        set(target, prop, value) {
+          if (prop === "currentTime") {
+            seeks++;
+            // Land on the frame containing the requested instant.
+            (target as any).currentTime = Math.floor(value / step) * step;
+            return true;
+          }
+          (target as any)[prop] = value;
+          return true;
+        },
+      }) as MediaHandle,
+      seekCount: () => seeks,
+    };
+  }
+
+  it("re-seeks on every repaint without the request memory", () => {
+    // The behaviour as it was: `applyIntent` given no `lastRequestedSec`.
+    const { handle, seekCount } = frameSnappingVideo(120);
+    const element = clip({ trim: { startTime: 18_933, endTime: 33_117 } });
+
+    for (let i = 0; i < 60; i++) {
+      // Cursor well before the clip, so it is parked at its trim-in point.
+      applyIntent(handle, intentFor(element, 0, true));
+    }
+
+    expect(seekCount()).toBe(60);
+  });
+
+  it("seeks once when the caller remembers the request", () => {
+    const { handle, seekCount } = frameSnappingVideo(120);
+    const element = clip({ trim: { startTime: 18_933, endTime: 33_117 } });
+    const doc1 = doc({ a: element });
+    const lastRequests = new Map<string, number>();
+
+    for (let i = 0; i < 60; i++) {
+      syncPlayback(doc1, 0, true, { a: handle }, undefined, lastRequests);
+    }
+
+    expect(seekCount()).toBe(1);
+  });
+
+  it("still places the handle exactly when the target moves", () => {
+    const { handle, seekCount } = frameSnappingVideo(120);
+    const element = clip({ trim: { startTime: 18_933, endTime: 33_117 } });
+    const doc1 = doc({ a: element });
+    const lastRequests = new Map<string, number>();
+
+    // Parked before the clip.
+    syncPlayback(doc1, 0, false, { a: handle }, undefined, lastRequests);
+    // Scrubbing inside it: a different target on every tick, so every one of
+    // these must place the handle.
+    for (const cursor of [5100, 5200, 5300, 5400]) {
+      syncPlayback(doc1, cursor, false, { a: handle }, undefined, lastRequests);
+    }
+
+    expect(seekCount()).toBe(5);
+  });
+
+  it("re-places a handle that was released and reloaded", () => {
+    // The map is the caller's, and a fresh handle starts at zero — so the
+    // caller must forget the id. `loadedAssetStore` does this on load and on
+    // release; this pins the consequence of failing to.
+    const element = clip({ trim: { startTime: 18_933, endTime: 33_117 } });
+    const doc1 = doc({ a: element });
+    const lastRequests = new Map<string, number>();
+
+    const first = frameSnappingVideo(120);
+    syncPlayback(doc1, 0, false, { a: first.handle }, undefined, lastRequests);
+    expect(first.seekCount()).toBe(1);
+
+    const replacement = frameSnappingVideo(120);
+    lastRequests.delete("a");
+    syncPlayback(
+      doc1,
+      0,
+      false,
+      { a: replacement.handle },
+      undefined,
+      lastRequests,
+    );
+    expect(replacement.seekCount()).toBe(1);
+  });
+
+  /**
+   * The other half, and the one that actually stalled real footage.
+   *
+   * A clip the playhead has just entered is `playing` in intent but still
+   * `paused` in fact, so it takes the exact tolerance — and because the cursor
+   * is moving its target is a *different* exact value on every repaint, which
+   * `lastRequestedSec` cannot suppress. Each seek flushed the decoder still
+   * working on the previous one, so the handle never buffered, never
+   * un-paused, and was seeked forever. Observed directly on 3600x2338 120fps
+   * footage: two handles pinned at `readyState 1` — metadata and no frames —
+   * taking sixty seeks a second each for as long as playback ran.
+   */
+  describe("a seek already in flight", () => {
+    /**
+     * A handle that cannot start.
+     *
+     * `play()` is a no-op, which is the whole point: a real element whose
+     * decoder is starved stays `paused` however often it is asked to roll, and
+     * that is what puts it on the exact-placement branch every frame.
+     */
+    function stalledVideo(reportsSeeking: boolean) {
+      let seeks = 0;
+      const handle: any = {
+        currentTime: 0,
+        seeking: reportsSeeking ? false : undefined,
+        muted: false,
+        volume: 1,
+        playbackRate: 1,
+        paused: true,
+        play() {},
+        pause() {},
+      };
+      return {
+        handle: new Proxy(handle, {
+          set(target, prop, value) {
+            if (prop === "currentTime") {
+              seeks++;
+              if (reportsSeeking) target.seeking = true;
+            }
+            target[prop] = value;
+            return true;
+          },
+        }) as MediaHandle,
+        raw: handle,
+        seekCount: () => seeks,
+      };
+    }
+
+    /** In its window from 0, so a moving cursor gives a moving target. */
+    const entering = () => doc({ a: clip({ startTime: 0 }) });
+
+    /**
+     * The headline case: a decoder that cannot keep up is placed once and then
+     * left to work, rather than being re-placed as fast as seeks can land.
+     */
+    it("places a stalled handle once and then lets it be", () => {
+      const d = entering();
+      const v = stalledVideo(true);
+      const lastRequests = new Map<string, number>();
+
+      for (let cursor = 100; cursor < 1700; cursor += 16) {
+        syncPlayback(d, cursor, true, { a: v.handle }, undefined, lastRequests);
+      }
+
+      // 1.6s of cursor travel is well inside PLAYING_DRIFT_TOLERANCE_SEC, so
+      // after the entry placement there is nothing worth correcting.
+      expect(v.seekCount()).toBe(1);
+    });
+
+    it("still corrects a handle that has fallen genuinely far behind", () => {
+      const d = entering();
+      const v = stalledVideo(true);
+      const lastRequests = new Map<string, number>();
+
+      syncPlayback(d, 100, true, { a: v.handle }, undefined, lastRequests);
+      expect(v.seekCount()).toBe(1);
+
+      // A jump — clicking the ruler mid-playback — is not drift, and must move
+      // the handle even though it is nominally rolling.
+      v.raw.seeking = false;
+      syncPlayback(d, 3500, true, { a: v.handle }, undefined, lastRequests);
+      expect(v.seekCount()).toBe(2);
+    });
+
+    /**
+     * Scrubbing keeps the exact tolerance, so it is the case where seeks can
+     * still pile up — a pointer moves faster than a 4K seek lands.
+     */
+    it("does not queue a second scrub seek on top of one in flight", () => {
+      const d = entering();
+      const v = stalledVideo(true);
+      const lastRequests = new Map<string, number>();
+
+      // isPlaying false: every one of these is an exact placement.
+      for (let cursor = 100; cursor < 900; cursor += 16) {
+        syncPlayback(d, cursor, false, { a: v.handle }, undefined, lastRequests);
+      }
+
+      expect(v.seekCount()).toBe(1);
+    });
+
+    it("scrubs again as soon as the previous seek lands", () => {
+      const d = entering();
+      const v = stalledVideo(true);
+      const lastRequests = new Map<string, number>();
+
+      syncPlayback(d, 100, false, { a: v.handle }, undefined, lastRequests);
+      expect(v.seekCount()).toBe(1);
+
+      syncPlayback(d, 200, false, { a: v.handle }, undefined, lastRequests);
+      expect(v.seekCount()).toBe(1);
+
+      v.raw.seeking = false;
+      syncPlayback(d, 300, false, { a: v.handle }, undefined, lastRequests);
+      expect(v.seekCount()).toBe(2);
+    });
+
+    it("scrubs every frame when the handle cannot report seeking", () => {
+      // The degraded path: a handle with no `seeking` property is placed on
+      // each move, which is what the code did everywhere before.
+      const d = entering();
+      const v = stalledVideo(false);
+      const lastRequests = new Map<string, number>();
+
+      let ticks = 0;
+      for (let cursor = 100; cursor < 900; cursor += 16) {
+        ticks++;
+        syncPlayback(d, cursor, false, { a: v.handle }, undefined, lastRequests);
+      }
+
+      expect(v.seekCount()).toBe(ticks);
+    });
+
+    // The guard must not change the case that was already correct: a handle
+    // that is actually rolling is governed by the generous tolerance.
+    it("leaves a rolling handle alone", () => {
+      const d = entering();
+      const element = clip({ startTime: 0 });
+      const handle = fakeVideo({ seeking: false });
+      const lastRequests = new Map<string, number>();
+
+      // Start it: one exact placement, then it rolls.
+      syncPlayback(d, 100, true, { a: handle }, undefined, lastRequests);
+      expect(handle.paused).toBe(false);
+
+      let seeks = 0;
+      const counting = new Proxy(handle, {
+        set(t, p, val) {
+          if (p === "currentTime") seeks++;
+          (t as any)[p] = val;
+          return true;
+        },
+      }) as MediaHandle;
+
+      for (let cursor = 116; cursor < 1700; cursor += 16) {
+        // The handle keeps up on its own, a hair behind — the healthy case the
+        // 250ms tolerance exists for.
+        (handle as any).currentTime = sourceTimeAt(element, cursor) / 1000 - 0.03;
+        syncPlayback(d, cursor, true, { a: counting }, undefined, lastRequests);
+      }
+
+      expect(seeks).toBe(0);
+    });
+  });
+
+  it("forgets a handle whose element has gone", () => {
+    const element = clip();
+    const lastRequests = new Map<string, number>([["gone", 1.5]]);
+    syncPlayback(
+      doc({ a: element }),
+      0,
+      false,
+      { gone: fakeVideo() },
+      undefined,
+      lastRequests,
+    );
+    expect(lastRequests.has("gone")).toBe(false);
+  });
+});
+
+/**
+ * Playback now sets the cursor to a frame boundary instead of the raw wall
+ * clock, and `elementTimelineRuler` used to carry a comment warning that
+ * quantizing there would "fight the drift tolerance in `playback.ts`".
+ *
+ * It does not, and the reason is a bound rather than an opinion: flooring moves
+ * the cursor by less than one frame, and one frame is two orders of magnitude
+ * inside `PLAYING_DRIFT_TOLERANCE_SEC`. These tests hold that, by counting the
+ * seeks a real playthrough issues with and without the quantization.
+ */
+describe("a quantized playback cursor", () => {
+  const RATES = [24, 25, 30, 50, 60, 120];
+
+  /**
+   * Play from `0` to `4000ms`, ticking at a display refresh rate that has
+   * nothing to do with the project, and count the seeks `applyIntent` performs.
+   */
+  function seeksDuringPlayback(fps: number, quantize: boolean): number {
+    const element = clip();
+    const handle = fakeVideo();
+    const tickMs = 1000 / 144;
+
+    let seeks = 0;
+    for (let tick = 0; tick * tickMs <= 9000; tick++) {
+      const elapsed = tick * tickMs;
+      const cursor = quantize ? cursorAtElapsed(elapsed, fps) : elapsed;
+      const result = applyIntent(
+        handle,
+        intentFor(element, cursor, true),
+        PLAYING_DRIFT_TOLERANCE_SEC,
+      );
+      if (result.seeked) {
+        seeks++;
+      }
+    }
+    return seeks;
+  }
+
+  it("issues no more seeks than the unquantized cursor did", () => {
+    for (const fps of RATES) {
+      expect(seeksDuringPlayback(fps, true)).toBeLessThanOrEqual(
+        seeksDuringPlayback(fps, false),
+      );
+    }
+  });
+
+  it("does not re-seek on every frame", () => {
+    // The failure mode the tolerance exists to prevent: a seek per tick is the
+    // feedback loop that made a one-frame tolerance unusable.
+    for (const fps of RATES) {
+      expect(seeksDuringPlayback(fps, true)).toBeLessThan(10);
+    }
+  });
+
+  it("keeps the quantization far inside the tolerance, at every rate", () => {
+    // The arithmetic behind the two claims above, stated on its own so a change
+    // to either constant fails here rather than somewhere subtle.
+    for (const fps of RATES) {
+      expect(1000 / fps).toBeLessThan(PLAYING_DRIFT_TOLERANCE_SEC * 1000);
+      expect(1000 / fps).toBeLessThan(PLAYING_DRIFT_TOLERANCE_SEC * 1000 * 0.2);
+    }
+  });
+
+  it("still resolves to the right source instant", () => {
+    // Quantizing the cursor must not move which part of the source is shown by
+    // more than the frame the user is looking at.
+    for (const fps of RATES) {
+      for (let tick = 0; tick < 500; tick++) {
+        const elapsed = 5000 + tick * (1000 / 144);
+        const raw = intentFor(clip(), elapsed, true).sourceTimeSec;
+        const snapped = intentFor(
+          clip(),
+          cursorAtElapsed(elapsed, fps),
+          true,
+        ).sourceTimeSec;
+        expect(Math.abs(raw - snapped)).toBeLessThan(1 / fps);
+      }
+    }
+  });
+
+  it("still enters and leaves a clip's window on the right frame", () => {
+    // Off-by-one at the boundary is what a floor could plausibly cost, so it is
+    // asserted rather than assumed.
+    for (const fps of RATES) {
+      const element = clip();
+      const enter = element.startTime;
+      expect(intentFor(element, cursorAtElapsed(enter, fps), true).inWindow).toBe(
+        true,
+      );
+      expect(
+        intentFor(element, cursorAtElapsed(enter - 1 / fps, fps), true).inWindow,
+      ).toBe(false);
+    }
+  });
+});
+
+describe("playbackRateFor, and the drift it exists to prevent", () => {
+  /** A ten-second clip carrying `points`, starting at the timeline origin. */
+  function ramped(points: Array<{ t: number; v: number }>) {
+    return withSpeedCurve(
+      videoElement({
+        trackId: "v1",
+        startTime: 0,
+        duration: 10_000,
+        sourceDuration: 10_000,
+        trim: { startTime: 0, endTime: 10_000 },
+        speed: 1,
+      }),
+      points,
+    );
+  }
+
+  /**
+   * Where a media handle ends up after playing the clip through at 60Hz.
+   *
+   * The handle advances `rate * dt` of source per repaint, which is what
+   * `playbackRate` means. `sourceTimeAt` is where it should be. The gap between
+   * the two is the drift `applyIntent` re-seeks on.
+   */
+  function worstDriftMs(
+    element: ReturnType<typeof ramped>,
+    rateAt: (el: typeof element, cursorMs: number) => number,
+  ): number {
+    const dt = RATE_LOOKAHEAD_MS;
+    let handle = sourceTimeAt(element, 0);
+    let worst = 0;
+    for (let cursor = 0; cursor < spanLength(element); cursor += dt) {
+      handle += rateAt(element, cursor) * dt;
+      worst = Math.max(
+        worst,
+        Math.abs(handle - sourceTimeAt(element, cursor + dt)),
+      );
+    }
+    return worst;
+  }
+
+  it("is the scalar, unrounded, for a clip with no ramp", () => {
+    const plain = videoElement({ speed: 1.5, trackId: "v1" });
+    expect(playbackRateFor(plain, 0)).toBe(1.5);
+    expect(playbackRateFor(plain, 99_999)).toBe(1.5);
+    expect(playbackRateFor(imageElement({ trackId: "v1" }), 0)).toBe(1);
+  });
+
+  it("follows the ramp rather than reporting the clip's mean", () => {
+    const element = ramped([
+      { t: 0, v: 1 },
+      { t: 10_000, v: 4 },
+    ]);
+    const atStart = playbackRateFor(element, 0);
+    const atEnd = playbackRateFor(element, spanLength(element) - 1);
+    expect(atStart).toBeCloseTo(1, 2);
+    expect(atEnd).toBeCloseTo(4, 2);
+    expect(speedOf(element)).toBeGreaterThan(atStart);
+    expect(speedOf(element)).toBeLessThan(atEnd);
+  });
+
+  it("stays inside the re-seek tolerance for a sweep of random ramps", () => {
+    const rand = seededRandom(0xd71f7);
+    for (let i = 0; i < 60; i++) {
+      const count = 2 + Math.floor(rand() * 6);
+      const points = Array.from({ length: count }, (_, index) => ({
+        t: (10_000 * index) / (count - 1),
+        v: 0.25 + rand() * 3.75,
+      }));
+      if (points.every((p) => Math.abs(p.v - points[0].v) < 1e-6)) {
+        continue;
+      }
+      const element = ramped(points);
+      expect(worstDriftMs(element, playbackRateFor)).toBeLessThan(
+        PLAYING_DRIFT_TOLERANCE_SEC * 1000,
+      );
+    }
+  });
+
+  it("holds the sound two orders of magnitude closer than the cursor's own rate", () => {
+    // The measurement that chose this rule. Writing the rate at the cursor makes
+    // the handle integrate a left Riemann sum of the curve, and it settles at
+    // about 31ms whatever the shape: the handle is re-aimed on every repaint, so
+    // the error saturates rather than accumulating. That never trips
+    // `PLAYING_DRIFT_TOLERANCE_SEC`, which is the problem rather than the
+    // reassurance: 31ms is two frames at 60fps of sound out against picture, and
+    // nothing would ever correct it.
+    //
+    // The four shapes here are the ones that could plausibly behave differently:
+    // a monotone ramp, its reverse, a V, and alternation at the minimum gap.
+    const shapes: Array<Array<{ t: number; v: number }>> = [
+      [
+        { t: 0, v: 0.25 },
+        { t: 10_000, v: 4 },
+      ],
+      [
+        { t: 0, v: 4 },
+        { t: 10_000, v: 0.25 },
+      ],
+      [
+        { t: 0, v: 4 },
+        { t: 5000, v: 0.25 },
+        { t: 10_000, v: 4 },
+      ],
+      Array.from({ length: MAX_CURVE_POINTS }, (_, i) => ({
+        t: i * MIN_CURVE_GAP_MS,
+        v: i % 2 === 0 ? 0.25 : 4,
+      })),
+    ];
+
+    for (const points of shapes) {
+      const element = ramped(points);
+      const instant = worstDriftMs(element, (el, cursorMs) =>
+        speedAt(el, cursorMs),
+      );
+      const averaged = worstDriftMs(element, playbackRateFor);
+
+      expect(instant).toBeGreaterThan(20);
+      expect(averaged).toBeLessThan(1);
+      expect(averaged).toBeLessThan(instant / 20);
+    }
+  });
+});

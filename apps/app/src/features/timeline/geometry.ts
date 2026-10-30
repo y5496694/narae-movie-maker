@@ -1,0 +1,357 @@
+/**
+ * The single source of truth for timeline geometry.
+ *
+ * Before this module the codebase held three incompatible readings of `trim`:
+ *
+ *   A. the canvas compositor (`renderer/video.ts`, `element/time.ts`) treated a
+ *      clip as `[startTime, startTime + duration/speed)` and ignored `trim`,
+ *      documenting it as an FFmpeg `-ss` offset;
+ *   B. the timeline UI and the FFmpeg audio path treated it as
+ *      `[startTime + trim.startTime, startTime + trim.endTime)`;
+ *   C. `loadedAssetStore.seek` ignored `trim` altogether when seeking the
+ *      `<video>`, so a trimmed clip previewed the wrong source frame.
+ *
+ * Reading A wins, and it is now an invariant rather than a convention:
+ *
+ *   - `trim` is a window into the **source file**, measured in source ms.
+ *   - `duration` is that window's length, so
+ *     `duration === trim.endTime - trim.startTime` for dynamic elements.
+ *   - the clip occupies `[startTime, startTime + duration/speed)` on the
+ *     timeline, which is the same shape static elements already had.
+ *
+ * Keeping both readings straight is what makes a Final Cut style split work:
+ * the two halves differ in `trim` *and* in `startTime`/`duration`, so they land
+ * side by side instead of on top of each other.
+ */
+
+import type {
+  AudioElementType,
+  TimelineElement,
+  VideoElementType,
+} from "../../@types/timeline";
+import { elementUtils } from "../../utils/element";
+import { rigRoleOf } from "./rig";
+import {
+  curveSourceAt,
+  curveSpanLength,
+  MAX_SPEED,
+  MIN_SPEED,
+  speedAtSource,
+  speedCurveOf,
+} from "./speedCurve";
+
+/** Elements that carry a source window: video and audio. */
+export type DynamicElement = VideoElementType | AudioElementType;
+
+/**
+ * How far apart two edges may be and still count as touching, in ms.
+ *
+ * Not slop for the user's benefit — a clip dragged near another one still will
+ * not read as adjacent, because `moveClips` snaps to frames and a frame is far
+ * wider than this. It is float insurance: a sped-up clip's timeline span is
+ * `duration / speed`, so the two halves of a 1.5x split reconstruct to `offset`
+ * only to within a rounding error. Half a millisecond is under a thousandth of
+ * a frame at 60fps.
+ *
+ * Lives here rather than in `mergeOps` — where it began, as `MERGE_EPSILON_MS`
+ * — because two features now ask the same question of the same two numbers:
+ * "were these one clip a moment ago?" for a merge, and "is there a cut here?"
+ * for a transition. They must agree, or a cut that offers a transition could
+ * refuse to merge.
+ */
+export const ADJACENCY_EPSILON_MS = 0.5;
+
+/** Shortest source window a trim may leave behind, in source ms. */
+export const MIN_SOURCE_MS = 10;
+
+/** Shortest timeline span a static element may be trimmed to, in ms. */
+export const MIN_TIMELINE_MS = 10;
+
+export function isDynamicElement(
+  element: TimelineElement,
+): element is DynamicElement {
+  return elementUtils.getElementType(element.filetype) === "dynamic";
+}
+
+/**
+ * Whether this element's length belongs to its author rather than to the user.
+ *
+ * True for a `template`, and for either group of a stabilize rig. A template is
+ * a whole edit standing
+ * in for one clip: its timing is what was authored, and a user who could trim
+ * or split it would be cutting the author's work apart while the composition
+ * inside went on running to its own clock.
+ *
+ * It lives here, in the module that owns the trim/duration/speed invariants,
+ * because that is what it is a statement about — and because putting it here
+ * means `clipEdit.ts` can read it without importing anything from the template
+ * feature, which would close a cycle through `placement.ts`.
+ *
+ * **Every operation that would change a length declines on this**, and
+ * `layout.ts#hitTest` reads it too, so the trim handles are never drawn on a
+ * template in the first place. Written once so `splitAt`, `trimStart`,
+ * `trimEnd`, `setClipSpeed` and `canJoin` cannot drift apart, and so a second
+ * fixed-length element type would not mean finding all of them again.
+ */
+export function isDurationLocked(
+  element: TimelineElement | undefined | null,
+): boolean {
+  // A rig's camera holds a copy of a null's keyframes on the null's own time
+  // base. Trimming its start would rebase that copy, and splitting it would
+  // leave the footage under the left half holding the cut value for good.
+  return element?.filetype === "template" || rigRoleOf(element) != null;
+}
+
+/**
+ * Playback rate, guarded.
+ *
+ * `speed` is absent on hand-authored fixtures and a zero would turn every span
+ * into `Infinity`, so anything non-positive falls back to real time.
+ *
+ * On a clip carrying a `speedCurve` this is the **mean** rate over the trim
+ * window, derived so that `spanLength` stays `duration / speed`. That is what
+ * keeps every collision, ripple, placement and layout call site correct without
+ * knowing the ramp exists. For the rate at an instant, ask `speedAt`.
+ */
+export function speedOf(element: TimelineElement): number {
+  if (!isDynamicElement(element)) {
+    return 1;
+  }
+  const speed = element.speed;
+  return typeof speed === "number" && speed > 0 ? speed : 1;
+}
+
+/**
+ * Full length of the source file in source ms.
+ *
+ * Older elements predate the field, and `trim.endTime` was what stood in for it
+ * — which is why dragging a trim handle back outwards used to be impossible
+ * once it had been dragged in.
+ */
+export function sourceDurationOf(element: TimelineElement): number {
+  if (!isDynamicElement(element)) {
+    return element.duration;
+  }
+  const declared = (element as DynamicElement).sourceDuration;
+  if (typeof declared === "number" && declared > 0) {
+    return declared;
+  }
+  return Math.max(element.trim.endTime, element.duration);
+}
+
+/** Timeline ms at which the clip begins. */
+export function spanStart(element: TimelineElement): number {
+  return element.startTime;
+}
+
+/**
+ * How much timeline the clip covers, in ms.
+ *
+ * `duration` is source ms for dynamic elements and timeline ms for static ones,
+ * so only the former is divided by `speed`.
+ */
+export function spanLength(element: TimelineElement): number {
+  return isDynamicElement(element)
+    ? element.duration / speedOf(element)
+    : element.duration;
+}
+
+export function spanEnd(element: TimelineElement): number {
+  return spanStart(element) + spanLength(element);
+}
+
+export function spanOf(element: TimelineElement): {
+  start: number;
+  end: number;
+  length: number;
+} {
+  const start = spanStart(element);
+  const length = spanLength(element);
+  return { start, end: start + length, length };
+}
+
+/**
+ * Source-file ms shown at timeline time `t`.
+ *
+ * This is the formula `loadedAssetStore` was missing: without the `trim`
+ * term a trimmed clip seeks to the untrimmed frame.
+ */
+export function sourceTimeAt(element: DynamicElement, t: number): number {
+  const curve = speedCurveOf(element);
+  if (curve == null) {
+    return element.trim.startTime + (t - element.startTime) * speedOf(element);
+  }
+  return curveSourceAt(curve, element.trim.startTime, t - element.startTime);
+}
+
+/**
+ * The inverse of `sourceTimeAt`: where a given source frame lands on the
+ * timeline.
+ *
+ * Needed wherever something is authored against the source file rather than
+ * against the timeline — transcription being the obvious case, since a
+ * speech-to-text pass timestamps the media, not the edit.
+ */
+export function timelineTimeAt(
+  element: DynamicElement,
+  sourceMs: number,
+): number {
+  const curve = speedCurveOf(element);
+  if (curve == null) {
+    return (
+      element.startTime + (sourceMs - element.trim.startTime) / speedOf(element)
+    );
+  }
+  return (
+    element.startTime +
+    curveSpanLength(curve, element.trim.startTime, sourceMs)
+  );
+}
+
+/**
+ * The rate the clip is playing at one timeline instant.
+ *
+ * `speedOf` for an unramped clip, and for a ramped one the curve's value at the
+ * source frame that instant shows. Wanted by anything that has to *act* at a
+ * rate rather than measure a length: the preview's media handle, and the band
+ * drawn over the clip.
+ *
+ * Static elements have no rate and answer 1, exactly as `speedOf` does.
+ */
+export function speedAt(element: TimelineElement, t: number): number {
+  if (!isDynamicElement(element)) {
+    return 1;
+  }
+  const curve = speedCurveOf(element);
+  if (curve == null) {
+    return speedOf(element);
+  }
+  return speedAtSource(curve, sourceTimeAt(element, t));
+}
+
+/**
+ * The three numbers FFmpeg needs for one dynamic element: where to seek in the
+ * source, how much to take, and how far to delay it on the output timeline.
+ */
+export function ffmpegWindow(element: DynamicElement): {
+  ssSec: number;
+  tSec: number;
+  delayMs: number;
+} {
+  return {
+    ssSec: element.trim.startTime / 1000,
+    tSec: element.duration / 1000,
+    delayMs: element.startTime,
+  };
+}
+
+/**
+ * Signed px/ms conversion for layout.
+ *
+ * `utils/time.millisecondsToPx` clamps negatives to zero, which is right for
+ * the ruler and wrong for clips: a clip scrolled halfway off the left edge
+ * would be pinned to x=0 and drawn at the wrong width. Rounding is deliberately
+ * omitted — callers round once, where a pixel is actually written, instead of
+ * accumulating a pixel of drift per `px -> ms -> px` round trip during a drag.
+ */
+export function msToPxSigned(ms: number, timelineRange: number): number {
+  return (ms / 5) * (timelineRange / 4);
+}
+
+export function pxToMsSigned(px: number, timelineRange: number): number {
+  return (px * 5) / (timelineRange / 4);
+}
+
+/**
+ * Development-time check that an element still satisfies the source-window
+ * invariant. Editing ops call this so a broken write surfaces at its origin
+ * rather than as a mis-timed frame three subsystems later.
+ */
+export function assertTrimInvariant(
+  element: TimelineElement,
+  context = "element",
+): void {
+  if (!isDynamicElement(element)) {
+    return;
+  }
+  const window = element.trim.endTime - element.trim.startTime;
+  if (Math.abs(window - element.duration) > 0.5) {
+    throw new Error(
+      `${context}: duration ${element.duration} does not match trim window ` +
+        `${element.trim.startTime}..${element.trim.endTime} (${window})`,
+    );
+  }
+}
+
+/** Whether an element currently satisfies the invariant, without throwing. */
+export function hasValidTrim(element: TimelineElement): boolean {
+  try {
+    assertTrimInvariant(element);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Development-time check that a ramped clip's derived scalar still matches its
+ * curve, the twin of `assertTrimInvariant` for the other half of the model.
+ *
+ * `speed` is authored on a clip with no `speedCurve` and derived on one that has
+ * it, and the whole design rests on the second staying true:
+ *
+ *     duration / speed === curveSpanLength(curve, trim.startTime, trim.endTime)
+ *
+ * Break it and the clip's drawn length stops matching the footage it plays, in
+ * a way that shows up three subsystems later as a mis-timed frame. The half
+ * millisecond of tolerance is `assertTrimInvariant`'s, and the same budget
+ * `ADJACENCY_EPSILON_MS` reconciles spans with everywhere else.
+ *
+ * **Anything that writes `trim` on a ramped clip has to recompute the scalar.**
+ * `clipEdit.ts#withTrim` is where that happens for trim and split; `mergeOps`,
+ * `reverseOps` and `audio.ts`'s detached twin write `trim` themselves and each
+ * calls `withDerivedSpeed` for this reason. A new op that writes `trim` without
+ * it will fail this assertion in the suites, which is what it is for.
+ */
+export function assertSpeedInvariant(
+  element: TimelineElement,
+  context = "element",
+): void {
+  if (!isDynamicElement(element)) {
+    return;
+  }
+  const curve = speedCurveOf(element);
+  if (curve == null) {
+    return;
+  }
+
+  const speed = element.speed;
+  if (!Number.isFinite(speed) || speed < MIN_SPEED || speed > MAX_SPEED) {
+    throw new Error(
+      `${context}: ramped clip carries an unusable speed ${speed}`,
+    );
+  }
+
+  const want = curveSpanLength(
+    curve,
+    element.trim.startTime,
+    element.trim.endTime,
+  );
+  const have = element.duration / speed;
+  if (Math.abs(want - have) > 0.5) {
+    throw new Error(
+      `${context}: speed ${speed} gives a span of ${have} where the ramp asks ` +
+        `for ${want}`,
+    );
+  }
+}
+
+/** Whether an element currently satisfies the speed invariant, without throwing. */
+export function hasValidSpeed(element: TimelineElement): boolean {
+  try {
+    assertSpeedInvariant(element);
+    return true;
+  } catch {
+    return false;
+  }
+}

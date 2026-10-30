@@ -1,0 +1,247 @@
+/**
+ * What the pointer is over, in the element's own coordinate space.
+ *
+ * The version this replaces lived inside `previewCanvas.collisionCheck` and
+ * un-rotated the pointer by hand, reading `element.rotation` directly. That was
+ * a second, independent answer to "where is this element" — the exact hazard
+ * the header of `elementPosition.ts` documents — and it was already incomplete:
+ * it knew about rotation but not about scale, because until now nothing could
+ * scale an element except its own `scale` track, which the check ignored.
+ *
+ * With groups, an element can be rotated *and* scaled by an ancestor it has
+ * never heard of. So the un-rotation is gone; the caller inverts the element's
+ * world matrix — the same matrix the renderer draws with — and hands the
+ * pointer in already in local space. This function then only has to answer a
+ * question about an axis-aligned rectangle at the origin.
+ *
+ * Kept DOM-free so it runs in the `node` suite alongside the timeline modules.
+ */
+
+import type { Point } from "../timeline/transform";
+import type {
+  Timeline,
+  TimelineElement,
+} from "../../@types/timeline";
+import { isVisualTimelineElement } from "../../@types/timeline";
+import { isElementVisibleAtTime } from "../element/time";
+import { isHeldByRig } from "../timeline/rig";
+
+export type HitZone =
+  | "position"
+  | "rotation"
+  | "stretchE"
+  | "stretchW"
+  | "stretchN"
+  | "stretchS"
+  | "stretchNW"
+  | "stretchNE"
+  | "stretchSW"
+  | "stretchSE"
+  | "none";
+
+/**
+ * Half-width of the grab band around an edge, in screen pixels.
+ *
+ * Screen pixels at every zoom: `previewCanvas.hitZoneAt` divides by the
+ * preview's zoom as well as the element's own world scale, so the band stays
+ * the size of the grips `renderControlOutline` draws. It used to divide by the
+ * world scale alone, which left the band in project pixels, and these three
+ * values were 20, 25 and 75 of those: 8, 10 and 30 on screen at a 1080p
+ * project's fit view, three times that at 300%. They are now those fit-view
+ * sizes, so the view people work in feels as it did.
+ */
+export const HANDLE_PADDING_PX = 8;
+
+/** The rotation knob's box above the top edge, in screen pixels. */
+export const ROTATION_HANDLE_HALF_WIDTH_PX = 10;
+export const ROTATION_HANDLE_HEIGHT_PX = 30;
+
+export type HitTestOptions = {
+  /** Grab band around the edges. Defaults to `HANDLE_PADDING_PX`. */
+  padding?: number;
+  /**
+   * The uniform scale the element's world matrix applies.
+   *
+   * Handle sizes are a property of the *pointer*, not of the artwork: a corner
+   * grip should be the same number of screen pixels whatever the element is
+   * doing. Since the point arriving here has already been divided by this
+   * scale, the bands have to be divided too — otherwise a child inside a group
+   * scaled to 25% gets grips a quarter their intended size and becomes
+   * effectively unusable, and one inside a group scaled to 400% gets grips so
+   * fat they swallow the element.
+   */
+  worldScale?: number;
+};
+
+/**
+ * Which zone `local` falls in for a `w × h` box whose top-left is the origin.
+ *
+ * Order matters and matches what the pointer expects: the interior wins over
+ * the edges, so a drag started well inside a small element moves it rather than
+ * resizing it; corners win over edges, since a corner is inside both bands.
+ */
+export function hitZoneOf(
+  local: Point,
+  w: number,
+  h: number,
+  options: HitTestOptions = {},
+): HitZone {
+  const scale = normaliseScale(options.worldScale);
+  // Grips shrink for a small element rather than swallowing it.
+  //
+  // Without the clamp the bands overlap once `padding` passes half a side, and
+  // the interior test `x > p/2 && x < w - p/2` becomes an empty range — so a
+  // 20×20 clip, or any clip inside a group scaled well down, could not be
+  // grabbed to move at all: every point on it reported a resize grip. A third
+  // of the shorter side leaves the interior at least a third of the element and
+  // keeps the four edge bands disjoint.
+  const requested = (options.padding ?? HANDLE_PADDING_PX) / scale;
+  const padding = Math.max(
+    0,
+    Math.min(requested, Math.abs(w) / 3, Math.abs(h) / 3),
+  );
+  const knobHalfWidth = ROTATION_HANDLE_HALF_WIDTH_PX / scale;
+  const knobHeight = ROTATION_HANDLE_HEIGHT_PX / scale;
+
+  const { x, y } = local;
+
+  if (!Number.isFinite(x) || !Number.isFinite(y)) {
+    return "none";
+  }
+
+  // Interior first. `padding / 2` rather than `padding` so that a click just
+  // inside an edge still moves the element — the resize bands straddle the
+  // edge, and the inner half of one is shared with the body.
+  if (
+    x > padding / 2 &&
+    x < w - padding / 2 &&
+    y > padding / 2 &&
+    y < h - padding / 2
+  ) {
+    return "position";
+  }
+
+  const nearW = x > -padding && x < padding;
+  const nearE = x > w - padding && x < w + padding;
+  const nearN = y > -padding && y < padding;
+  const nearS = y > h - padding && y < h + padding;
+
+  // Corners before edges: a corner point satisfies two edge bands at once, and
+  // a diagonal resize is what the user aimed at.
+  if (nearW && nearN) return "stretchNW";
+  if (nearE && nearN) return "stretchNE";
+  if (nearW && nearS) return "stretchSW";
+  if (nearE && nearS) return "stretchSE";
+
+  const insideVertically = y > padding && y < h - padding;
+  const insideHorizontally = x > padding && x < w - padding;
+
+  if (nearE && insideVertically) return "stretchE";
+  if (nearW && insideVertically) return "stretchW";
+  if (nearN && insideHorizontally) return "stretchN";
+  if (nearS && insideHorizontally) return "stretchS";
+
+  // The rotation knob sits above the top edge, outside the box entirely, so it
+  // is tested last — nothing inside the element can reach it.
+  if (
+    x > w / 2 - knobHalfWidth &&
+    x < w / 2 + knobHalfWidth &&
+    y > -knobHeight &&
+    y < 0
+  ) {
+    return "rotation";
+  }
+
+  return "none";
+}
+
+/** The eight resize grips, as against the body, the knob and a miss. */
+export type StretchZone = Exclude<HitZone, "position" | "rotation" | "none">;
+
+/** Whether a zone is one of the eight resize grips. */
+export function isStretchZone(zone: HitZone): zone is StretchZone {
+  return zone.startsWith("stretch");
+}
+
+/**
+ * A guard against a scale of zero or worse.
+ *
+ * The scale track can reach 0, and dividing the handle sizes by it would make
+ * every band infinite — so every pointer position would report a corner grab.
+ */
+function normaliseScale(raw: number | undefined): number {
+  if (raw == null || !Number.isFinite(raw) || raw <= 0) {
+    return 1;
+  }
+  return raw;
+}
+
+/**
+ * Whether the pointer may act on this element at the current playhead.
+ *
+ * Split out of `previewCanvas.isPointerTarget` so the rule has one home and a
+ * test. It used to be re-decided inline in both `_handleMouseDown` and
+ * `_handleMouseMove`, and both copies added `trim` to `startTime` — `trim` is a
+ * window into the *source file* in source ms, `startTime` is a position on the
+ * timeline, and their sum is a time in no coordinate system at all. An
+ * untrimmed clip has `trim.startTime === 0`, so the sum was accidentally right
+ * and the bug survived; the second half of a split carries a non-zero trim, so
+ * its grabbable window slid forward by exactly that amount and it could not be
+ * clicked over its own opening seconds.
+ *
+ * The predicate is deliberately `isElementVisibleAtTime` — the same one
+ * `renderTimelineAtTime` gates drawing on — so the pointer and the picture
+ * cannot disagree.
+ */
+export function canPointerTarget(
+  element: TimelineElement | undefined,
+  cursorMs: number,
+  timeline: Timeline,
+): boolean {
+  if (element == null) {
+    return false;
+  }
+
+  // Not drawn, so not grabbable: a row with its eye off would otherwise leave
+  // an invisible clip catching the clicks aimed at whatever shows through it.
+  // Ahead of the group rule, which would answer `true` regardless.
+  if (element.trackHidden === true) {
+    return false;
+  }
+
+  // A stabilize rig's groups, and what sits directly in its camera, are held
+  // where the lock was built: a drag on any of them would leave the camera
+  // describing a picture that is no longer there. They are selected on the
+  // timeline instead. A label riding the tracked null is not held.
+  if (isHeldByRig(timeline, element)) {
+    return false;
+  }
+
+  // A group is always a target, and its own bar does not gate that: its
+  // transform applies to its children at every instant, so a null whose handles
+  // blinked out with its bar would be arbitrary.
+  //
+  // This used to read `return isActiveElement`, on the reasoning that an
+  // invisible rectangle answering the pointer all the time would swallow every
+  // click aimed at its own children — a real hazard, since a group's box
+  // typically encloses them. But the guard was **circular**: the only thing
+  // that ever wrote `previewCanvas.activeElementId` was the preview's own
+  // mousedown, which could not reach a group that was not already active. So no
+  // group was ever pointer-targetable, its dashed outline was unreachable, and
+  // a null could be created but never seen or moved.
+  //
+  // The hazard is answered where it actually lives instead — in the *zone*:
+  // `nullGizmo.ts#nullHitZoneOf` claims the anchor and the edge bands and
+  // returns `"none"` for the interior, so clicks aimed at a child still reach
+  // it. Liveness and shape are two questions, and this one only ever had to
+  // answer the first.
+  if (element.filetype === "group") {
+    return true;
+  }
+
+  if (!isVisualTimelineElement(element)) {
+    return false;
+  }
+
+  return isElementVisibleAtTime(cursorMs, timeline, element);
+}

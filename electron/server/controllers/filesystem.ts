@@ -1,0 +1,104 @@
+import fs from "fs";
+import * as fsp from "fs/promises";
+import fse from "fs-extra";
+import { Router, Response, Request } from "express";
+import path from "path";
+import { listDirectory } from "../../lib/listDirectory";
+
+export const httpFilesystem = {
+  getDirectory: async function (req: Request, res: Response) {
+    try {
+      res.status(200).send(await listDirectory(String(req.query.dir)));
+    } catch (error: any) {
+      res.status(404).send({ message: String(error?.message ?? error) });
+    }
+  },
+  getFile: async function (req: Request, res: Response) {
+    try {
+      const filepath = req.query.path as string;
+      if (!filepath) {
+        res.status(400).send("path query parameter is required.");
+        return;
+      }
+
+      const fileSplit = filepath.split("/");
+      const directoryParts = fileSplit.slice(0, -1);
+      const fileDirectory = directoryParts.join("/");
+
+      res.sendFile(
+        fileSplit[fileSplit.length - 1],
+        { root: fileDirectory },
+        (err) => {
+          if (err) {
+            console.error("Error sending file:", err);
+            const status = (err as Error & { status?: number }).status;
+            res.status(status || 500).send(err.message);
+          }
+        },
+      );
+    } catch (error) {
+      console.error("Server error:", error);
+      res.status(500).send("Internal server error");
+    }
+  },
+  makeDirectory: async (event, path, options) => {
+    let mkdir = await fsp.mkdir(path, options);
+
+    let status = mkdir == null ? false : true;
+    return status;
+  },
+
+  emptyDirectorySync: async (event, path) => {
+    let status = true;
+    fse.emptyDirSync(path);
+    return status;
+  },
+
+  removeDirectory: async (event, path) => {
+    try {
+      fs.rmSync(path, { recursive: true, force: true });
+      return true;
+    } catch (error) {
+      // `force` already swallows a missing path; anything left is a real
+      // failure — a busy handle on Windows, say. The caller is the export's
+      // "finish" handler cleaning up `renderAnimation/`, and a leftover temp
+      // directory is not worth failing a finished render over, so report it
+      // rather than rejecting the invoke.
+      console.error("filesystem:removeDirectory", path, error);
+      return false;
+    }
+  },
+
+  writeFile: async (event, filename, data, options) => {
+    fs.writeFile(filename, data, options, (error) => {
+      if (error) {
+        return false;
+      }
+
+      return true;
+    });
+  },
+
+  readFile: async (event, filename) => {
+    let data = await fsp.readFile(filename);
+    return data;
+  },
+
+  existFile: async (event, path) => {
+    try {
+      await fsp.access(path);
+      return true;
+    } catch (err) {
+      return false;
+    }
+  },
+
+  removeFile: async (event, path) => {
+    try {
+      await fsp.unlink(path);
+      return true;
+    } catch (err) {
+      return false;
+    }
+  },
+};

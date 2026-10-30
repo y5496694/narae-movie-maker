@@ -1,0 +1,507 @@
+.asset {
+    padding: .5rem;
+
+    /*
+     * Every tile is a click target: a preset, a utility, a LUT, a template, a
+     * file to open, a folder to enter. None of them is a `<button>`, and
+     * Bootstrap's reboot hands the pointer to `button:not(:disabled)` and
+     * `.btn` alone. That is why every button in these panels already had it
+     * and the tiles did not.
+     */
+    cursor: pointer;
+
+    /*
+     * Both for the band below. `isolation` is load-bearing: a `z-index: -1`
+     * child of a tile that is not a stacking context escapes to the nearest
+     * one and paints behind the panel's own background, where it is invisible
+     * and nothing errors.
+     */
+    position: relative;
+    isolation: isolate;
+}
+
+/*
+ * ------------------------------------------------------- the file browser
+ *
+ * `<asset-list>`'s tiles, and the Fx tab's and the template library's, which
+ * reuse the grid, the well and the name so every browsable collection in the
+ * sidebar reads as one grid (`_browse.scss` adds only their headings and
+ * states). The text presets and utilities are still Bootstrap columns inside a
+ * `.row`; `.asset` above is the whole of what those have in common.
+ */
+
+asset-list {
+    /*
+     * A custom element with no styles is `display: inline`, and an inline box
+     * is not a containing block the grid below can resolve `1fr` against.
+     * Nothing errors; the columns just come out wrong.
+     */
+    display: block;
+}
+
+/*
+ * `auto-fill` rather than a fixed column count.
+ *
+ * The panel is a percentage of the window (`uiStore`'s
+ * `resize.horizontal.panel`, 30 by default) and is draggable on top of that, so
+ * any fixed count is either cramped in a narrow panel or enormous in a wide
+ * one. The track floor decides instead: about three across at the default
+ * width, more as the panel grows, and never a tile whose name has room for two
+ * characters.
+ */
+.asset-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
+    /*
+     * Small because each tile carries its own padding, and that padding is what
+     * the hover plate fills. Widening this separates the plates rather than the
+     * pictures.
+     */
+    gap: 2px;
+    align-content: start;
+    padding: .25rem 0 .75rem;
+}
+
+.asset-rows {
+    display: flex;
+    flex-direction: column;
+    padding: .25rem 0 .75rem;
+}
+
+/*
+ * One tile: a well of a fixed shape, then one line of name.
+ *
+ * **The well's height never depends on the picture in it.** `aspect-ratio` on
+ * the well, `flex: none` on both children and a pinned height on the name are
+ * the whole of it: the tile's width decides the well's height, the image is
+ * fitted to the well rather than the reverse, and the caption therefore sits at
+ * the same y in every tile whatever shape the media is.
+ *
+ * That also holds the tile's geometry still while a thumbnail is being
+ * captured, which `tileVisibility.ts` depends on: intersection is decided from
+ * layout, so a tile that changes height when its frame lands re-triggers that
+ * decision for every tile below it.
+ */
+.asset-tile {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    padding: 5px;
+}
+
+.asset-row {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+    padding: 3px 6px;
+}
+
+/*
+ * A tighter plate than the sidebar's other tiles, whose 12px is set against a
+ * much taller LUT swatch. This is the well's own 6px plus the tile's padding.
+ */
+.asset-tile::before,
+.asset-row::before {
+    border-radius: 9px;
+}
+
+.asset-thumb {
+    position: relative;
+    flex: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    overflow: hidden;
+    border: 1px solid rgba(255, 255, 255, .08);
+    border-radius: 6px;
+    /*
+     * Also the empty state. A video tile renders no `<img>` at all until its
+     * capture lands, because an empty `src` resolves against the document and
+     * paints a broken-image glyph, so this fill is what stands in, at exactly
+     * the size the frame will occupy.
+     */
+    background-color: #15171a;
+    transition: border-color 140ms ease-out;
+}
+
+.asset:hover > .asset-thumb {
+    border-color: rgba(255, 255, 255, .18);
+}
+
+/*
+ * `cover`, so a folder of sixty different aspect ratios reads as one grid. The
+ * whole frame is one dwell away on the hover preview, which is the place that
+ * shows a picture at its own shape.
+ */
+.asset-thumb > .asset-thumb-img {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+
+/*
+ * Two classes, and deliberately: `material-symbols/outlined` is imported
+ * *after* this file in `style.scss`, so its `.material-symbols-outlined`
+ * (24px, `inline-block`) outranks any single-class rule written here.
+ */
+.asset-thumb > .asset-thumb-icon {
+    font-size: 28px;
+    color: #5c646d;
+}
+
+/* A folder is the one tile with no picture to look at, so its mark carries. */
+.asset-thumb-folder > .asset-thumb-icon {
+    font-size: 32px;
+    color: #98a1ab;
+}
+
+/* Says "video" without covering the frame it marks. */
+.asset-thumb > .asset-thumb-badge {
+    position: absolute;
+    right: 4px;
+    bottom: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 17px;
+    height: 17px;
+    border-radius: 999px;
+    background-color: rgba(8, 9, 11, .58);
+    -webkit-backdrop-filter: blur(3px);
+    backdrop-filter: blur(3px);
+    color: #f1f3f5;
+    font-size: 12px;
+}
+
+/*
+ * The filename, deliberately quiet: in a grid of pictures the name is a label,
+ * and one per tile in bright bold text makes a column of captions the loudest
+ * thing in the panel.
+ *
+ * A `<span>`, not the `<b>` this used to be. `devent-designsystem.css` pins `b`
+ * to `font-weight: 400 !important`, so a lighter weight is not available on
+ * that element at any specificity.
+ *
+ * `height` is the point of the rule, not `line-height`: one line always, so
+ * every tile in the folder is exactly as tall as every other.
+ */
+.asset-name {
+    flex: none;
+    width: 100%;
+    height: 15px;
+    color: #7f878f;
+    font-size: 11px;
+    font-weight: 300;
+    line-height: 15px;
+    letter-spacing: .1px;
+    text-align: left;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    transition: color 140ms ease-out;
+}
+
+.asset:hover > .asset-name {
+    color: #c3c9cf;
+}
+
+/*
+ * A second, quieter line under the name, for a tile whose name alone does not
+ * tell it from its neighbours: the Text panel's tiles are a face and a look,
+ * and three Montserrat tiles in one section differ only by the look.
+ *
+ * Grid mode only, like the name above it. Pulled up against the name with a
+ * negative margin, because the tile's flex gap is spacing for the well and
+ * would otherwise split one caption into two.
+ */
+.asset-note {
+    flex: none;
+    width: 100%;
+    height: 13px;
+    margin-top: -4px;
+    color: #5c646d;
+    font-size: 10px;
+    font-weight: 300;
+    line-height: 13px;
+    text-align: left;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    transition: color 140ms ease-out;
+}
+
+.asset:hover > .asset-note {
+    color: #8b939b;
+}
+
+/*
+ * List mode: one row per entry, sized for reading names rather than for looking
+ * at frames. `applyShowType` in `features/asset/assetList.ts` swaps the class.
+ *
+ * A square slot, so every name in the column starts at the same x whatever the
+ * media's shape. The same well, the same crop, one third the size.
+ */
+.asset-row > .asset-thumb {
+    width: 34px;
+    aspect-ratio: 1;
+    border-radius: 5px;
+}
+
+.asset-row > .asset-name {
+    flex: 1 1 auto;
+    width: auto;
+    min-width: 0;
+    height: 17px;
+    font-size: 12px;
+    line-height: 17px;
+}
+
+/*
+ * The list view's one column: the row's value for the key the panel is sorted
+ * by, `features/asset/assetMeta.ts`'s "2.1 GB" or "Today 14:03". A step dimmer
+ * than the name so the name still reads first, and tabular figures so sizes
+ * and clocks line up down the column. `flex: none` with a cap: the name gives
+ * way first, and a long kind label clips before it takes the whole row.
+ */
+.asset-row > .asset-meta {
+    flex: none;
+    max-width: 50%;
+    color: #5c646d;
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    line-height: 17px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    transition: color 140ms ease-out;
+}
+
+.asset:hover > .asset-meta {
+    color: #7f878f;
+}
+
+.asset-row .asset-thumb > .asset-thumb-icon {
+    font-size: 19px;
+}
+
+.asset-row .asset-thumb-folder > .asset-thumb-icon {
+    font-size: 21px;
+}
+
+/*
+ * At 34px there is no corner to put a 17px badge in, so it becomes a scrim over
+ * the whole chip rather than a mark beside the picture.
+ */
+.asset-row .asset-thumb > .asset-thumb-badge {
+    inset: 0;
+    width: auto;
+    height: auto;
+    border-radius: 0;
+    background-color: rgba(8, 9, 11, .28);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+    font-size: 13px;
+}
+
+/*
+ * A tile's highlight opens rather than switching on.
+ *
+ * Every `.asset` in the sidebar: text presets, utilities, effects, transitions,
+ * LUTs, templates, animation presets and the file browser. It is a layer of its
+ * own because what animates is a scale, and scaling the tile itself would carry
+ * its preview and its labels with it.
+ *
+ * Every tile keeps Bootstrap's `overflow-hidden`, so the part of the overshoot
+ * that passes the tile's own edge is clipped, which at these widths is about
+ * half a pixel per side. Taking the class off was measured instead: the file
+ * two of the utility labels are wider than their cell, so the clip is holding
+ * real content in and the bounce lives in the curve rather than in those
+ * pixels.
+ *
+ * Every number arrives from `features/motion/hoverSpring.ts`, installed on the
+ * document root at boot. The fallbacks below are what that file resolves to
+ * today, and exist for a stylesheet loaded without it.
+ */
+.asset::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    border-radius: 12px;
+    background-color: #2a3036;
+
+    opacity: 0;
+    transform: scale(var(--asset-hover-from, .9));
+
+    /*
+     * Leaving: flat, quick, and with no spring in it. A transition declared on
+     * the resting rule is the one that runs when the pointer goes, so this pair
+     * times the exit and the pair below times the entrance.
+     */
+    transition:
+        opacity var(--asset-hover-exit, 120ms) ease-out,
+        transform var(--asset-hover-exit, 120ms) ease-out;
+}
+
+.asset:hover::before {
+    opacity: 1;
+    transform: scale(1);
+
+    /*
+     * The fade is shorter than the spring on purpose: the colour is there
+     * within 140ms and the last of the bounce settles under it.
+     */
+    transition:
+        opacity var(--asset-hover-fade, 140ms) ease-out,
+        transform var(--asset-hover-enter, 271ms)
+            var(--asset-hover-ease, ease-out);
+}
+
+/*
+ * Reduced motion keeps the highlight and drops the travel. Both rules, or the
+ * hovered one would restore the transform the resting one just gave up.
+ */
+@media (prefers-reduced-motion: reduce) {
+    .asset::before,
+    .asset:hover::before {
+        transform: none;
+        transition: opacity 100ms linear;
+    }
+}
+
+/*
+ * The "drop a file here" affordance.
+ *
+ * Two properties are load-bearing rather than cosmetic:
+ *
+ * `pointer-events: none` — this is a label, not a target. Without it, showing
+ * it mid-drag makes it the drop target for everything beneath, which is exactly
+ * how it used to swallow drops meant for the timeline.
+ *
+ * No full-area fill — it used to be an 80%-opaque sheet over the whole window.
+ * The timeline now highlights the row a drop would land on, and a sheet over
+ * the top hides the one piece of feedback that says where the file is going.
+ * An inset border frames the window without covering anything.
+ *
+ * Both used to be assigned from `render()` as inline styles alongside an
+ * `innerHTML` rewrite, so a Lit re-render mid-drag rebuilt the drop target
+ * underneath the pointer. Here they cost nothing to re-render.
+ */
+.asset-drop-curtain {
+    position: fixed;
+    inset: 0;
+    z-index: 10000;
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    padding-top: 12vh;
+    border: 2px dashed #4a5058;
+    border-radius: 8px;
+    background-color: rgba(22, 24, 26, .25);
+    pointer-events: none;
+}
+
+.asset-drop-curtain > b {
+    padding: .5rem 1rem;
+    border-radius: 8px;
+    background-color: #16181a;
+    box-shadow: 0 2px 12px rgba(0, 0, 0, .5);
+}
+
+/*
+ * The large preview that opens after resting on a tile.
+ *
+ * `pointer-events: none` is load-bearing, for the reason `.asset-drop-curtain`
+ * gives above and one more: this box sits *under the cursor that summoned it*.
+ * Let it take pointer events and it becomes the topmost element at the pointer,
+ * the tile immediately gets a `pointerleave`, the preview closes, the tile gets
+ * a `pointerenter` — and the whole thing oscillates for as long as the pointer
+ * is still.
+ *
+ * `z-index: 7000` is the one free rung on the ladder and the right one: above
+ * the dropdown menus at 6000, below the modals at 8000, the toasts at 9000 and
+ * the drop curtain at 10000. A preview must never cover a dialog or a message.
+ *
+ * Position and size arrive as inline styles from `hoverPreviewOverlay.ts` —
+ * they are the only things that change per open. Everything structural is here.
+ */
+.asset-hover-preview {
+    position: fixed;
+    top: 0;
+    left: 0;
+    z-index: 7000;
+    pointer-events: none;
+    overflow: hidden;
+    border-radius: 10px;
+    background-color: #16181a;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, .6);
+    border: 1px solid #3a3f44;
+}
+
+/*
+ * The card is the picture with its name under it, in that order.
+ *
+ * `min-width` is for the caption alone: a small source is shown at its own size
+ * (`previewBoxSize` never upscales), and a 64px-wide picture would otherwise
+ * give a filename a 64px column to wrap in. The frame centres itself in
+ * whatever the caption makes the card, and keeps its exact size either way.
+ */
+.asset-hover-preview {
+    display: flex;
+    flex-direction: column;
+    min-width: 180px;
+}
+
+.asset-hover-preview-frame {
+    position: relative;
+    flex: none;
+    align-self: center;
+}
+
+/*
+ * The whole filename, however long, because this is the only place it is not
+ * clipped: the tiles ellipsis theirs and nothing scrolls any more.
+ *
+ * `overflow-wrap: anywhere` is what makes that true. A filename usually has no
+ * space in it, so a long one is a single unbreakable word and would otherwise
+ * push the card wider than the window.
+ */
+.asset-hover-preview-name {
+    flex: none;
+    padding: .4rem .6rem;
+    border-top: 1px solid #2a2f34;
+    color: #f8f9fa;
+    font-size: 12px;
+    line-height: 1.35;
+    text-align: left;
+    overflow-wrap: anywhere;
+}
+
+/*
+ * `contain` rather than `cover`: the box is already the media's own aspect
+ * ratio, so these agree — until the frame between opening and `loadedmetadata`,
+ * where the box is still the 16:9 guess. `cover` crops that frame and the
+ * preview visibly jumps; `contain` letterboxes it and the box grows into place.
+ */
+.asset-hover-preview-frame > video,
+.asset-hover-preview-frame > img {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+}
+
+.asset-hover-preview [hidden] {
+    display: none;
+}
+
+.asset-transparent {
+    background-color: transparent;
+    outline: 0;
+    border: none;
+    margin: 0px;
+}

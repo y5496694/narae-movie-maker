@@ -1,0 +1,302 @@
+@import "../var";
+
+// The first-run tour. Every number here is transcribed from the Figma frames
+// `1090:2`, `1090:14`, `1099:111`, `1338:7` and `1099:208`, whose card is
+// 657x465 — the card is drawn at those literal pixels rather than scaled to
+// the window.
+//
+// Two deliberate departures from the file: the type is Noto Sans KR, the face
+// the rest of the editor already loads, rather than Pretendard; and the last
+// card's button spans the card's own 30px gutters (597px) instead of the
+// asymmetric 588px it was drawn at.
+
+$onboarding-card-color: #191a1d;
+$onboarding-title-color: #dcdfe5;
+$onboarding-subtitle-color: #6b6b75;
+$onboarding-accent-color: #225bec;
+$onboarding-secondary-color: #a1a1a1;
+$onboarding-gutter: 30px;
+$onboarding-button-width: 123px;
+$onboarding-button-height: 48px;
+
+// `--onboarding-fade` is set inline by the component, which also times its
+// unmount against it — so the two can never drift apart. The fallback is only
+// there for a stylesheet loaded without the component.
+@keyframes onboarding-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.onboarding-scrim {
+  position: fixed;
+  inset: 0;
+  // Above every other layer in this sheet; the highest in use is 9000.
+  z-index: 9500;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  background-color: rgba(0, 0, 0, 0.72);
+  backdrop-filter: $blur-backdrop-filter;
+  -webkit-backdrop-filter: $blur-backdrop-filter;
+
+  // Runs once, on insert: the tour fades up over the editor rather than
+  // appearing on top of it. No fill mode, so the transition below takes over
+  // cleanly once the animation is done.
+  animation: onboarding-fade-in var(--onboarding-fade, 200ms) ease-out;
+  transition: opacity var(--onboarding-fade, 200ms) ease-in;
+
+  &.is-leaving {
+    opacity: 0;
+  }
+}
+
+// The card keeps its box while the step changes, and so do the buttons: they
+// are a sibling of this, not a child. Only the art, the gradient over it and
+// the words crossfade.
+.onboarding-content {
+  transition: opacity var(--onboarding-fade, 200ms) ease;
+
+  &.is-swapping {
+    opacity: 0;
+  }
+}
+
+.onboarding-card {
+  position: relative;
+  width: 657px;
+  height: 465px;
+  border-radius: 30px;
+  background-color: $onboarding-card-color;
+  font-family: "Noto Sans KR", sans-serif;
+  overflow: hidden;
+
+  // The window has no minimum size, so shrink the whole card rather than let
+  // its absolutely-positioned contents spill out of it.
+  @media (max-width: 720px), (max-height: 540px) {
+    transform: scale(0.7);
+  }
+}
+
+.onboarding-title {
+  position: absolute;
+  top: 75px;
+  left: 0;
+  right: 0;
+  margin: 0;
+
+  font-size: 32px;
+  font-weight: 700;
+  line-height: 38px;
+  text-align: center;
+  color: $onboarding-title-color;
+}
+
+.onboarding-subtitle {
+  position: absolute;
+  top: 244px;
+  left: 0;
+  right: 0;
+  margin: 0;
+
+  font-size: 20px;
+  font-weight: 400;
+  line-height: 24px;
+  text-align: center;
+  color: $onboarding-subtitle-color;
+}
+
+// `top` is set inline, per step: each of the five sits at its own height, and
+// each keeps the width and height it was drawn at.
+//
+// A screenshot's box is the region of the card it fills, which the committed
+// file matches to within a fraction of a pixel but not exactly; `object-fit`
+// crops that away rather than letting the picture stretch. `max-width` is
+// cleared so the box stated per step is the one that is used, whatever a
+// vendor sheet loaded before this one has to say about images.
+.onboarding-art {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: none;
+  object-fit: cover;
+  -webkit-user-drag: none;
+}
+
+// A step that gives its art an explicit `left` sets it inline, where it beats
+// the 50% above; all that is left to undo is the centring transform.
+.onboarding-art--placed {
+  transform: none;
+}
+
+// The three screenshots travel in; the two drawings only fade. The two that
+// are cut off at a side arrive from that side, so the motion continues the
+// crop rather than contradicting it; the one drawn whole rises from below.
+//
+// Only an *entrance*: leaving is the plain fade `.onboarding-content` already
+// does, so there is no matching rule here. The component puts `.is-entering`
+// on for one card's worth of arrival and takes it off again, which is what
+// makes the animation run a second time on a later visit.
+//
+// Every number comes from `motion.ts` through the scrim. The distances are
+// only ever undone, never held: after the animation the class goes and the
+// `transform` above is what applies.
+@keyframes onboarding-enter-bottom {
+  from {
+    transform: translateY(var(--onboarding-rise-from));
+  }
+  to {
+    transform: translateY(0);
+  }
+}
+
+@keyframes onboarding-enter-right {
+  from {
+    transform: translateX(var(--onboarding-slide-from));
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+
+@keyframes onboarding-enter-left {
+  from {
+    transform: translateX(calc(-1 * var(--onboarding-slide-from)));
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+
+.onboarding-art--from-bottom.is-entering {
+  animation: onboarding-enter-bottom var(--onboarding-rise)
+    var(--onboarding-rise-ease) both;
+}
+
+.onboarding-art--from-right.is-entering {
+  animation: onboarding-enter-right var(--onboarding-slide)
+    var(--onboarding-slide-ease) both;
+}
+
+.onboarding-art--from-left.is-entering {
+  animation: onboarding-enter-left var(--onboarding-slide)
+    var(--onboarding-slide-ease) both;
+}
+
+// The gradient that sinks a screenshot into the card, so the title above it
+// and the buttons over it have something to sit on. It always reaches the
+// card's bottom edge, so only `top` varies, set inline per step along with the
+// stop at which the card colour starts taking over. The end stop is the same
+// on all three cards that carry one.
+.onboarding-art-fade {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+
+  // Both ends name the card colour. `transparent` is a transparent *black* in
+  // the older interpolation rules, which greys the middle of the ramp.
+  background-image: linear-gradient(
+    180deg,
+    rgba($onboarding-card-color, 0) var(--onboarding-art-fade-from, 0%),
+    $onboarding-card-color 92.972%
+  );
+}
+
+// Both buttons are positioned against this row rather than laid out in it.
+// A flex row would have to reflow when Next widens to the full 597px, and the
+// reflow would shove Skip sideways at the exact moment it is fading out; the
+// two numbers below hold each button still and let only the width animate.
+.onboarding-actions {
+  position: absolute;
+  left: $onboarding-gutter;
+  right: $onboarding-gutter;
+  bottom: 31px;
+  height: $onboarding-button-height;
+}
+
+.onboarding-secondary {
+  position: absolute;
+  // 40px clear of the Next button's un-widened left edge, which is what the
+  // flex `gap` used to hold it at.
+  right: $onboarding-button-width + 40px;
+  top: 50%;
+  transform: translateY(-50%);
+
+  padding: 0;
+  border: 0;
+  background: none;
+  cursor: pointer;
+
+  font-family: inherit;
+  font-size: 16px;
+  font-weight: 700;
+  line-height: 19px;
+  color: $onboarding-secondary-color;
+
+  transition: opacity var(--onboarding-fade) ease;
+
+  &:hover {
+    color: #cfcfcf;
+  }
+}
+
+// The last card has nothing to skip to: Skip fades out where it stands while
+// Next takes over the row.
+.onboarding-secondary.is-gone {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.onboarding-next {
+  position: absolute;
+  right: 0;
+  top: 0;
+  width: $onboarding-button-width;
+  height: $onboarding-button-height;
+  border: 0;
+  border-radius: 15px;
+  background-color: $onboarding-accent-color;
+  cursor: pointer;
+
+  font-family: inherit;
+  font-size: 16px;
+  font-weight: 700;
+  line-height: 19px;
+  color: #ffffff;
+
+  // The morph. Right-anchored, so the width opens leftwards and the spring's
+  // overshoot spends itself in the card's gutter rather than off the card.
+  transition: width var(--onboarding-morph) var(--onboarding-morph-ease);
+
+  &:hover {
+    background-color: #1a4bd0;
+  }
+}
+
+// The last card: one button across the card, inside the same gutters.
+.onboarding-next--wide {
+  width: 100%;
+}
+
+// Both labels are always in the button, stacked, so they can cross-fade while
+// the width springs open underneath them. `inset: 0` re-centres each one on
+// every frame of the widening, so neither slides against the other.
+.onboarding-next-label {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  transition: opacity var(--onboarding-morph) ease;
+}
+
+.onboarding-next-label.is-hidden {
+  opacity: 0;
+}

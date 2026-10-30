@@ -1,0 +1,110 @@
+.dropdown-item {
+  padding: 0.4rem 0.8rem;
+  color: #dedede;
+}
+
+.dropdown-item:hover {
+  background-color: #43444aba;
+  color: #dedede;
+}
+
+.dropdown-menu {
+  border-radius: 10px;
+  border: 0.3px solid rgba(0, 0, 0, 0.059);
+  box-shadow: 0 0.5rem 1rem rgb(0 0 0 / 10%);
+  padding: 0rem 0.2rem;
+  background-color: #25262bba;
+  -webkit-backdrop-filter: saturate(120%) blur(8px);
+  backdrop-filter: saturate(120%) blur(8px);
+
+  // The height itself is set inline by `features/menu/menuPlacement.ts`, which
+  // has to measure the menu and the window to know what it should be. What
+  // belongs here is the rest of the scrolling contract: rounded corners that
+  // clip the scrolled content, and a scroll that stops at the menu's own edge
+  // instead of chaining to the timeline pane behind it.
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.dropdown-item-sm {
+  padding: 0.25rem 0.5rem !important;
+  color: #dedede;
+  font-size: 12px;
+}
+
+// Applied row by row, not folded into `.dropdown-item-sm`: `menuDropdown.ts`
+// and the preview top bar's add and zoom menus opt in, and the font list, which
+// lays its icons out its own way, does not.
+.dropdown-item-icon {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+// `.icon-xs` and its siblings hard-set `color: #ffffff`, so an icon inside a
+// coloured row — the red "Delete track" — would come out white while its label
+// went red. Inheriting instead lets one class colour the whole row, and it also
+// settles the icons at the label's own `#dedede` rather than a brighter white.
+.dropdown-item-icon .material-symbols-outlined {
+  color: inherit;
+  // `.icon-xs` is `x-small`, which lands at 10px against a 12px label and reads
+  // as an afterthought. An icon wants to be a little larger than its text, not
+  // smaller.
+  font-size: 14px;
+}
+
+// ------------------------------------------------------------------ submenus
+
+// The chevron sits at the far edge of the row rather than after the label,
+// which is shadcn/ui's `ml-auto` on `ContextMenuSubTrigger`. `min-width` is
+// what stops a short label — "Animate" — from putting it two characters away
+// from its own text; the padding is the gap it keeps at its widest.
+.dropdown-sub-chevron {
+  margin-left: auto;
+  padding-left: 1.25rem;
+}
+
+.dropdown-sub-trigger {
+  min-width: 9rem;
+}
+
+// A trigger stays lit while its submenu is open, so the open path reads as one
+// row rather than as two menus with no relationship.
+.dropdown-sub-trigger.active {
+  background-color: #43444aba;
+}
+
+// Above the menu that opened it — which `menuPlacement.ts` puts at 6000 — and
+// laid out beside it, never inside: `features/menu/menuDropdown.ts` portals
+// this to `<body>` and says why.
+.dropdown-submenu {
+  z-index: 6001;
+  min-width: 9rem;
+}
+
+// ------------------------------------------------------- the context menu
+
+// `features/menu/menuDropdown.ts` dresses these three custom elements
+// directly instead of wrapping them in a `<ul>` and `<li>`s. A custom element
+// with no styles is `display: inline`, where width and height do nothing, so
+// the menu would measure its own children at zero and place itself against a
+// box that is not the one on screen.
+menu-dropdown-body,
+menu-dropdown-item,
+menu-dropdown-sub {
+  display: block;
+}
+
+// The timeline canvas is the one surface a menu opens over that is repainting
+// underneath it, for the selection outline the same click just changed. A
+// backdrop blur there costs the compositor a readback of that canvas every
+// frame the menu is up, to show eight pixels of something already being
+// redrawn. The other dropdowns keep theirs.
+menu-dropdown-body.dropdown-menu {
+  // Qualified, so it outranks Bootstrap's `.dropdown-menu { display: none }`
+  // without relying on `.show` being present.
+  display: block;
+  background-color: #25262b;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}

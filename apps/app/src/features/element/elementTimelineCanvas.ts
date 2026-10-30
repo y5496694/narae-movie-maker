@@ -1,0 +1,3101 @@
+import { v4 as uuidv4 } from "uuid";
+import { LitElement, html } from "lit";
+import { customElement, property, query } from "lit/decorators.js";
+import { ITimelineStore, useTimelineStore } from "../../states/timelineStore";
+import { consume } from "@lit/context";
+import { timelineContext } from "../../context/timelineContext";
+import { IUIStore, uiStore } from "../../states/uiStore";
+import { IKeyframeStore, keyframeStore } from "../../states/keyframeStore";
+import {
+  IRenderOptionStore,
+  renderOptionStore,
+} from "../../states/renderOptionStore";
+import {
+  MASK_ANIMATABLE_PROPERTIES,
+  animatableProperties,
+  fxParamKeyOf,
+  isFxParamTrack,
+  type AnimatableProperty,
+  type TimelineElement,
+} from "../../@types/timeline";
+import {
+  deleteClips,
+  moveClips,
+  rippleDelete,
+  trimClipEnd,
+  trimClipStart,
+} from "../timeline/clipOps";
+import {
+  normalizeFps,
+  shouldShowFrameGrid,
+  stepCursorByFrames,
+} from "../timeline/frames";
+import { pinchRange } from "../timeline/zoom";
+import {
+  confirmTrimGuide,
+  nextDragPreview,
+  resolveMove,
+  resolveTransitionResize,
+  resolveTrim,
+} from "../timeline/dragResolve";
+import {
+  addTransition,
+  cutPointsOn,
+  setTransitionDuration,
+} from "../timeline/transitionOps";
+import { addEffect } from "../timeline/effectOps";
+import { addGraphic } from "../timeline/graphicOps";
+import { newGraphicOptions } from "../graphic/graphicPlacement";
+import { isGradable, setClipLut } from "../timeline/lutOps";
+import { chooseClipBackdrop, isShapeElement } from "../timeline/shapeOps";
+import { backdropModeOf } from "../fx/backdropPreset";
+import { mirrorToggleTarget, type MirrorAxis } from "../timeline/mirrorOps";
+import { isReversed, isReversible } from "../timeline/reverseOps";
+import { mirrorClips } from "../editor/actions";
+import { refusesEdit } from "../editor/timelineLock";
+import { CANCEL_GESTURES_EVENT } from "../editor/gestureCancel";
+import { afterPaint } from "../../functions/afterPaint";
+import {
+  canReverseHere,
+  isReversePending,
+  reverseClips,
+  unreverseClips,
+} from "../reverse/reverseSession";
+import { DEFAULT_EFFECT_MS } from "./effectElement";
+import {
+  DEFAULT_TRANSITION_MS,
+  maxTransitionMs,
+} from "../timeline/transitionGeometry";
+import {
+  defaultParamsFor,
+  presetById,
+  presetsOfKind,
+  subscribePresets,
+} from "../fx/presetRegistry";
+import { resolvePreset } from "../fx/resolvePreset";
+import {
+  RULER_OFFSET,
+  clipsInRect,
+  hitTest,
+  layoutTimeline,
+  rectBetween,
+  rowStack,
+  trackAtY,
+  type ScreenRect,
+  type TimelineLayout,
+} from "../timeline/layout";
+import {
+  DRAG,
+  idleDrag,
+  reduceDrag,
+  type DragState,
+  type PointerEv,
+} from "../timeline/dragMachine";
+import {
+  UNARMED,
+  axisVelocity,
+  contentTravel,
+  createEdgeScroller,
+  maxVerticalScroll,
+  pinToBand,
+  scrollAxesOf,
+  scrollStep,
+  updateArm,
+  wholeRowsInView,
+  type Band,
+  type EdgeArm,
+  type Point,
+  type ScrollPair,
+} from "../timeline/edgeScroll";
+import { windowScheduler } from "../caption/previewLoop";
+import { liftInsetAt } from "../timeline/liftPulse";
+import {
+  clipLabel,
+  drawDropTarget,
+  drawMarquee,
+  drawTimeline,
+} from "../timeline/draw";
+import { applySurface, surfaceSpec } from "../timeline/canvasSurface";
+import {
+  createVideoTileProvider,
+  type VideoTileProvider,
+} from "../timeline/strip/videoTiles";
+import {
+  sharedAudioPeakProvider,
+  type AudioPeakProvider,
+} from "../timeline/strip/audioPeaks";
+import { type TimelineDocument } from "../timeline/tracks";
+import { canBeGrouped, dissolveRig, removeFromParent } from "../timeline/groupOps";
+import { isRigMember, rigOf, type Rig } from "../timeline/rig";
+import {
+  refusalMessage,
+  stabilize,
+  stabilizePairOf,
+  zoomMessage,
+} from "../track/stabilizeOp";
+import { addTemplateToTimeline } from "../template/addTemplate";
+import {
+  clearReplaceable,
+  isReplaceable,
+  replaceableOf,
+  setReplaceable,
+} from "../timeline/templateOps";
+import { parentOf, withDescendants } from "../timeline/hierarchy";
+import { canDetachAudio, volumeDbOf } from "../timeline/audio";
+import {
+  addLevelKeyframe,
+  detachAudioFrom,
+  moveLevelKeyframe,
+  offsetLevelEnvelope,
+  removeLevelKeyframe,
+  setVolumeDb,
+} from "../timeline/audioOps";
+import {
+  dbPerPx,
+  hasLevelEnvelope,
+  levelBandOf,
+} from "../timeline/levelLine";
+import { KEYFRAME_LANE_PX, keyframeLane } from "../timeline/keyframeMarkers";
+import { bakeRateFor } from "../animation/keyframes";
+import { pxToMsSigned, spanLength } from "../timeline/geometry";
+
+/**
+ * How many decibels one pixel of a Shift-held level drag is worth.
+ *
+ * The band is short by necessity (track height is a constant here), so the
+ * coarse rate is about 3.8 dB per pixel on a 40px row. A tenth of a decibel is
+ * finer than anyone can hear as a step and makes the whole fader reachable
+ * without the band having to be tall.
+ */
+const FINE_LEVEL_DB_PER_PX = 0.1;
+import { rasterizeTextElements } from "./rasterizeText";
+import {
+  ASSET_MIME,
+  FX_PRESET_MIME,
+  LUT_PRESET_MIME,
+  TEMPLATE_MIME,
+  dropIntent,
+} from "../asset/dropIntent";
+import { dropTargetAt } from "../asset/dropTarget";
+import { importDroppedFiles, importPathsAt } from "../asset/importDrop";
+import { isTypingEvent } from "../../utils/typingTarget";
+import { dispatchExtensionKeybinding } from "../extension/keybindingSeam";
+import { clipMenuItems, extensionMenuHtml } from "../extension/contextMenu";
+import { contributionStore } from "../extension/contributions";
+import { runContributedCommand } from "../extension/bridge";
+import { hasEditorModifier } from "../../utils/platform";
+import { mergeIds, selectionStore } from "../../states/selectionStore";
+import {
+  effectiveTrackHeights,
+  trackHeightStore,
+} from "../../states/trackHeightStore";
+import {
+  copySelection,
+  cutSelection,
+  deleteSelection,
+  groupClips,
+  pasteFromClipboard,
+  redo,
+  splitSelection,
+  undo,
+  ungroupClips,
+} from "../editor/actions";
+import { penCapturesKey } from "../mask/penSession";
+import { count as perfCount } from "../debug/frameStats";
+import { canShowMediaInfo, openMediaInfo } from "../mediaInfo/mediaInfoSession";
+import { targetForElement } from "../mediaInfo/mediaInfoView";
+import { timelineTouchMode } from "../mobile/timelineTouch";
+import type { SurfaceMode } from "../mobile/touchGesture";
+import { noteStore } from "../../states/noteStore";
+import { expandTemplate } from "../composition/expandTemplate";
+import { activeTimelineEndMs } from "../composition/timelineEnd";
+import { compositionOfElement } from "../composition/project";
+import { MOBILE_LAYOUT } from "../mobile/install";
+import {
+  drawNotePins,
+  noteAnchorAt,
+  notePinAt,
+  placeNotePins,
+  type NoteAnchor,
+  type NotePin,
+} from "../note/notePins";
+
+/** What a click on a bare cut reaches for first. */
+const DEFAULT_TRANSITION_PRESET = "com.cartcut.cross-dissolve";
+
+/**
+ * How each animatable property is named and drawn on the context menu.
+ *
+ * A lookup rather than a formatted string because the icon cannot be derived
+ * from the property name. An unlisted property still gets an entry — its own
+ * name, with no icon — so widening `animatableProperties` can never silently
+ * drop a row from the menu.
+ *
+ * The labels are bare nouns because these rows live inside the "Animate" and
+ * "Animate mask" submenus, which say the verb once. That is also why the two
+ * `position` entries can read alike: they are never on the same panel.
+ */
+const ANIMATION_MENU: Record<string, { label: string; icon: string }> = {
+  position: { label: "Position", icon: "open_with" },
+  opacity: { label: "Opacity", icon: "opacity" },
+  scale: { label: "Scale", icon: "aspect_ratio" },
+  rotation: { label: "Rotation", icon: "rotate_90_degrees_cw" },
+  // Not `aspect_ratio`, which `scale` above already wears: the two are next to
+  // each other on this menu and are the pair most easily confused for one
+  // another, so they must not also look alike.
+  size: { label: "Size", icon: "open_in_full" },
+  // The mask's five, which `animatableProperties` offers only on a clip that
+  // has one. Listed because the fallback above would otherwise render them as
+  // `maskPosition` — correct, and not English.
+  maskPosition: { label: "Position", icon: "open_with" },
+  maskSize: { label: "Size", icon: "aspect_ratio" },
+  maskRotation: { label: "Rotation", icon: "rotate_90_degrees_cw" },
+  maskFeather: { label: "Feather", icon: "blur_on" },
+  maskRoundness: { label: "Roundness", icon: "rounded_corner" },
+  revealProgress: { label: "Reveal", icon: "keyboard" },
+  // An effect's overall strength. Its `fx:` siblings are not here and cannot
+  // be: their names come from a preset manifest on disk, so `labelForTrack`
+  // reads them from there instead.
+  intensity: { label: "Intensity", icon: "tune" },
+  // The level envelope. Called "Level" and not "Volume", which is the word the
+  // codebase already uses for it (`audioLevel.ts`, `METER_FLOOR_DB`, "the level
+  // fader"); one thing gets one name, the rule the LUT section states about
+  // "filter".
+  volumeDb: { label: "Level", icon: "volume_up" },
+  // The same icon as the mask's Roundness, which is never on the same panel:
+  // that one sits in "Animate mask", this one in "Animate".
+  cornerRadius: { label: "Corner radius", icon: "rounded_corner" },
+};
+
+/**
+ * An attribute value, escaped.
+ *
+ * The rows below are built as a template string and handed to `innerHTML`, and
+ * one of the labels now comes from a **preset manifest**, which is data a user
+ * installs from somewhere else. Everything else on this menu is a literal from
+ * the table above. `presetTypes.ts` makes the case at length that a preset is
+ * declarative data and never code; this is the line that keeps that true on the
+ * way to the DOM.
+ */
+function attr(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+/**
+ * What one animation row says, and whether there is one at all.
+ *
+ * `null` means the property is not offered. That happens for exactly one
+ * family: `animatableProperties` cannot read a preset manifest, so it offers an
+ * `fx:` track for any parameter whose stored value is a number, a `select`'s
+ * included. Here the manifest is in scope and gets the last word, which is the
+ * same split `<option-effect>` makes for the sidebar's diamonds.
+ *
+ * A track the element already carries is always offered, whatever the manifest
+ * says or whether there is one to read. Refusing there would strand a curve the
+ * user drew behind an uninstalled preset, with no way back to it.
+ */
+function labelForTrack(
+  element: TimelineElement,
+  property: string,
+): { label: string; icon: string } | null {
+  const entry = ANIMATION_MENU[property];
+  if (entry != null) {
+    return entry;
+  }
+  if (!isFxParamTrack(property)) {
+    return { label: property, icon: "" };
+  }
+  const key = fxParamKeyOf(property);
+  const param =
+    element.filetype === "effect"
+      ? resolvePreset(element)?.params.find((p) => p.key === key)
+      : undefined;
+  if (param != null) {
+    return param.type === "number" ? { label: param.label, icon: "tune" } : null;
+  }
+  const carried = (element as any).animation?.[property];
+  return carried != null ? { label: key, icon: "tune" } : null;
+}
+
+/** The mask's five, as a set, for splitting the menu in two. */
+const MASK_ANIMATION_PROPERTIES = new Set<string>(MASK_ANIMATABLE_PROPERTIES);
+
+/**
+ * A clip's label, with an effect's preset name resolved.
+ *
+ * `draw.ts` derives labels from the element alone, which is right for every
+ * other type — a clip is named after its file, a title after its words. An
+ * effect's name lives in a preset manifest on disk, and the painter is DOM-free
+ * and drawn against a Skia canvas in tests, so it cannot read one. This is the
+ * hook it exposes for exactly that; the preset id is the fallback when the
+ * preset is not installed, which is at least true.
+ */
+function labelForClip(element: TimelineElement): string {
+  if (element.filetype === "effect") {
+    return resolvePreset(element)?.name ?? clipLabel(element);
+  }
+  return clipLabel(element);
+}
+
+/**
+ * The timeline canvas.
+ *
+ * This used to be 1,500 lines that measured clips, hit-tested them, drew them,
+ * and edited them — with the row geometry written out four separate times
+ * across two files and, inevitably, disagreeing. All of that now lives in
+ * DOM-free modules under `features/timeline/`, each with its own tests, and
+ * what is left here is the part that genuinely needs a browser: a canvas, some
+ * event listeners, and the store.
+ */
+@customElement("element-timeline-canvas")
+export class elementTimelineCanvas extends LitElement {
+  /**
+   * The selection, kept in `selectionStore` and reached through here.
+   *
+   * An accessor rather than a field so every call site in this file — and the
+   * agent's `select_clips`/`get_selection`, which reach for this property
+   * through the DOM — reads and writes exactly as it did, while the value
+   * itself lives somewhere the toolbar can subscribe to. A plain field notified
+   * nobody, which is why writing it used to have to be followed by a manual
+   * `drawCanvas()`.
+   */
+  get targetId(): string[] {
+    return selectionStore.getState().ids;
+  }
+
+  set targetId(ids: string[]) {
+    selectionStore.getState().setIds(ids);
+  }
+
+  /**
+   * The selection as it stood when the context menu opened.
+   *
+   * Stays a plain field: this is a snapshot of one gesture, not the app's idea
+   * of what is selected, and nothing outside this component should see it.
+   */
+  targetIdDuringRightClick: string[] = [];
+
+  /**
+   * Where "Add a note" puts its pin, taken when the context menu opened, and
+   * the pointer's viewport position there for the card. Null when the canvas
+   * has no rows.
+   */
+  private noteDuringRightClick: {
+    anchor: NoteAnchor;
+    x: number;
+    y: number;
+  } | null = null;
+
+  /** The note pins the last paint placed, for the hit tests. */
+  private notePins: NotePin[] = [];
+
+  private dragState: DragState = idleDrag;
+  /** The document as it stood when the drag began. */
+  private dragBase: TimelineDocument | null = null;
+  /** `timelineStore.switchEpoch` when the drag began. */
+  private dragEpoch = 0;
+  /**
+   * The selection the drag is carrying.
+   *
+   * Also the band's starting point: `dispatchPointer` snapshots this on `down`
+   * *before* the effects run, so for a shift-drag over empty space it holds
+   * the selection as it stood when the button went down — the thing a band
+   * extends, and the thing Escape puts back.
+   */
+  private dragIds: string[] = [];
+  private longPressTimer = 0;
+  /** Row a freed clip is currently hovering over, for the drop highlight. */
+  private dropTrackId: string | null = null;
+  /** The rubber-band currently being dragged, in canvas px, or null. */
+  private marqueeRect: ScreenRect | null = null;
+  /**
+   * The document as the drag has it so far.
+   *
+   * A drag draws from this and writes to the store exactly once, on mouseup.
+   * Every mousemove used to call `patchTimeline`, which churned the store at
+   * pointer rate and let a single drag eat the whole undo history.
+   */
+  private pendingDoc: TimelineDocument | null = null;
+  private snapGuideMs: number | null = null;
+  /**
+   * Whether the frame lattice is currently drawn.
+   *
+   * The only state the hysteresis needs: `shouldShowFrameGrid` stays a pure
+   * function by being handed its own previous answer, so the grid cannot strobe
+   * while the zoom slider crosses the threshold.
+   */
+  private frameGridOn = false;
+  private layout: TimelineLayout = {
+    rows: [],
+    clips: [],
+    transitions: [],
+    cuts: [],
+    totalHeight: 0,
+  };
+  private canvasVerticalScroll = 0;
+
+  /**
+   * The pulse the hold gave the clips it freed, while it plays.
+   *
+   * Left to finish when the gesture ends, Escape included: cutting it at the
+   * release would snap a half-pressed clip back to size in one frame.
+   */
+  private lift: { ids: ReadonlySet<string>; startMs: number } | null = null;
+
+  /**
+   * Both scrolls as they stood when the press began.
+   *
+   * A move resolves from travel through the content, not across the screen
+   * (`contentTravel`), so a scroll mid-drag carries the clip with the rows and
+   * times under the pointer instead of leaving it on a row counted from where
+   * it started.
+   */
+  private dragScrollOrigin: ScrollPair = { h: 0, v: 0 };
+  /**
+   * Where the pointer is, in canvas px, while a gesture is live.
+   *
+   * Kept apart from `dragState` because a slide zeroes its vertical travel, and
+   * the edge zones still need to know where the hand actually is.
+   */
+  private dragPointer: Point | null = null;
+  /** Which edge zones this gesture has armed. See `updateArm`. */
+  private edgeArm: { x: EdgeArm; y: EdgeArm } = { x: UNARMED, y: UNARMED };
+  private edgeScroller = createEdgeScroller({
+    scheduler: windowScheduler(),
+    now: () => performance.now(),
+    velocity: () => this.edgeVelocity(),
+    scrollBy: (dx, dy) => this.edgeScrollBy(dx, dy),
+  });
+
+  /**
+   * The bare cut under the pointer, hinted while hovered.
+   *
+   * Display-only, like `snapGuideMs`: it takes no part in hit-testing, which
+   * reads the cut rects out of `layout` directly.
+   */
+  private hoveredCut: { trackId: string; fromId: string } | null = null;
+
+  /**
+   * Decodes filmstrip frames in the background.
+   *
+   * Drawing only ever reads from it, so a frame that is not ready yet costs
+   * nothing; when one lands it asks for a repaint.
+   */
+  private tiles: VideoTileProvider = createVideoTileProvider();
+  /**
+   * Shared, not owned: the preview's level meter reads the same decoded peaks.
+   * See `sharedAudioPeakProvider`. This element unsubscribes from it on
+   * disconnect but must never dispose it.
+   */
+  private peaks: AudioPeakProvider = sharedAudioPeakProvider();
+  private disposeStrips: Array<() => void> = [];
+
+  constructor() {
+    super();
+    window.addEventListener("resize", this.handleWindowResize);
+    window.addEventListener("keydown", this._handleKeydown.bind(this));
+    document.addEventListener("mousedown", this._handleDocumentClick.bind(this));
+
+    // A drag has to keep tracking once the pointer leaves the canvas —
+    // dragging a clip up to another row means moving well outside it — and it
+    // must end even if the button is released somewhere else entirely,
+    // otherwise the drag sticks to the cursor.
+    window.addEventListener("mousemove", this.handleWindowMouseMove);
+    window.addEventListener("mouseup", this.handleWindowMouseUp);
+    window.addEventListener("blur", this.handleCancelGesture);
+    window.addEventListener(CANCEL_GESTURES_EVENT, this.handleCancelGesture);
+  }
+
+  /** Bound so `this` survives the listener call. */
+  private handleWindowResize = () => {
+    this.drawCanvas();
+  };
+
+  private handleWindowMouseMove = (e: MouseEvent) => {
+    if (this.dragState.phase === "idle" || !this.canvas) {
+      return;
+    }
+    const rect = this.canvas.getBoundingClientRect();
+    this.dispatchPointer({
+      type: "move",
+      x: e.clientX - rect.left,
+      y: e.clientY - rect.top,
+      t: e.timeStamp,
+    });
+  };
+
+  private handleWindowMouseUp = (e: MouseEvent) => {
+    if (this.dragState.phase !== "idle") {
+      this.dispatchPointer({ type: "up", t: e.timeStamp });
+    }
+  };
+
+  /** Escape abandons a drag; so does the window losing focus mid-gesture. */
+  private handleCancelGesture = () => {
+    if (this.dragState.phase !== "idle") {
+      this.dispatchPointer({ type: "cancel" });
+    }
+  };
+
+  private timelineResizeObserver?: ResizeObserver;
+
+  /**
+   * `element-timeline` sits in a resizable split pane and can measure 0 high at
+   * first paint, so observing it covers both the first real layout and every
+   * later resize.
+   */
+  protected firstUpdated(): void {
+    const timeline = document.querySelector("element-timeline");
+    if (timeline) {
+      this.timelineResizeObserver = new ResizeObserver(() => this.drawCanvas());
+      this.timelineResizeObserver.observe(timeline);
+    }
+    this.disposeStrips = [
+      this.tiles.onReady(() => this.drawCanvas()),
+      this.peaks.onReady(() => this.drawCanvas()),
+    ];
+    this.drawCanvas();
+  }
+
+  disconnectedCallback(): void {
+    for (const dispose of this.disposeStrips) {
+      dispose();
+    }
+    this.disposeStrips = [];
+    this.tiles.dispose();
+    // `peaks` is deliberately not disposed: it is the shared decode cache, and
+    // the preview's level meter is still reading it.
+    this.timelineResizeObserver?.disconnect();
+    this.timelineResizeObserver = undefined;
+    // A coalesced repaint outlives the element that asked for it otherwise, and
+    // would run `paintCanvas` against a canvas that is no longer in the tree.
+    if (this.drawRequest) {
+      cancelAnimationFrame(this.drawRequest);
+      this.drawRequest = 0;
+    }
+    window.removeEventListener("resize", this.handleWindowResize);
+    window.removeEventListener("mousemove", this.handleWindowMouseMove);
+    window.removeEventListener("mouseup", this.handleWindowMouseUp);
+    window.removeEventListener("blur", this.handleCancelGesture);
+    window.removeEventListener(CANCEL_GESTURES_EVENT, this.handleCancelGesture);
+    window.clearTimeout(this.longPressTimer);
+    this.edgeScroller.stop();
+    super.disconnectedCallback();
+  }
+
+  @query("#elementTimelineCanvasRef") canvas!: HTMLCanvasElement;
+
+  @property({ attribute: false })
+  timelineState: ITimelineStore = useTimelineStore.getInitialState();
+
+  @property({ attribute: false })
+  timeline: any = this.timelineState.timeline;
+
+  @property({ attribute: false })
+  tracks = this.timelineState.tracks;
+
+  @property({ attribute: false })
+  timelineRange = this.timelineState.range;
+
+  @property({ attribute: false })
+  timelineScroll = this.timelineState.scroll;
+
+  @property({ attribute: false })
+  timelineCursor = this.timelineState.cursor;
+
+  @property({ attribute: false })
+  timelineHistory = this.timelineState.history;
+
+  @property({ attribute: false })
+  control = this.timelineState.control;
+
+  @property({ attribute: false })
+  keyframeState: IKeyframeStore = keyframeStore.getInitialState();
+
+  @property({ attribute: false })
+  uiState: IUIStore = uiStore.getInitialState();
+
+  @property({ attribute: false })
+  resize = this.uiState.resize;
+
+  @property({ attribute: false })
+  renderOptionStore: IRenderOptionStore = renderOptionStore.getInitialState();
+
+  @property({ attribute: false })
+  renderOption = this.renderOptionStore.options;
+
+  @consume({ context: timelineContext })
+  @property({ attribute: false })
+  public timelineOptions: any = { canvasVerticalScroll: 0 };
+
+  createRenderRoot() {
+    useTimelineStore.subscribe((state) => {
+      this.timeline = state.timeline;
+      this.tracks = state.tracks;
+      this.timelineRange = state.range;
+      this.timelineCursor = state.cursor;
+      this.timelineScroll = state.scroll;
+      this.timelineHistory = state.history;
+      this.control = state.control;
+      this.drawCanvas();
+    });
+
+    // The selection is drawn, so a change to it has to repaint — including one
+    // made from somewhere else entirely, like the toolbar's merge narrowing the
+    // selection or the agent's `select_clips`.
+    selectionStore.subscribe(() => {
+      this.drawCanvas();
+    });
+
+    // An effect clip is labelled with its preset's *name*, which lives in the
+    // registry rather than in the document. The registry fills in
+    // asynchronously at startup, well after this canvas has already painted —
+    // so without this every effect on the timeline showed its raw preset id
+    // until some unrelated edit happened to trigger a repaint.
+    subscribePresets(() => {
+      this.drawCanvas();
+    });
+
+    uiStore.subscribe((state) => {
+      this.resize = state.resize;
+      this.drawCanvas();
+    });
+
+    renderOptionStore.subscribe((state) => {
+      this.renderOption = state.options;
+      this.drawCanvas();
+    });
+
+    // A row resized from its header, live while the edge is dragged. Batched
+    // into the next frame like every other repaint, so a drag costs one paint
+    // per frame however many pixels it crossed.
+    trackHeightStore.subscribe(() => {
+      this.drawCanvas();
+    });
+
+    // Note pins are drawn, and so is which one has its card open.
+    noteStore.subscribe(() => {
+      this.drawCanvas();
+    });
+
+    return this;
+  }
+
+  /** The document being displayed: mid-drag preview, or the committed one. */
+  private currentDoc(): TimelineDocument {
+    return this.pendingDoc ?? useTimelineStore.getState().getDocument();
+  }
+
+  /** A pending coalesced repaint, or 0. */
+  private drawRequest = 0;
+
+  /**
+   * Ask for a repaint on the next frame.
+   *
+   * This is the entry point every caller gets — including the cross-component
+   * ones that reach in through `querySelector` — because none of them needs the
+   * pixels to exist before the call returns, and several of them fire far
+   * faster than the display can show the result: a cursor tick on a 120Hz
+   * panel, a mousemove from a high-rate pointer, a drag writing the document
+   * once per event. Each of those used to be a synchronous relayout of every
+   * clip plus a full-window paint.
+   *
+   * `previewCanvas.scheduleDraw` is the same thing, and was already doing it
+   * for the viewport.
+   *
+   * Coalescing also keeps `this.layout` honest rather than compromising it.
+   * Every hit test — `_handleMouseMove`, `_handleMouseDown`, the drop targets —
+   * reads the layout `paintCanvas` last computed, so deferring the paint defers
+   * the layout with it and the pointer goes on aiming at the frame actually on
+   * screen. Painting eagerly would have let the layout run a frame *ahead* of
+   * the picture, which is the `previewCanvas.collisionCheck` bug in a new
+   * place: the picture in one spot and the pointer's idea of it in another.
+   * The field is initialised to an empty layout, so a hit test before the first
+   * paint misses rather than throwing.
+   */
+  drawCanvas() {
+    if (this.drawRequest) {
+      return;
+    }
+    this.drawRequest = requestAnimationFrame(() => {
+      this.drawRequest = 0;
+      this.paintCanvas();
+    });
+  }
+
+  private paintCanvas() {
+    perfCount("timeline.draw");
+    const container = document.querySelector("element-timeline");
+    if (!this.canvas || !container) {
+      return;
+    }
+
+    const ctx = this.canvas.getContext("2d");
+    if (!ctx) {
+      return;
+    }
+
+    const dpr = window.devicePixelRatio || 1;
+    // The canvas is absolutely positioned to the right of the track headers, so
+    // its own width is what is left of the window. Using the full window width
+    // ran it off the right edge by exactly the header width.
+    const width = Math.max(
+      0,
+      window.innerWidth - this.resize.timelineVertical.leftOption,
+    );
+    const height = (container as HTMLElement).offsetHeight;
+
+    // All four numbers, not three: `style.height` was missing and no
+    // stylesheet supplies one, so the CSS box fell back to the `height`
+    // attribute and every y coordinate was off by `dpr`. See `canvasSurface`.
+    applySurface(this.canvas, ctx, surfaceSpec(width, height, dpr));
+
+    const doc = this.currentDoc();
+    const liftInset =
+      this.lift == null ? null : liftInsetAt(performance.now() - this.lift.startMs);
+    if (liftInset == null) {
+      this.lift = null;
+    }
+    this.layout = layoutTimeline({
+      doc,
+      range: this.timelineRange,
+      hScroll: this.timelineScroll,
+      vScroll: this.canvasVerticalScroll,
+      viewportW: width,
+      viewportH: height,
+      heights: effectiveTrackHeights(),
+    });
+
+    const fps = this.projectFps();
+    // Recomputed each paint, carrying its own previous answer so the threshold
+    // has hysteresis and the lattice cannot flicker mid zoom-drag.
+    this.frameGridOn = shouldShowFrameGrid(
+      this.timelineRange,
+      fps,
+      this.frameGridOn,
+    );
+
+    drawTimeline(ctx, {
+      layout: this.layout,
+      doc,
+      range: this.timelineRange,
+      hScroll: this.timelineScroll,
+      viewportW: width,
+      viewportH: height,
+      fps,
+      frameGrid: this.frameGridOn,
+      // Selecting a group outlines its contents too. A group's bar sits on its
+      // own row, often far from the clips it holds, so without this there is no
+      // way to see what is in one — and the outline is drawn by the painter
+      // already, so showing it costs nothing but the id list.
+      //
+      // Only the *drawn* selection is widened. `this.targetId` still holds what
+      // the user picked, so a drag moves the group's bar alone and a delete
+      // removes the group (taking its contents through `withDescendants`,
+      // which is a decision `deleteClips` owns rather than the painter).
+      selection: withDescendants(this.timeline, this.targetId),
+      playheadMs: this.timelineCursor,
+      // Main's length, or a template's own (`composition/timelineEnd.ts`).
+      projectEndMs: activeTimelineEndMs(),
+      snapGuideMs: this.snapGuideMs,
+      // Hinted only while hovered; a transcript-driven edit has hundreds of
+      // cuts and marking them all would be noise.
+      hoveredCut: this.hoveredCut,
+      // `draw.ts` is DOM-free and cannot read a preset manifest off disk, so
+      // an effect's display name is injected from here instead of derived.
+      labelOf: labelForClip,
+      provider: this.tiles,
+      peaks: this.peaks,
+      lift:
+        this.lift != null && liftInset != null
+          ? { ids: this.lift.ids, insetPx: liftInset }
+          : null,
+    });
+
+    // Above the clips and the playhead, below the gesture transients.
+    const notes = noteStore.getState();
+    this.notePins = placeNotePins(
+      notes.notes,
+      this.layout,
+      this.timelineRange,
+      this.timelineScroll,
+      { w: width, h: height },
+    );
+    drawNotePins(ctx, this.notePins, notes.open?.id ?? null);
+
+    // The pulse runs on the paint loop itself: one more frame while it lasts,
+    // and nothing scheduled once it is over.
+    if (this.lift != null) {
+      this.drawCanvas();
+    }
+
+    if (this.dropTrackId != null) {
+      drawDropTarget(ctx, this.layout, this.dropTrackId, width);
+    }
+
+    // Last, because it is the topmost transient. Outside `drawTimeline` for
+    // the reason the drop target is: that function takes a document and a
+    // layout and knows nothing about a gesture in flight.
+    if (this.marqueeRect != null) {
+      drawMarquee(ctx, this.marqueeRect);
+    }
+  }
+
+  // ---------------------------------------------------------------- editing
+
+  /**
+   * Apply a document transform and record one undo step.
+   *
+   * Guarded, because this is the canvas's own commit and does not go through
+   * `features/editor/actions`: a track move, a level point, a transition at a
+   * cut and the end of every drag all land here.
+   */
+  private commit(fn: (doc: TimelineDocument) => TimelineDocument) {
+    if (refusesEdit()) {
+      return;
+    }
+    useTimelineStore.getState().withCheckpoint(fn);
+  }
+
+  /**
+   * The project's frame rate.
+   *
+   * One source, `renderOptionStore.options.fps` — the same field
+   * `features/export/renderTimeline.ts` samples the timeline with. The component
+   * already subscribes to that store and repaints on any change, so making fps
+   * editable later needs nothing here.
+   */
+  private projectFps(): number {
+    return normalizeFps(this.renderOption?.fps);
+  }
+
+  /**
+   * The rate this project's curves must be baked at.
+   *
+   * `keyframeOps` defaults every op to `BAKE_HZ` (60), which is half the rate a
+   * 120fps project reads its lanes at, so a curve authored without this steps
+   * visibly until the file is reloaded. `commands/animation.ts` reads the store
+   * for the same reason and with the same rule.
+   */
+  private projectBakeHz(): number {
+    return bakeRateFor(this.projectFps());
+  }
+
+  /**
+   * Move the playhead by whole frames, without accumulating error.
+   *
+   * Public because the Playback menu offers the same step. The modal-tool
+   * guard stays inside rather than at the callers, so both surfaces decline
+   * together while the mask pen is drawing.
+   */
+  public stepCursor(deltaFrames: number) {
+    if (this.control.cursorType !== "pointer") {
+      return;
+    }
+    this.timelineState.setCursor(
+      stepCursorByFrames(this.timelineCursor, deltaFrames, this.projectFps()),
+    );
+  }
+
+  /**
+   * Delete and close the gap, pulling later clips on the same track backwards.
+   * Delete and close the gap, pulling later clips on the same track backwards.
+   *
+   * Plain delete leaves the hole; this is the other half of the pair every
+   * editor offers, and with one clip per row there was nothing for it to act on
+   * before.
+   */
+  public rippleDeleteSelected() {
+    const ids = [...this.targetIdDuringRightClick];
+    this.commit((doc) => {
+      let next = doc;
+      for (const id of ids) {
+        next = rippleDelete(next, id);
+      }
+      return next;
+    });
+  }
+
+  /**
+   * Remove the right-clicked clips.
+   *
+   * Acts on the context-menu snapshot rather than the live selection, so it
+   * stays here instead of calling `deleteSelection` — the menu operates on what
+   * was under the cursor when it opened.
+   */
+  public removeSeletedElements() {
+    const ids = [...this.targetIdDuringRightClick];
+    this.commit((doc) => deleteClips(doc, ids));
+  }
+
+  // ---------------------------------------------------------------- groups
+
+  /**
+   * Wrap the right-clicked selection in a new group.
+   *
+   * The work is `features/editor/actions#groupClips`, which the Clip menu also
+   * calls; what stays here is the one thing the context menu means and the menu
+   * bar does not — that it acts on the right-click snapshot rather than on the
+   * live selection.
+   */
+  public groupSelected() {
+    groupClips([...this.targetIdDuringRightClick]);
+    this.drawCanvas();
+  }
+
+  /** Dissolve the right-clicked group, leaving its contents where they look. */
+  public ungroupSelected() {
+    ungroupClips([...this.targetIdDuringRightClick]);
+    this.drawCanvas();
+  }
+
+  /** Detach the right-clicked clips from their group, keeping them in place. */
+  public removeSelectedFromGroup() {
+    const ids = [...this.targetIdDuringRightClick];
+    const atMs = useTimelineStore.getState().cursor;
+    this.commit((doc) => removeFromParent(doc, ids, atMs));
+    this.drawCanvas();
+  }
+
+  /**
+   * Hold the right-clicked null's tracked point on the frame's centre by
+   * moving the right-clicked clip under it (`track/stabilizeOp.ts`).
+   *
+   * Offered only for exactly a clip and a null the op would accept, so the
+   * refusal toast below is for a document that changed between the click and
+   * the choice.
+   */
+  public stabilizeSelected() {
+    const doc = this.currentDoc();
+    const pair = stabilizePairOf(doc, [...this.targetIdDuringRightClick]);
+    if (pair == null) {
+      return;
+    }
+    const { previewSize, fps } = renderOptionStore.getState().options;
+    let outcome: ReturnType<typeof stabilize>["outcome"] | null = null;
+    this.commit((input) => {
+      const result = stabilize(input, {
+        ...pair,
+        target: { x: previewSize.w / 2, y: previewSize.h / 2 },
+        frame: { width: previewSize.w, height: previewSize.h },
+        fps,
+        autoZoom: true,
+        zoomId: uuidv4(),
+        cameraId: uuidv4(),
+        trackIds: { zoom: uuidv4(), camera: uuidv4() },
+      });
+      outcome = result.outcome;
+      return result.doc;
+    });
+
+    const done = outcome as ReturnType<typeof stabilize>["outcome"] | null;
+    if (done == null) {
+      return;
+    }
+    if (!done.ok) {
+      this.toast(refusalMessage(done.reason));
+      return;
+    }
+    this.targetId = [done.zoomId];
+    this.showSideOption(done.zoomId);
+    const message = zoomMessage(done);
+    if (message != null) {
+      this.toast(message);
+    }
+    this.drawCanvas();
+  }
+
+  /** Take apart every rig the right-clicked clips belong to, exactly. */
+  public removeStabilization() {
+    const rigs = this.rigsInSnapshot();
+    this.commit((doc) =>
+      rigs.reduce((next, rig) => dissolveRig(next, rig), doc),
+    );
+    this.drawCanvas();
+  }
+
+  /** The intact rigs the right-click snapshot touches, each once. */
+  private rigsInSnapshot(): Rig[] {
+    const doc = this.currentDoc();
+    const seen = new Map<string, Rig>();
+    for (const id of this.targetIdDuringRightClick) {
+      const rig = rigOf(doc.elements, id);
+      if (rig != null) {
+        seen.set(rig.zoomId, rig);
+      }
+    }
+    return [...seen.values()];
+  }
+
+  /**
+   * The group entries for the context menu, chosen from what is selected.
+   *
+   * "Ungroup" only when a group is in the selection; "remove from group" only
+   * when something in it actually has a parent — offering an item that can only
+   * decline is worse than not offering it. For the same reason none of the
+   * three is offered for a stabilize rig's members, which `setParent` and
+   * `createGroup` decline; the rig is taken apart whole, by "Remove
+   * stabilization".
+   */
+  private groupMenuTemplate(): string {
+    const ids = this.targetIdDuringRightClick;
+    if (ids.length === 0) {
+      return "";
+    }
+
+    const doc = this.currentDoc();
+    const call = (method: string, label: string, icon: string) =>
+      `<menu-dropdown-item onclick="document.querySelector('element-timeline-canvas').${method}()" item-name="${label}" item-icon="${icon}"> </menu-dropdown-item>`;
+
+    const rows: string[] = [];
+    const held = ids.some((id) => isRigMember(doc.elements, id));
+
+    if (stabilizePairOf(doc, ids) != null) {
+      rows.push(call("stabilizeSelected", "Stabilize on null", "video_stable"));
+    }
+    if (this.rigsInSnapshot().length > 0) {
+      rows.push(call("removeStabilization", "Remove stabilization", "layers_clear"));
+    }
+    if (held) {
+      return rows.join("\n          ");
+    }
+
+    if (ids.every((id) => canBeGrouped(doc.elements[id]))) {
+      rows.push(call("groupSelected", "Group selected", "layers"));
+    }
+    if (ids.some((id) => doc.elements[id]?.filetype === "group")) {
+      rows.push(call("ungroupSelected", "Ungroup", "layers_clear"));
+    }
+    if (ids.some((id) => parentOf(doc.elements, id) != null)) {
+      rows.push(call("removeSelectedFromGroup", "Remove from group", "link_off"));
+    }
+
+    return rows.join("\n          ");
+  }
+
+  // ----------------------------------------------------------- template slots
+
+  /** Mark the right-clicked clips as slots in an exported template. */
+  public markSelectedReplaceable() {
+    const ids = [...this.targetIdDuringRightClick];
+    this.commit((doc) => setReplaceable(doc, ids, uuidv4));
+    this.drawCanvas();
+  }
+
+  /** Unmark them. */
+  public unmarkSelectedReplaceable() {
+    const ids = [...this.targetIdDuringRightClick];
+    this.commit((doc) => clearReplaceable(doc, ids));
+    this.drawCanvas();
+  }
+
+  /**
+   * The replaceable entries, chosen from what is selected.
+   *
+   * Offered only when the op would do something — the rule this menu already
+   * keeps for grouping and for detaching audio, and the reason is unchanged:
+   * `menu-dropdown-item` has no disabled state, so an entry that could only
+   * decline is worse than no entry.
+   */
+  private replaceableMenuTemplate(): string {
+    const ids = this.targetIdDuringRightClick;
+    if (ids.length === 0) {
+      return "";
+    }
+
+    const doc = this.currentDoc();
+    const call = (method: string, label: string, icon: string) =>
+      `<menu-dropdown-item onclick="document.querySelector('element-timeline-canvas').${method}()" item-name="${label}" item-icon="${icon}"> </menu-dropdown-item>`;
+
+    const rows: string[] = [];
+    if (
+      ids.some(
+        (id) =>
+          isReplaceable(doc.elements[id]) && replaceableOf(doc, id) == null,
+      )
+    ) {
+      rows.push(
+        call("markSelectedReplaceable", "Mark replaceable", "swap_horiz"),
+      );
+    }
+    if (ids.some((id) => replaceableOf(doc, id) != null)) {
+      rows.push(
+        call("unmarkSelectedReplaceable", "Unmark replaceable", "block"),
+      );
+    }
+
+    return rows.join("\n          ");
+  }
+
+  // ----------------------------------------------------------------- audio
+
+  /**
+   * Split the right-clicked clips' audio onto audio tracks of their own.
+   *
+   * One `withCheckpoint` for the whole selection, so Cmd+Z takes back the new
+   * clips, the track they landed on and the silencing of their sources
+   * together. Clips with nothing to detach are skipped inside the op, and a
+   * selection where none of them can be detached returns the document by
+   * identity — no undo step for a click that did nothing.
+   */
+  public detachAudioFromSelected() {
+    const ids = [...this.targetIdDuringRightClick];
+    this.commit((doc) => detachAudioFrom(doc, ids, uuidv4));
+    this.drawCanvas();
+  }
+
+  /**
+   * The "detach audio" entry, offered only when it would do something.
+   *
+   * `menu-dropdown-item` has no disabled state, so the choice is between
+   * showing an item that can only decline and showing none — and the group
+   * menu above already settled that question the same way.
+   */
+  private audioMenuTemplate(): string {
+    const ids = this.targetIdDuringRightClick;
+    if (ids.length === 0) {
+      return "";
+    }
+
+    const doc = this.currentDoc();
+    if (!ids.some((id) => canDetachAudio(doc.elements[id]))) {
+      return "";
+    }
+
+    return `<menu-dropdown-item onclick="document.querySelector('element-timeline-canvas').detachAudioFromSelected()" item-name="Detach audio" item-icon="music_off"> </menu-dropdown-item>`;
+  }
+
+  /**
+   * Bake the selected text clips into image clips.
+   *
+   * Async, unlike every other entry on this menu: the glyphs have to be drawn
+   * and the PNG written before the document can change. The single checkpoint
+   * happens inside `rasterizeTextElements` once all of that has landed, so the
+   * whole selection is still one Cmd+Z.
+   */
+  public async rasterizeSelectedText() {
+    const ids = [...this.targetIdDuringRightClick];
+    const cursor = useTimelineStore.getState().cursor ?? 0;
+    const results = await rasterizeTextElements(ids, cursor);
+
+    const failed = results.filter((result) => !result.ok);
+    if (failed.length > 0) {
+      (document.querySelector("toast-box") as any)?.showToast({
+        message: `Could not rasterize ${failed.length} clip(s)`,
+        delay: "4000",
+      });
+    }
+
+    this.drawCanvas();
+  }
+
+  /** The "rasterize text" entry, offered only when the selection has text. */
+  private rasterizeMenuTemplate(): string {
+    const ids = this.targetIdDuringRightClick;
+    if (ids.length === 0) {
+      return "";
+    }
+
+    const doc = this.currentDoc();
+    if (!ids.some((id) => doc.elements[id]?.filetype === "text")) {
+      return "";
+    }
+
+    return `<menu-dropdown-item onclick="document.querySelector('element-timeline-canvas').rasterizeSelectedText()" item-name="Rasterize text" item-icon="image"> </menu-dropdown-item>`;
+  }
+
+  // ------------------------------------------------------------------ info
+
+  /** Open Show Info on the one right-clicked clip's source file. */
+  public showInfoForSelected() {
+    const [id] = this.targetIdDuringRightClick;
+    const target = targetForElement(this.currentDoc().elements[id]);
+    if (target != null) {
+      openMediaInfo(target);
+    }
+  }
+
+  // ------------------------------------------------------ template timelines
+
+  /** Open the right-clicked template's own timeline in a tab of its own. */
+  public expandTemplateForSelected() {
+    const id = this.targetIdDuringRightClick[0];
+    if (id == null) {
+      return;
+    }
+    void expandTemplate(id).then((outcome) => {
+      if (!outcome.ok && outcome.reason !== "locked") {
+        (document.querySelector("toast-box") as any)?.showToast({
+          message: outcome.reason,
+          delay: "4000",
+        });
+      }
+    });
+  }
+
+  /** Save the right-clicked template, one this project owns, to the library. */
+  public saveTemplateForSelected() {
+    const element = this.currentDoc().elements[this.targetIdDuringRightClick[0]];
+    const compositionId = compositionOfElement(element);
+    if (compositionId != null) {
+      void (document.querySelector("timeline-tabs") as any)?.saveTemplate?.(
+        compositionId,
+      );
+    }
+  }
+
+  /**
+   * "Expand Template" for exactly one template clip, and "Save as Template…"
+   * once it is one the project owns. Not on the phone layout, which hides the
+   * row above the timeline that holds the tabs to get back.
+   */
+  private templateMenuTemplate(): string {
+    const ids = this.targetIdDuringRightClick;
+    if (ids.length !== 1 || MOBILE_LAYOUT) {
+      return "";
+    }
+    const element = this.currentDoc().elements[ids[0]];
+    if (element?.filetype !== "template") {
+      return "";
+    }
+    const call = (method: string, label: string, icon: string) =>
+      `<menu-dropdown-item onclick="document.querySelector('element-timeline-canvas').${method}()" item-name="${label}" item-icon="${icon}"> </menu-dropdown-item>`;
+    const rows = [call("expandTemplateForSelected", "Expand Template", "open_in_full")];
+    if (compositionOfElement(element) != null) {
+      rows.push(call("saveTemplateForSelected", "Save as Template…", "bookmark_add"));
+    }
+    return rows.join("\n          ");
+  }
+
+  /**
+   * "Show Info", for exactly one video, photo, GIF or sound clip. A selection
+   * of several has no single file to describe, and the rest of this menu's
+   * rule applies: an entry that could only decline is not offered.
+   */
+  private infoMenuTemplate(): string {
+    const ids = this.targetIdDuringRightClick;
+    if (ids.length !== 1 || !canShowMediaInfo()) {
+      return "";
+    }
+    if (targetForElement(this.currentDoc().elements[ids[0]]) == null) {
+      return "";
+    }
+    return `<menu-dropdown-item onclick="document.querySelector('element-timeline-canvas').showInfoForSelected()" item-name="Show Info" item-icon="info"> </menu-dropdown-item>`;
+  }
+
+  // ----------------------------------------------------------------- media
+
+  /**
+   * Start reversing the right-clicked video clips.
+   *
+   * Returns at once: the file is made in main, the tray in the bottom-left
+   * shows it, and each clip lands as its own undo step when its file does.
+   * The work is `reverseSession`, which the option panel's button also calls.
+   */
+  public reverseSelected() {
+    reverseClips([...this.targetIdDuringRightClick]);
+  }
+
+  /** Put the right-clicked clips back on their forward sources. Instant. */
+  public unreverseSelected() {
+    unreverseClips([...this.targetIdDuringRightClick]);
+    this.drawCanvas();
+  }
+
+  /** Mirror the right-clicked clips on one axis, or clear it. */
+  public mirrorSelected(axis: MirrorAxis) {
+    mirrorClips([...this.targetIdDuringRightClick], axis);
+    this.drawCanvas();
+  }
+
+  /**
+   * Reverse and mirror entries, offered only when they would do something —
+   * the rule the rest of this menu keeps, since `menu-dropdown-item` has no
+   * disabled state. A clip already being reversed offers no second Reverse.
+   *
+   * The mirror labels say what the click will do: a toggle over a selection
+   * that is all mirrored clears it, and "Mirror horizontally" on a clip that
+   * already is would be a label promising the opposite of the effect.
+   */
+  private mediaMenuTemplate(): string {
+    const ids = this.targetIdDuringRightClick;
+    if (ids.length === 0) {
+      return "";
+    }
+
+    const doc = this.currentDoc();
+    const call = (invocation: string, label: string, icon: string) =>
+      `<menu-dropdown-item onclick="document.querySelector('element-timeline-canvas').${invocation}" item-name="${label}" item-icon="${icon}"> </menu-dropdown-item>`;
+
+    const rows: string[] = [];
+
+    if (
+      canReverseHere() &&
+      ids.some((id) => isReversible(doc.elements[id]) && !isReversePending(id))
+    ) {
+      rows.push(call("reverseSelected()", "Reverse", "fast_rewind"));
+    }
+    if (ids.some((id) => isReversed(doc.elements[id]))) {
+      rows.push(call("unreverseSelected()", "Un-reverse", "restore"));
+    }
+
+    const h = mirrorToggleTarget(doc, ids, "h");
+    if (h != null) {
+      rows.push(
+        call(
+          "mirrorSelected('h')",
+          h ? "Mirror horizontally" : "Remove horizontal mirror",
+          "flip",
+        ),
+      );
+    }
+    const v = mirrorToggleTarget(doc, ids, "v");
+    if (v != null) {
+      rows.push(
+        call(
+          "mirrorSelected('v')",
+          v ? "Flip vertically" : "Remove vertical flip",
+          "swap_vert",
+        ),
+      );
+    }
+
+    return rows.join("\n          ");
+  }
+
+  // ----------------------------------------------------------------- drag
+
+  /**
+   * Apply the drag machine's verdict to the document.
+   *
+   * The machine decides *what kind* of gesture is happening, `dragResolve`
+   * decides *where it lands*, and this turns that answer into a candidate
+   * document. Recomputed from `dragBase` every frame rather than compounded, so
+   * the clip tracks the pointer exactly.
+   *
+   * The arithmetic that used to live here — snapping, rounding, the no-op guard
+   * — moved into `features/timeline/dragResolve.ts` so it could be tested. It
+   * was the last real decision in the timeline that a suite could not reach,
+   * and frame quantization is not something to add to untested code.
+   */
+  /**
+   * Alt-click on the rubber band: add a point, or take one away.
+   *
+   * The gesture every editor binds to this, and the two halves are one idea:
+   * the line is a list of points, and Alt toggles whether there is one under
+   * the pointer.
+   *
+   * Adding **plants** rather than appends, so dropping a point into the middle
+   * of a fade cannot re-shape the fade either side of it. Removing the last
+   * point puts the level it held back on the clip as a static value, so
+   * undoing an envelope one point at a time never makes the clip suddenly
+   * loud. `audioOps` owns both rules; this method owns only the arithmetic
+   * that turns an x into a time.
+   */
+  private toggleLevelPointAt(
+    hit: { elementId: string; zone: string; levelIndex?: number },
+    offsetX: number,
+  ) {
+    const bakeHz = this.projectBakeHz();
+    if (hit.zone === "levelPoint") {
+      const index = hit.levelIndex;
+      if (index == null) {
+        return;
+      }
+      this.commit((doc) =>
+        removeLevelKeyframe(doc, hit.elementId, index, bakeHz),
+      );
+      this.drawCanvas();
+      return;
+    }
+
+    const rect = this.layout.clips.find(
+      (clip) => clip.elementId === hit.elementId,
+    );
+    if (rect == null || !(rect.w > 0)) {
+      return;
+    }
+    const element = this.currentDoc().elements[hit.elementId];
+    if (element == null) {
+      return;
+    }
+    // Element-local, and not snapped: audio is exempt from the frame grid, so
+    // the point lands exactly where it was clicked.
+    const tMs = ((offsetX - rect.x) * spanLength(element)) / rect.w;
+    this.commit((doc) => addLevelKeyframe(doc, hit.elementId, tMs, bakeHz));
+    this.drawCanvas();
+  }
+
+  /**
+   * One frame of a level rubber-band drag.
+   *
+   * **Relative, not absolute.** The drag moves the level by how far the pointer
+   * has travelled rather than setting it to where the pointer is. That matters
+   * because the band is short: a 40px track leaves about 19px for 72 dB, so an
+   * absolute mapping would make the level jump to wherever the press landed and
+   * would cap precision at the band's height. Relative travel plus Shift's fine
+   * mode makes the whole range reachable at any height, and it is what every
+   * editor does.
+   *
+   * Three cases, and they are the three things the line can mean:
+   *
+   *   - an unkeyframed clip: the whole clip's static level;
+   *   - a keyframed clip, dragged on the line: the entire envelope, shifted,
+   *     because the shape the user drew is theirs;
+   *   - a point: that keyframe, in time and level both.
+   */
+  private resolveLevelDrag(
+    base: TimelineDocument,
+    drag: DragState,
+  ): TimelineDocument | null {
+    const hit = drag.hit;
+    if (hit.kind !== "clip") {
+      return null;
+    }
+    const element = base.elements[hit.elementId];
+    if (element == null) {
+      return null;
+    }
+    const rect = this.layout.clips.find(
+      (clip) => clip.elementId === hit.elementId,
+    );
+    if (rect == null) {
+      return null;
+    }
+    const band = levelBandOf(rect, element);
+    if (band == null) {
+      return null;
+    }
+
+    // Shift is a tenth of a decibel per pixel. The coarse rate is the band's
+    // own scale *at the level being dragged*, because that scale is tapered:
+    // taking it at one fixed level would make the line lag the pointer near
+    // unity and outrun it near the floor.
+    const perPx = drag.shift
+      ? FINE_LEVEL_DB_PER_PX
+      : dbPerPx(band, volumeDbOf(element));
+    const deltaDb = -drag.dyPx * perPx;
+    const bakeHz = this.projectBakeHz();
+
+    if (drag.phase === "levelPoint") {
+      const index = hit.levelIndex;
+      if (index == null) {
+        return null;
+      }
+      const track = (element as any).animation?.volumeDb;
+      const keyframe = track?.x?.[index];
+      const tMs = keyframe?.p?.[0];
+      const db = keyframe?.p?.[1];
+      if (typeof tMs !== "number" || typeof db !== "number") {
+        return null;
+      }
+      // Time moves with the pointer at the timeline's own scale, and is not
+      // quantized: `frames.ts#isFrameLocked` exempts audio from the grid, and a
+      // gain change is heard at the instant it happens.
+      const movedMs = tMs + pxToMsSigned(drag.dxPx, this.timelineRange);
+      return moveLevelKeyframe(
+        base,
+        hit.elementId,
+        index,
+        movedMs,
+        db + deltaDb,
+        bakeHz,
+      );
+    }
+
+    if (hasLevelEnvelope(element)) {
+      return offsetLevelEnvelope(base, hit.elementId, deltaDb, bakeHz);
+    }
+    return setVolumeDb(base, hit.elementId, volumeDbOf(element) + deltaDb);
+  }
+
+  private applyDrag() {
+    const base = this.dragBase;
+    const drag = this.dragState;
+    if (base == null) {
+      return;
+    }
+
+    const fps = this.projectFps();
+
+    if (
+      drag.hit.kind === "transition" &&
+      (drag.phase === "transitionStart" || drag.phase === "transitionEnd")
+    ) {
+      this.snapGuideMs = null;
+      this.dropTrackId = null;
+
+      const plan = resolveTransitionResize({
+        base,
+        transitionId: drag.hit.transitionId,
+        edge: drag.phase === "transitionStart" ? "start" : "end",
+        dxPx: drag.dxPx,
+        range: this.timelineRange,
+        fps,
+      });
+      // `setTransitionDuration` clamps to what the source handles can supply
+      // and records the ask, so dragging past the available footage stops the
+      // badge growing without losing what was asked for. It clamps rather
+      // than refuses, so identity from it is the base.
+      const next =
+        plan.kind === "none"
+          ? null
+          : setTransitionDuration(base, drag.hit.transitionId, plan.durationMs);
+      this.pendingDoc = nextDragPreview(this.pendingDoc, base, next, "base");
+      this.drawCanvas();
+      return;
+    }
+
+    if (drag.hit.kind !== "clip") {
+      return;
+    }
+
+    this.snapGuideMs = null;
+    this.dropTrackId = null;
+
+    // `null` is a resolver's "no change". `nextDragPreview` keeps that apart
+    // from a declined op, and the difference is the whole of it — see there.
+    let next: TimelineDocument | null = null;
+
+    if (drag.phase === "level" || drag.phase === "levelPoint") {
+      // Recomputed from `dragBase` every frame rather than compounded, like
+      // every other gesture here: a drag draws from the document as it was when
+      // the press began and writes to the store exactly once, on mouseup.
+      next = this.resolveLevelDrag(base, drag);
+      // The ops clamp at the ends of the fader rather than refusing, so
+      // identity from them means the base and not "declined".
+      this.pendingDoc = nextDragPreview(this.pendingDoc, base, next, "base");
+      this.drawCanvas();
+      return;
+    }
+
+    if (drag.phase === "trimStart" || drag.phase === "trimEnd") {
+      // Trimming acts on the grabbed clip alone; dragging one edge of a
+      // multi-selection has no obvious meaning for the rest. `clipOps` clamps
+      // the edge at the neighbouring clip rather than letting it overlap.
+      const edge = drag.phase === "trimStart" ? "start" : "end";
+      const plan = resolveTrim({
+        base,
+        elementId: drag.hit.elementId,
+        edge,
+        dxPx: drag.dxPx,
+        range: this.timelineRange,
+        fps,
+        playheadMs: this.timelineCursor,
+      });
+      if (plan.kind !== "none") {
+        next =
+          edge === "start"
+            ? trimClipStart(base, drag.hit.elementId, plan.trimMs)
+            : trimClipEnd(base, drag.hit.elementId, plan.trimMs);
+
+        // Asked after the op, not before: `clipOps` clamps against the source
+        // file's remaining footage, so an edge can be aimed at a neighbour it
+        // cannot reach. A guide on a line the edge stopped short of reads as a
+        // bug.
+        this.snapGuideMs = confirmTrimGuide(
+          next,
+          drag.hit.elementId,
+          edge,
+          plan.snapGuideMs,
+        );
+      }
+      // A trim clamps rather than refuses, so identity is the base.
+      this.pendingDoc = nextDragPreview(this.pendingDoc, base, next, "base");
+      this.drawCanvas();
+      return;
+    } else {
+      // The grabbed clip is resolved, and the whole selection then moves by
+      // however much it actually travelled, so a multi-clip drag keeps its
+      // shape.
+      //
+      // Travel through the content once the gesture is a move, so the clip
+      // stays under the pointer while the view scrolls. Not while `pressed`:
+      // a wheel then must not move a clip the reducer has not let go of yet.
+      //
+      // And kept in sight: carried past an edge, the clip waits at it (the
+      // grabbed instant at the side, the outermost whole row at the top or
+      // bottom) while the view scrolls, so it lands where it was last seen.
+      const moving = drag.phase === "moveH" || drag.phase === "moveFree";
+      const bands = moving ? this.edgeBands() : null;
+      const scroll = this.currentScroll();
+      const travel = moving
+        ? contentTravel(
+            {
+              dx: bands
+                ? pinToBand(drag.origin.x, drag.dxPx, bands.x)
+                : drag.dxPx,
+              dy: drag.dyPx,
+            },
+            this.dragScrollOrigin,
+            scroll,
+          )
+        : { dx: drag.dxPx, dy: drag.dyPx };
+      // Over the same heights the rows are drawn at, so a clip changes row
+      // where the rows it is carried across visibly meet.
+      const stack = rowStack(base.tracks, effectiveTrackHeights());
+      const plan = resolveMove({
+        base,
+        primaryId: drag.hit.elementId,
+        dragIds: this.dragIds,
+        dxPx: travel.dx,
+        dyPx: travel.dy,
+        free: drag.free,
+        range: this.timelineRange,
+        fps,
+        playheadMs: this.timelineCursor,
+        stack,
+        rows: bands ? wholeRowsInView(scroll.v, bands.y, stack) : null,
+      });
+
+      // A gesture that moves nothing must produce nothing. `moveClips` builds a
+      // fresh document even for a zero delta, so `next !== base` held and a
+      // press-and-hold with a steady hand committed an undo step that appears
+      // to do nothing — and, if a neighbour's edge happened to lie within the
+      // snap tolerance, silently relocated the clip the user never dragged.
+      if (plan.kind !== "none") {
+        this.snapGuideMs = plan.snapGuideMs;
+        next = moveClips(base, this.dragIds, plan.appliedMs, plan.trackDelta);
+
+        if (plan.trackDelta !== 0 && next !== base) {
+          this.dropTrackId =
+            next.elements[drag.hit.elementId]?.trackId ?? null;
+        }
+      }
+    }
+
+    // `moveClips` refuses rather than clamps, so a declined move holds the
+    // previous frame: a blocked drag comes to rest against whatever is in the
+    // way instead of jumping home. "No change" still goes home.
+    this.pendingDoc = nextDragPreview(this.pendingDoc, base, next, "hold");
+    this.drawCanvas();
+  }
+
+  /**
+   * Recompute the band, and the selection it names.
+   *
+   * The screen-space twin of `applyDrag`: same moment in the gesture, same
+   * per-move budget, but it produces a selection rather than a candidate
+   * document. Separate because `applyDrag`'s entire job is turning the
+   * machine's verdict into a `TimelineDocument`, and a band makes none — so a
+   * marquee must not reach it, and the branch that keeps it out is stated in
+   * `dispatchPointer` rather than left to `applyDrag`'s early return, which
+   * only declines a band by coincidence of `hit.kind`.
+   *
+   * Selection is applied on every move, not once on release: watching clips
+   * light up as the band sweeps them is the whole gesture. That costs nothing,
+   * because `clipsInRect` answers in layout order — the same array whichever
+   * way the band was dragged — so a move that swept nothing new is declined by
+   * `setIds`' `sameIds` guard and wakes no subscriber. The repaint below is
+   * unconditional anyway: the band itself has moved even when its contents
+   * have not.
+   */
+  private applyMarquee() {
+    const drag = this.dragState;
+    const rect = rectBetween(drag.origin, {
+      x: drag.origin.x + drag.dxPx,
+      y: drag.origin.y + drag.dyPx,
+    });
+    this.marqueeRect = rect;
+
+    // `this.layout` is the layout the last paint produced — the same one every
+    // hit test in this file reads, and so the same pixels the user is aiming
+    // at. See `drawCanvas`.
+    const banded = clipsInRect(this.layout, rect);
+    this.targetId = drag.shift ? mergeIds(this.dragIds, banded) : banded;
+
+    this.drawCanvas();
+  }
+
+  /** Feed one pointer event to the machine and carry out what it asks for. */
+  private dispatchPointer(ev: PointerEv) {
+    const { state, effects } = reduceDrag(this.dragState, ev);
+    const wasIdle = this.dragState.phase === "idle";
+    this.dragState = state;
+
+    if (ev.type === "down" || ev.type === "move") {
+      this.dragPointer = { x: ev.x, y: ev.y };
+    }
+
+    if (ev.type === "down" && state.phase !== "idle") {
+      this.dragBase = this.currentDoc();
+      this.dragEpoch = useTimelineStore.getState().switchEpoch;
+      this.dragIds = [...this.targetId];
+      this.dragScrollOrigin = this.currentScroll();
+      this.edgeArm = { x: UNARMED, y: UNARMED };
+      // A hold has to be able to complete without the pointer moving.
+      window.clearTimeout(this.longPressTimer);
+      this.longPressTimer = window.setTimeout(
+        () => this.dispatchPointer({ type: "tick", t: ev.t + DRAG.LONG_PRESS_MS }),
+        DRAG.LONG_PRESS_MS,
+      );
+    }
+
+    for (const effect of effects) {
+      switch (effect.type) {
+        case "cursor":
+          this.style.cursor = effect.value;
+          break;
+        case "clearSelection":
+          this.targetId = [];
+          this.drawCanvas();
+          break;
+        case "restoreSelection":
+          // A cancelled band. `dragIds` still holds the selection from before
+          // the press — the idle branch below clears it, and that runs after
+          // this loop.
+          this.targetId = this.dragIds;
+          this.drawCanvas();
+          break;
+        case "commit": {
+          const pending = this.pendingDoc;
+          this.pendingDoc = null;
+          // `pending` is a whole document of the timeline the drag began in.
+          // Committed after a switch, it would replace the other timeline.
+          if (
+            pending &&
+            useTimelineStore.getState().switchEpoch === this.dragEpoch
+          ) {
+            this.commit(() => pending);
+          }
+          break;
+        }
+        case "revert":
+          this.pendingDoc = null;
+          break;
+        case "armed":
+          // The clip is off its track now; showing that immediately is what
+          // makes the gesture discoverable without a tooltip.
+          this.startLift();
+          this.drawCanvas();
+          break;
+        default:
+          break;
+      }
+    }
+
+    if (state.phase === "idle") {
+      // Captured before the reset below, because it is the one thing that says
+      // this gesture was a band: a click and a clip drag never set it. See the
+      // `syncSideOption` call at the end of this branch.
+      const wasMarquee = this.marqueeRect != null;
+      window.clearTimeout(this.longPressTimer);
+      this.longPressTimer = 0;
+      // The view stays where the gesture left it, Escape included: the drop
+      // is under the pointer, and a cancel takes back the edit, not the look.
+      this.edgeScroller.stop();
+      this.dragPointer = null;
+      this.dragBase = null;
+      this.dragIds = [];
+      this.snapGuideMs = null;
+      this.dropTrackId = null;
+      // One place covers `up`, `cancel`, Escape and window blur.
+      this.marqueeRect = null;
+      // `commit` and `revert` clear this themselves, but a press that ends
+      // without ever becoming a drag emits neither — and `applyDrag` has
+      // already run for it, because a `pressed` state still tracks the pointer.
+      // Left set, `currentDoc()` keeps returning that preview for good: the
+      // canvas shows a clip position the store does not have, later store
+      // changes are invisible, and the next real drag commits the stale
+      // document on top of whatever happened in between. An ordinary imprecise
+      // click — press, drift two pixels, release — was enough.
+      this.pendingDoc = null;
+      // A band names no clip, so `_handleMouseDown` — the only thing that
+      // pushes the option column — never fired for it, and the column went on
+      // showing whichever clip was last clicked. Once, here, rather than from
+      // `applyMarquee`: see `syncSideOption`.
+      if (wasMarquee) {
+        this.syncSideOption();
+      }
+      this.drawCanvas();
+      return;
+    }
+
+    if (!wasIdle || ev.type !== "down") {
+      if (state.phase === "marquee") {
+        this.applyMarquee();
+      } else {
+        this.applyDrag();
+      }
+    }
+
+    this.updateEdgeScroll();
+  }
+
+  /**
+   * Press in the clips the hold just freed: the grabbed one and whatever is
+   * selected with it, since all of them move together from here.
+   *
+   * Nothing at all under reduced motion. The cursor's change to `grabbing`
+   * still says the same thing without anything on screen moving.
+   */
+  private startLift() {
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      return;
+    }
+    const ids = new Set(this.dragIds);
+    const hit = this.dragState.hit;
+    if (hit.kind === "clip") {
+      ids.add(hit.elementId);
+    }
+    this.lift = { ids, startMs: performance.now() };
+  }
+
+  /** Both scrolls as they stand. */
+  private currentScroll(): ScrollPair {
+    return {
+      h: useTimelineStore.getState().scroll,
+      v: this.canvasVerticalScroll,
+    };
+  }
+
+  /**
+   * The visible stretch of each axis, in canvas px.
+   *
+   * Measured rather than assumed, because what covers the canvas is decided by
+   * other components. The ruler is laid over the top `RULER_OFFSET`. At the
+   * bottom, the canvas runs past the window's own edge (by 46px in an 800px
+   * window), and the status bar and the horizontal scrollbar are both
+   * `position: fixed` over what is left. Measured from the canvas's box, the
+   * bottom zone sat entirely off screen and the last row the scroll stopped on
+   * was one nobody could see.
+   */
+  private edgeBands(): { x: Band; y: Band } | null {
+    if (!this.canvas) {
+      return null;
+    }
+    const rect = this.canvas.getBoundingClientRect();
+    let bottom = Math.min(rect.bottom, window.innerHeight);
+    // The scrollbar is only rendered while there is somewhere to scroll to.
+    for (const selector of [".timeline-bottom-scroll", ".timeline-bottom"]) {
+      const bar = document.querySelector(selector)?.getBoundingClientRect();
+      if (bar != null && bar.height > 0 && bar.top > rect.top) {
+        bottom = Math.min(bottom, bar.top);
+      }
+    }
+    return {
+      x: { lo: 0, hi: rect.width },
+      y: { lo: RULER_OFFSET, hi: bottom - rect.top },
+    };
+  }
+
+  /**
+   * Re-arm the edge zones for where the pointer now is, and start the loop if
+   * it is in one. Called after every pointer event; a gesture that cannot
+   * scroll (a trim, a band, a press still undecided) just stops it.
+   */
+  private updateEdgeScroll() {
+    const axes = scrollAxesOf(this.dragState.phase);
+    const pointer = this.dragPointer;
+    const bands = axes.x || axes.y ? this.edgeBands() : null;
+    if (pointer == null || bands == null) {
+      this.edgeScroller.stop();
+      return;
+    }
+
+    const origin = this.dragState.origin;
+    this.edgeArm = {
+      x: updateArm(this.edgeArm.x, pointer.x, origin.x, bands.x),
+      y: updateArm(this.edgeArm.y, pointer.y, origin.y, bands.y),
+    };
+    this.edgeScroller.update();
+  }
+
+  /** The edge loop's speed for the pointer as it stands, in px per second. */
+  private edgeVelocity(): { x: number; y: number } {
+    const axes = scrollAxesOf(this.dragState.phase);
+    const pointer = this.dragPointer;
+    const bands = axes.x || axes.y ? this.edgeBands() : null;
+    if (pointer == null || bands == null) {
+      return { x: 0, y: 0 };
+    }
+    return {
+      x: axes.x ? axisVelocity(pointer.x, bands.x, this.edgeArm.x) : 0,
+      y: axes.y ? axisVelocity(pointer.y, bands.y, this.edgeArm.y) : 0,
+    };
+  }
+
+  /**
+   * One step of the edge loop, then the drag re-resolved at the new scroll.
+   *
+   * Time is open to the right, as it is for the trackpad (see `applyWheel`):
+   * holding a clip at the right edge is how it is carried past the end of the
+   * project. The rows stop where the last one comes fully into view.
+   */
+  private edgeScrollBy(dx: number, dy: number): boolean {
+    const before = this.currentScroll();
+
+    const nextH = scrollStep(before.h, dx, 0, Infinity);
+    if (nextH !== before.h) {
+      this.timelineState.setScroll(nextH);
+    }
+
+    const bands = this.edgeBands();
+    if (bands != null) {
+      const maxV = maxVerticalScroll(this.layout.totalHeight, bands.y.hi);
+      this.setVerticalScroll(scrollStep(before.v, dy, 0, maxV));
+    }
+
+    const after = this.currentScroll();
+    if (after.h === before.h && after.v === before.v) {
+      return false;
+    }
+    this.applyDrag();
+    return true;
+  }
+
+  /**
+   * What a finger landing at client (`x`, `y`) should do, for the touch bridge.
+   *
+   * Asked here because only this component holds the layout a press is hit
+   * tested against; the rule itself is `mobile/timelineTouch.ts`.
+   */
+  touchModeAt(clientX: number, clientY: number): SurfaceMode {
+    const rect = this.canvas.getBoundingClientRect();
+    const hit = hitTest(
+      this.layout,
+      clientX - rect.left,
+      clientY - rect.top,
+      this.currentDoc().elements,
+      this.timelineRange,
+    );
+    return timelineTouchMode(hit, this.targetId);
+  }
+
+  // --------------------------------------------------------------- events
+
+  /**
+   * Clicking away from the timeline clears the selection.
+   *
+   * Bound to `mousedown`, which fires *before* the click a button acts on —
+   * and that ordering made the toolbar inert the moment it shipped. Pressing
+   * "split" cleared the selection on the way down, so by the time the button's
+   * own handler ran there was nothing selected and the op declined.
+   *
+   * Chrome that exists to act on the selection therefore opts out with
+   * `data-keeps-selection`. An allowlist rather than naming the toolbar here
+   * because it will not be the last such surface: anything that operates on
+   * what is selected has the same problem, and should not have to be known to
+   * this file to avoid it.
+   */
+  _handleDocumentClick(e) {
+    if (e.target?.id === "elementTimelineCanvasRef") {
+      return;
+    }
+
+    if (
+      e.target instanceof Element &&
+      e.target.closest("[data-keeps-selection]") != null
+    ) {
+      return;
+    }
+
+    this.targetId = [];
+    this.drawCanvas();
+  }
+
+  /**
+   * Apply a wheel gesture to the timeline.
+   *
+   * Public because the track-header column forwards its own wheel events here
+   * rather than working the scroll out for itself: the two columns are one
+   * scrollable surface, and one implementation is what stops them drifting
+   * apart. Vertical, horizontal and the Ctrl/pinch zoom therefore behave
+   * identically wherever the pointer is.
+   */
+  applyWheel(e) {
+    // Not `hasEditorModifier`. macOS synthesises `ctrlKey` on a trackpad pinch,
+    // and Windows spells wheel-zoom Ctrl+wheel — so this one flag is the right
+    // test on both platforms. Routing it through the editor modifier would make
+    // pinch-to-zoom scroll the timeline on a Mac instead of magnifying it.
+    if (e.ctrlKey) {
+      e.preventDefault();
+      const next = pinchRange(
+        this.timelineRange,
+        parseFloat(e.deltaY),
+        this.projectFps(),
+      );
+      if (next !== this.timelineRange) {
+        this.timelineState.setRange(next);
+      }
+      return;
+    }
+
+    this.setVerticalScroll(Math.max(0, this.canvasVerticalScroll + e.deltaY));
+
+    // The trackpad scrolls freely past the end of the project — only the bottom
+    // scrollbar is bounded, because a thumb that can leave its track is telling
+    // the user something untrue. A flick is not.
+    this.timelineState.setScroll(Math.max(0, this.timelineScroll + e.deltaX));
+
+    // A clip being carried follows the rows and times the wheel brought under
+    // the pointer. Without this it stayed put until the next mousemove, then
+    // jumped to a row counted from where it started.
+    const phase = this.dragState.phase;
+    if (phase === "moveH" || phase === "moveFree") {
+      this.applyDrag();
+    }
+  }
+
+  /**
+   * Scroll the rows, and the track headers with them.
+   *
+   * One writer for the wheel and the edge loop alike, so the headers cannot be
+   * left behind by either.
+   */
+  private setVerticalScroll(next: number) {
+    if (next === this.canvasVerticalScroll) {
+      return;
+    }
+    this.canvasVerticalScroll = next;
+    this.timelineOptions.canvasVerticalScroll = next;
+    this.drawCanvas();
+    this.syncTrackHeaders();
+  }
+
+  /**
+   * Tell the track-header column to redraw at the new vertical scroll.
+   *
+   * Writing the offset into the shared context object is not enough on its own:
+   * `@lit/context` publishes when the provider's property is *reassigned*, and
+   * this is a mutation of the object it already holds. So the value is correct
+   * the moment the column next renders, but nothing asks it to — until this
+   * change that only happened when an unrelated store update happened to wake
+   * it, which left the headers sitting a few notches behind the rows they name.
+   */
+  private syncTrackHeaders() {
+    const headers: any = document.querySelector("element-timeline-left-option");
+    headers?.requestUpdate();
+  }
+
+  _handleMouseMove(e) {
+    // While a gesture is live the window listener owns tracking, so this only
+    // has to keep the cursor honest about what is under the pointer.
+    if (this.dragState.phase !== "idle") {
+      return;
+    }
+
+    if (notePinAt(this.notePins, e.offsetX, e.offsetY) != null) {
+      this.style.cursor = "pointer";
+      return;
+    }
+
+    const hit = hitTest(
+      this.layout,
+      e.offsetX,
+      e.offsetY,
+      this.currentDoc().elements,
+      this.timelineRange,
+    );
+
+    // The hovered cut, if any. Only one is ever hinted and only while the
+    // pointer is on it — a transcript-driven edit has hundreds of cuts, and a
+    // permanent marker on each would be noise.
+    const nextHoveredCut =
+      hit.kind === "cut"
+        ? { trackId: hit.trackId, fromId: hit.fromId }
+        : null;
+    const hoverChanged =
+      (this.hoveredCut?.fromId ?? null) !== (nextHoveredCut?.fromId ?? null) ||
+      (this.hoveredCut?.trackId ?? null) !== (nextHoveredCut?.trackId ?? null);
+    this.hoveredCut = nextHoveredCut;
+
+    if (hit.kind === "clip") {
+      // The rubber band gets its own cursors, because it is the one part of a
+      // clip where a press means something other than moving or trimming and
+      // the pointer is the only warning of that.
+      this.style.cursor =
+        hit.zone === "body"
+          ? "pointer"
+          : hit.zone === "level"
+            ? "ns-resize"
+            : hit.zone === "levelPoint"
+              ? "grab"
+              : "ew-resize";
+    } else if (hit.kind === "transition") {
+      this.style.cursor = hit.zone === "body" ? "pointer" : "ew-resize";
+    } else if (hit.kind === "cut") {
+      this.style.cursor = "pointer";
+    } else {
+      this.style.cursor = "default";
+    }
+
+    // Repaint only when the hint actually appears or disappears — this runs at
+    // pointer rate.
+    if (hoverChanged) {
+      this.drawCanvas();
+    }
+  }
+
+  _handleMouseDown(e) {
+    // A pin sits on top of whatever clip is under it, so a press on one opens
+    // the note and goes no further: it neither selects nor drags the clip.
+    const noteId =
+      e.button === 0 ? notePinAt(this.notePins, e.offsetX, e.offsetY) : null;
+    if (noteId != null) {
+      // The card focuses its field as soon as it renders, which is before this
+      // press's default action runs; left alone, that action moves focus off
+      // the field again and the first keystroke goes to the timeline.
+      e.preventDefault();
+      noteStore.getState().openAt(noteId, e.clientX, e.clientY);
+      return;
+    }
+
+    this.timelineState.setCursorType("pointer");
+
+    const hit = hitTest(
+      this.layout,
+      e.offsetX,
+      e.offsetY,
+      this.currentDoc().elements,
+      this.timelineRange,
+    );
+
+    // Selection is settled here, before the machine sees the press, because
+    // what the drag carries depends on it.
+    if (hit.kind === "clip") {
+      if (e.shiftKey) {
+        if (!this.targetId.includes(hit.elementId)) {
+          this.targetId = [...this.targetId, hit.elementId];
+        }
+      } else if (!this.targetId.includes(hit.elementId)) {
+        this.targetId = [hit.elementId];
+      }
+      this.sideOptionFor(hit.elementId, e.button);
+    }
+
+    if (hit.kind === "transition") {
+      // Selecting it opens `<option-transition>`, which is the only way to
+      // change its preset or alignment. Never additive: a transition has
+      // nothing in common with a multi-clip selection, and the ops that act on
+      // one take a single id.
+      this.targetId = [hit.transitionId];
+      this.sideOptionFor(hit.transitionId, e.button);
+    }
+
+    // Everything above settles the selection, and looking at a clip is not
+    // editing it, so a locked timeline still lets a press choose one. Below
+    // this line is where a press starts changing the document, and that is
+    // refused here rather than at the commit: a drag previews through
+    // `previewDocument`, which is the very channel the caption session writes
+    // its projection on, so an armed gesture would paint over the session's
+    // document for the length of the drag. A press on empty canvas is left
+    // alone, because a rubber band only selects.
+    if (hit.kind !== "none" && refusesEdit()) {
+      this.drawCanvas();
+      return;
+    }
+
+    if (hit.kind === "cut") {
+      this.addTransitionAtCut(hit.fromId, hit.toId);
+    }
+
+    // Alt on the rubber band adds or removes a point. Handled here, on the
+    // press, because it is a click and not a drag: there is nothing to track
+    // and nothing to preview, so routing it through the drag machine would
+    // mean a phase that commits on `up` having already done its work.
+    //
+    // It returns rather than falling through, so the press arms no gesture. An
+    // Alt press that *did* reach the machine would start an unconstrained clip
+    // move, which is what Alt means everywhere else on a clip.
+    if (
+      e.altKey &&
+      e.button === 0 &&
+      hit.kind === "clip" &&
+      (hit.zone === "level" || hit.zone === "levelPoint")
+    ) {
+      this.toggleLevelPointAt(hit, e.offsetX);
+      return;
+    }
+
+    // `mousedown` fires for the right button too, and that press still has to
+    // reach the machine: it is what settles the selection `_handleContextmenu`
+    // is about to snapshot. `primary` is what stops it *arming* anything — the
+    // menu opens over the canvas, so a gesture tracking the pointer would sweep
+    // a rubber-band underneath it as the hand moves to the menu.
+    this.dispatchPointer({
+      type: "down",
+      x: e.offsetX,
+      y: e.offsetY,
+      t: e.timeStamp,
+      hit,
+      shift: e.shiftKey,
+      alt: e.altKey,
+      primary: e.button === 0,
+    });
+
+    this.drawCanvas();
+  }
+
+  _handleMouseUp(e) {
+    if (this.dragState.phase !== "idle") {
+      this.dispatchPointer({ type: "up", t: e.timeStamp });
+    }
+  }
+
+  /**
+   * Canvas-local coordinates for a drag event.
+   *
+   * `offsetX`/`offsetY` are not on the TS `DragEvent` type and needed an `any`
+   * cast; measuring off the bounding rect matches what `handleWindowMouseMove`
+   * already does for the mouse path, so both gestures read the same numbers.
+   */
+  private dragPoint(e: DragEvent): { x: number; y: number } {
+    const rect = this.canvas.getBoundingClientRect();
+    return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+  }
+
+  /**
+   * Accept a drop: an asset out of the panel, or files in from the OS.
+   *
+   * Assets could only ever be clicked before, which added them at the playhead
+   * on whatever row the chooser picked. Dropping says where and on which track,
+   * which is the whole point of having tracks — and OS files earn the same,
+   * rather than always landing at the playhead the way they used to.
+   */
+  _handleDragOver(e: DragEvent) {
+    const intent = dropIntent(e.dataTransfer?.types);
+
+    if (intent === "ignore") {
+      // Text or a link. Clear any highlight left from a previous drag rather
+      // than leaving a row lit under something that will never drop.
+      this._handleDragLeave();
+      return;
+    }
+
+    e.preventDefault();
+    if (e.dataTransfer) {
+      e.dataTransfer.dropEffect = "copy";
+    }
+
+    const { y } = this.dragPoint(e);
+    const next = trackAtY(this.layout, y);
+    if (next !== this.dropTrackId) {
+      this.dropTrackId = next;
+      this.drawCanvas();
+    }
+  }
+
+  _handleDragLeave() {
+    if (this.dropTrackId != null) {
+      this.dropTrackId = null;
+      this.drawCanvas();
+    }
+  }
+
+  _handleDrop(e: DragEvent) {
+    const intent = dropIntent(e.dataTransfer?.types);
+    this._handleDragLeave();
+
+    if (intent === "ignore") {
+      return;
+    }
+
+    // Refused whole rather than at the commit, so the OS drag ends with the
+    // file going nowhere instead of appearing and then being wiped by the
+    // caption session's next rebuild.
+    if (refusesEdit()) {
+      return;
+    }
+
+    const { x, y } = this.dragPoint(e);
+    const target = dropTargetAt(
+      this.layout,
+      x,
+      y,
+      this.timelineRange,
+      this.timelineScroll,
+      this.projectFps(),
+    );
+
+    if (intent === "template") {
+      const templateId = e.dataTransfer?.getData(TEMPLATE_MIME);
+      if (!templateId) {
+        return;
+      }
+      e.preventDefault();
+      void addTemplateToTimeline(templateId, {
+        startMs: target.startMs,
+        trackId: target.trackId,
+      }).then((result) => {
+        if (!result.ok) {
+          (document.querySelector("toast-box") as any)?.showToast({
+            message: result.message,
+            delay: "3000",
+          });
+        }
+        this.drawCanvas();
+      });
+      return;
+    }
+
+    if (intent === "lut-preset") {
+      const presetId = e.dataTransfer?.getData(LUT_PRESET_MIME);
+      if (!presetId) {
+        return;
+      }
+      e.preventDefault();
+      this.dropLutPreset(presetId, target.startMs, x, y);
+      return;
+    }
+
+    if (intent === "fx-preset") {
+      const presetId = e.dataTransfer?.getData(FX_PRESET_MIME);
+      if (!presetId) {
+        return;
+      }
+      e.preventDefault();
+      this.dropFxPreset(presetId, target.startMs, x, y);
+      return;
+    }
+
+    if (intent === "asset") {
+      const originPath = e.dataTransfer?.getData(ASSET_MIME);
+      if (!originPath) {
+        return;
+      }
+      e.preventDefault();
+      void importPathsAt([originPath], target);
+      return;
+    }
+
+    // `preventDefault` here is also what tells the curtain's own `drop`
+    // handler — which runs after this one, on `document` — that these files
+    // are already spoken for.
+    e.preventDefault();
+    void importDroppedFiles(e.dataTransfer, target);
+  }
+
+  _handleContextmenu(e) {
+    this.targetIdDuringRightClick = [...this.targetId];
+    const anchor = noteAnchorAt(
+      this.layout,
+      e.offsetX,
+      e.offsetY,
+      this.timelineRange,
+      this.timelineScroll,
+    );
+    this.noteDuringRightClick =
+      anchor == null ? null : { anchor, x: e.clientX, y: e.clientY };
+
+    // The menu is split, delete, merge, group, detach and the rest: every item
+    // on it would decline. An affordance that could only decline is not
+    // offered, which is the rule `layout.ts#hitTest` already keeps about the
+    // trim handles on a template.
+    if (refusesEdit()) {
+      return;
+    }
+
+    if (e.which == 3 || e.button == 2) {
+      this.showMenuDropdown({ x: e.clientX, y: e.clientY });
+    }
+  }
+
+  _handleKeydown(event) {
+    // Bound to `window`, so a keystroke aimed at a text field arrives here too.
+    // Without this, Backspace while typing deleted the selected clip.
+    if (isTypingEvent(event)) {
+      return;
+    }
+
+    // The mask pen owns Escape, Enter, Backspace and Delete while a stroke is
+    // in progress, and this is where it takes them from: Backspace here would
+    // delete the very clip being masked.
+    //
+    // `previewCanvas` also installs a capture-phase listener that calls
+    // `stopPropagation`, and that is what handles a real keystroke — but it is
+    // not sufficient on its own. Capture only beats a bubble listener when the
+    // event's target is *below* `window` in the tree; for one dispatched at
+    // `window` itself both fire in the AT_TARGET phase, in registration order,
+    // and this listener is registered first because the timeline mounts before
+    // the preview. So the ownership is stated here as well, where it cannot
+    // depend on which element happened to have focus.
+    if (
+      this.control.cursorType === "pen" &&
+      penCapturesKey(event.code)
+    ) {
+      return;
+    }
+
+    if (event.code === "Escape") {
+      this.handleCancelGesture();
+      return;
+    }
+
+    const mod = hasEditorModifier(event);
+
+    // `event.code` and a platform-strict modifier: the old handler used
+    // `keyCode` with a hard-coded `ctrlKey`, so none of these worked on macOS
+    // at all. It then accepted `metaKey || ctrlKey`, which worked everywhere
+    // but meant Ctrl+D on a Mac split a clip — a combination macOS spends on
+    // its own text editing. `hasEditorModifier` takes Cmd there and Ctrl here,
+    // and nothing else.
+    switch (event.code) {
+      case "ArrowUp":
+        this.moveSelectionByTrack(-1);
+        return;
+      case "ArrowDown":
+        this.moveSelectionByTrack(1);
+        return;
+      case "ArrowRight":
+        this.stepCursor(1);
+        return;
+      case "ArrowLeft":
+        this.stepCursor(-1);
+        return;
+      case "Backspace":
+      case "Delete":
+        deleteSelection();
+        return;
+    }
+
+    // Extension keybindings, after the app's own unmodified keys and before
+    // its modifier branch. The typing guard and the mask pen have already had
+    // this event, so an extension cannot take a key from a caption field or
+    // from a stroke in progress, and every chord the app itself uses was
+    // refused when the binding was registered.
+    if (dispatchExtensionKeybinding(event)) {
+      event.preventDefault();
+      return;
+    }
+
+    if (!mod) {
+      return;
+    }
+
+    // Every branch below delegates to `features/editor/actions`, which is also
+    // what the timeline toolbar calls. The shortcut and the button are the same
+    // code path by construction — there is no second implementation to drift.
+    //
+    // `preventDefault` matters here: the Electron app menu owns these same
+    // accelerators through native `undo`/`redo`/`cut`/`copy`/`paste` roles, and
+    // without this both fire. `isTypingEvent` above already let real text
+    // editing through, so nothing that wants the native behaviour reaches this.
+    switch (event.code) {
+      case "KeyZ":
+        event.preventDefault();
+        if (event.shiftKey) {
+          redo();
+        } else {
+          undo();
+        }
+        return;
+      case "KeyC":
+        event.preventDefault();
+        copySelection();
+        return;
+      case "KeyV":
+        event.preventDefault();
+        pasteFromClipboard();
+        return;
+      case "KeyX":
+        event.preventDefault();
+        cutSelection();
+        return;
+      case "KeyD":
+        event.preventDefault();
+        splitSelection();
+        return;
+    }
+  }
+
+  /**
+   * Move the selection one row up or down.
+   *
+   * Replaces `exchangePriority`, which swapped two elements' priorities to
+   * reorder rows — and which was called with the selection *array* where a
+   * single id was expected, so it never matched anything and silently did
+   * nothing.
+   *
+   * Gated on the pointer tool, exactly as `stepCursor` is and for the same
+   * reason: while a modal tool is active the arrow keys belong to it, or to
+   * nothing. Without this, pressing Up while drawing a mask moved the clip
+   * being masked to another track — one undo step per press, under a pointer
+   * that was nowhere near the timeline.
+   */
+  public moveSelectionByTrack(delta: number) {
+    if (this.control.cursorType !== "pointer") {
+      return;
+    }
+    this.commit((doc) => moveClips(doc, this.targetId, 0, delta));
+  }
+
+  /** The app's toast, reached the way everything else in this file reaches it. */
+  private toast(message: string) {
+    (document.querySelector("toast-box") as any)?.showToast({
+      message,
+      delay: "4000",
+    });
+  }
+
+  /**
+   * A preset tile dropped onto the timeline.
+   *
+   * A transition goes to the nearest bare cut on the row under the pointer, and
+   * an effect lands where it was dropped. Dropping a transition anywhere but on
+   * a track with a cut has nothing to attach to, so it says so rather than
+   * silently doing nothing — the failure mode a drop target most easily has.
+   */
+  /**
+   * A filter dropped on the timeline.
+   *
+   * On a clip it becomes that clip's own grade; on empty track space it becomes
+   * an adjustment layer over everything beneath. The two are the same decision
+   * the Filter panel's click makes with and without a selection, and they have
+   * to agree — a drag and a click that land in different places for the same
+   * tile is the kind of thing nobody reports and everybody notices.
+   */
+  private dropLutPreset(
+    presetId: string,
+    startMs: number,
+    x: number,
+    y: number,
+  ) {
+    const preset = presetById(presetId);
+    if (preset == null || preset.render.type !== "lut") {
+      this.toast("That filter is no longer installed.");
+      return;
+    }
+
+    const hit = hitTest(
+      this.layout,
+      x,
+      y,
+      this.currentDoc().elements,
+      this.timelineRange,
+    );
+    if (hit.kind === "clip") {
+      if (!isGradable(this.currentDoc().elements[hit.elementId])) {
+        this.toast("A filter can only go on a picture clip.");
+        return;
+      }
+      this.commit((doc) => setClipLut(doc, hit.elementId, presetId));
+      selectionStore.getState().setIds([hit.elementId]);
+      return;
+    }
+
+    if (preset.kind === "graphic") {
+      // On the row under the pointer when it is the right kind and free there;
+      // `placeNewElement` decides otherwise, as for any new clip.
+      const size = renderOptionStore.getState().options?.previewSize;
+      const project = { w: size?.w ?? 1920, h: size?.h ?? 1080 };
+      const id = uuidv4();
+      this.commit((doc) =>
+        addGraphic(
+          doc,
+          id,
+          uuidv4(),
+          newGraphicOptions(preset, startMs, project, trackAtY(this.layout, y) ?? undefined),
+        ),
+      );
+      if (this.currentDoc().elements[id] != null) {
+        this.targetId = [id];
+        this.showSideOption(id);
+      }
+      this.drawCanvas();
+      return;
+    }
+
+    const id = uuidv4();
+    const trackId = uuidv4();
+    this.commit((doc) =>
+      addEffect(
+        doc,
+        id,
+        presetId,
+        Math.max(0, startMs),
+        DEFAULT_EFFECT_MS,
+        trackId,
+        {},
+      ),
+    );
+    selectionStore.getState().setIds([id]);
+    this.toast(`${preset.name} added as an adjustment layer.`);
+  }
+
+  private dropFxPreset(
+    presetId: string,
+    startMs: number,
+    x: number,
+    y: number,
+  ) {
+    const preset = presetById(presetId);
+    if (preset == null) {
+      this.toast("That preset is no longer installed.");
+      return;
+    }
+
+    // An effect dropped on a shape runs inside that shape, the rule a LUT
+    // dropped on a clip follows (`dropLutPreset`): onto a clip means that
+    // clip's own. Anywhere else it is the adjustment layer it always was.
+    if (preset.kind === "effect") {
+      const hit = hitTest(
+        this.layout,
+        x,
+        y,
+        this.currentDoc().elements,
+        this.timelineRange,
+      );
+      if (
+        hit.kind === "clip" &&
+        isShapeElement(this.currentDoc().elements[hit.elementId])
+      ) {
+        if (backdropModeOf(preset) == null) {
+          this.toast(`${preset.name} plays over the frame and cannot run inside a shape.`);
+          return;
+        }
+        const shapeId = hit.elementId;
+        this.commit((doc) =>
+          chooseClipBackdrop(doc, shapeId, {
+            presetId,
+            params: defaultParamsFor(presetId),
+          }),
+        );
+        this.targetId = [shapeId];
+        selectionStore.getState().setIds([shapeId]);
+        this.showSideOption(shapeId);
+        this.drawCanvas();
+        return;
+      }
+    }
+
+    if (preset.kind === "transition") {
+      const trackId = trackAtY(this.layout, y);
+      if (trackId == null) {
+        this.toast("Drop a transition on a track that has a cut.");
+        return;
+      }
+      const bare = cutPointsOn(this.currentDoc(), trackId).filter(
+        (cut) => cut.transitionId == null,
+      );
+      if (bare.length === 0) {
+        this.toast("No cut on that track to put a transition on.");
+        return;
+      }
+      const nearest = bare.reduce((best, cut) =>
+        Math.abs(cut.atMs - startMs) < Math.abs(best.atMs - startMs)
+          ? cut
+          : best,
+      );
+      this.addTransitionAtCut(nearest.fromId, nearest.toId, presetId);
+      return;
+    }
+
+    const id = uuidv4();
+    const trackId = uuidv4();
+    this.commit((doc) =>
+      addEffect(
+        doc,
+        id,
+        presetId,
+        Math.max(0, startMs),
+        DEFAULT_EFFECT_MS,
+        trackId,
+        defaultParamsFor(presetId),
+        {
+          blend:
+            preset.render.type === "overlay"
+              ? ((preset.render.blend as GlobalCompositeOperation) ?? "screen")
+              : undefined,
+        },
+      ),
+    );
+    this.targetId = [id];
+    this.showSideOption(id);
+    this.drawCanvas();
+  }
+
+  // ------------------------------------------------------------ transitions
+
+  /**
+   * Put a transition on the cut the user clicked.
+   *
+   * The default is a cross-dissolve, centred, half a second — the same default
+   * every NLE offers, and the one most likely to be what was wanted. Everything
+   * else is changed in `<option-transition>` afterwards.
+   *
+   * `addTransition` declines by identity when the cut cannot take one — no
+   * source handles on either side is the case that actually happens — so a
+   * refusal costs no undo step. It is worth telling the user why, because a
+   * click that appears to do nothing is otherwise indistinguishable from a
+   * missed click.
+   */
+  private addTransitionAtCut(
+    fromId: string,
+    toId: string,
+    wantPresetId?: string,
+  ) {
+    // The first installed transition preset, preferring the built-in
+    // cross-dissolve. `presetsOfKind` lists built-ins first, so this is simply
+    // the head of the list unless the user has removed them all.
+    const preset =
+      (wantPresetId != null ? presetById(wantPresetId) : null) ??
+      presetById(DEFAULT_TRANSITION_PRESET) ??
+      presetsOfKind("transition")[0];
+    if (preset == null) {
+      this.toast("No transition presets are installed.");
+      return;
+    }
+    const presetId = preset.id;
+
+    const before = this.currentDoc();
+    const id = uuidv4();
+
+    this.commit((doc) =>
+      addTransition(
+        doc,
+        id,
+        fromId,
+        toId,
+        presetId,
+        DEFAULT_TRANSITION_MS,
+        "center",
+        defaultParamsFor(presetId),
+      ),
+    );
+
+    const after = useTimelineStore.getState().getDocument();
+    if (after.elements[id] == null) {
+      // A refusal now means the *clips* are too short to hold one, which is a
+      // real impossibility rather than a shortage of footage. Missing handles
+      // no longer refuse: the transition holds a frozen frame instead, which
+      // the badge marks and the panel explains.
+      this.toast("These clips are too short to hold a transition.");
+      return;
+    }
+
+    this.targetId = [id];
+    this.showSideOption(id);
+    this.drawCanvas();
+  }
+
+  // ------------------------------------------------------------ side panel
+
+  /** A deferred side-panel update is already queued. */
+  private sideOptionPending = false;
+
+  /**
+   * Point the option column at `elementId`, but never in front of a menu.
+   *
+   * A right press is a request for a context menu, and `mousedown` fires for
+   * the right button before `contextmenu` does. Swapping the column here put
+   * a store write every subscriber sees, two forced layouts and a re-render of
+   * the whole editor between the press and the menu's first paint, which is
+   * the entire reason the menu felt slow. The column still follows the
+   * selection; it just does it on the other side of the frame.
+   *
+   * The deferred call re-reads `targetId` rather than closing over the id it
+   * was given. By the time it runs the user may have picked Remove off the
+   * menu, and `syncSideOption` declines on an empty selection while
+   * `showSideOption` declines on an element that is gone.
+   */
+  private sideOptionFor(elementId: string, button: number) {
+    if (button === 0) {
+      this.showSideOption(elementId);
+      return;
+    }
+
+    if (this.sideOptionPending) {
+      return;
+    }
+    this.sideOptionPending = true;
+    afterPaint(() => {
+      this.sideOptionPending = false;
+      this.syncSideOption();
+    });
+  }
+
+  /**
+   * Point the option column at whatever is selected now.
+   *
+   * `showSideOption` takes the clip the gesture named, and only one gesture
+   * names one: `_handleMouseDown`. A rubber-band names none — it produces a
+   * selection and nothing else — so the column went on showing the clip that
+   * was last clicked, with its single-clip header, while three clips sat lit on
+   * the timeline. This is the half that was missing.
+   *
+   * The representative is `ids[0]`, which is what `option-transition`,
+   * `option-effect`, `lut-browser` and `default-transform#targetId` already
+   * read a selection as. A multi-clip selection of text still routes through
+   * `showOptions`, because `showSideOption` derives that from the whole
+   * selection rather than from the id handed to it.
+   *
+   * Deliberately *not* a `selectionStore` subscription, which is where the two
+   * panels that patched around this individually put theirs: a band rewrites
+   * the selection on every sweep, and `optionGroup.showOption` hides and
+   * re-shows every panel in the column — `option-text` alone rebuilds a
+   * dropdown of every installed font each time. So the caller decides when,
+   * and the only caller that needs it runs once, as the gesture ends.
+   *
+   * An empty selection is left alone: clearing the selection does not empty
+   * the column anywhere else in the app either (clicking off the timeline, the
+   * toolbar narrowing a selection), and a band that swept nothing should not be
+   * the one place that does.
+   */
+  private syncSideOption() {
+    const ids = this.targetId;
+    if (ids.length === 0) {
+      return;
+    }
+    this.showSideOption(ids[0]);
+  }
+
+  showSideOption(elementId: string) {
+    const optionGroup: any = document.querySelector("option-group");
+    const element = this.currentDoc().elements[elementId];
+    if (!optionGroup || !element) {
+      return;
+    }
+
+    const allText = this.targetId.every(
+      (id) => this.currentDoc().elements[id]?.filetype === "text",
+    );
+
+    if (element.filetype === "text" && allText) {
+      optionGroup.showOptions({ filetype: "text", elementIds: this.targetId });
+      return;
+    }
+
+    optionGroup.showOption({ filetype: element.filetype, elementId });
+  }
+
+  /**
+   * Menu items for keyframe editing, when the selection can be animated.
+   *
+   * The left column used to carry these buttons, one set per element row. With
+   * many clips per row there is no per-element row to hang them on, so they
+   * moved to the clip's own context menu.
+   */
+  private animationMenuTemplate(): string {
+    if (this.targetIdDuringRightClick.length !== 1) {
+      return "";
+    }
+
+    const elementId = this.targetIdDuringRightClick[0];
+    const element = this.currentDoc().elements[elementId];
+    if (!element) {
+      return "";
+    }
+
+    const properties = animatableProperties(element);
+
+    return [
+      this.animationSubmenuTemplate(
+        "Animate",
+        "animation",
+        elementId,
+        properties.filter((type) => !MASK_ANIMATION_PROPERTIES.has(type)),
+      ),
+      // `crop` is the icon the sidebar's Mask tab already wears
+      // (`option/optionTabBar.ts`), so both name the same feature.
+      this.animationSubmenuTemplate(
+        "Animate mask",
+        "crop",
+        elementId,
+        properties.filter((type) => MASK_ANIMATION_PROPERTIES.has(type)),
+      ),
+    ].join("");
+  }
+
+  /**
+   * One `Animate …` row, and the panel it opens.
+   *
+   * Empty when the group is: `animatableProperties` offers the mask's five
+   * only on a clip that has a mask, and a submenu with nothing behind it is
+   * the affordance-that-can-only-decline the context menu already refuses to
+   * draw elsewhere.
+   */
+  private animationSubmenuTemplate(
+    label: string,
+    icon: string,
+    elementId: string,
+    properties: AnimatableProperty[],
+  ): string {
+    if (properties.length === 0) {
+      return "";
+    }
+
+    const element = this.currentDoc().elements[elementId];
+    const items = properties
+      .map((type) => {
+        const entry = element == null ? null : labelForTrack(element, type);
+        if (entry == null) {
+          return "";
+        }
+        return `<menu-dropdown-item onclick="document.querySelector('element-timeline-canvas').openAnimationPanel('${elementId}', '${attr(type)}')" item-name="${attr(entry.label)}" item-icon="${entry.icon}"></menu-dropdown-item>`;
+      })
+      .join("");
+
+    if (items === "") {
+      return "";
+    }
+
+    return `<menu-dropdown-sub item-name="${label}" item-icon="${icon}">${items}</menu-dropdown-sub>`;
+  }
+
+  /**
+   * Rows contributed by extensions, for the selection the menu opened on.
+   *
+   * Built from `targetIdDuringRightClick` rather than the live selection, for
+   * the reason that field exists: the menu describes the gesture that opened
+   * it, and a selection that changed underneath would leave the rows talking
+   * about different clips than the ones the user right-clicked.
+   */
+  extensionMenuTemplate(): string {
+    try {
+      const ids = this.targetIdDuringRightClick;
+      const elements = this.currentDoc().elements;
+      const types = ids
+        .map((id) => (elements[id] as { filetype?: string } | undefined)?.filetype)
+        .filter((filetype): filetype is string => typeof filetype === "string");
+
+      return extensionMenuHtml(
+        clipMenuItems(contributionStore.getState(), {
+          selectionCount: ids.length,
+          selectionTypes: types,
+        }),
+      );
+    } catch (error) {
+      // The menu is built as one string, so a throw here would leave the user
+      // with no context menu at all rather than with one missing an
+      // extension's rows. An extension losing its item is the smaller loss.
+      console.warn("[extension] could not build the context menu rows", error);
+      return "";
+    }
+  }
+
+  /**
+   * Run one contributed item. Reached from the inline `onclick` above.
+   *
+   * Public because the dropdown's rows are an HTML string, so the only way
+   * back into this component is through the DOM. The selection is restored
+   * first: clicking a menu row does not change the selection, but the command
+   * runs asynchronously in another process and asks for it from there.
+   */
+  public runExtensionMenuItem(extId: string, commandId: string): void {
+    if (this.targetIdDuringRightClick.length > 0) {
+      this.targetId = [...this.targetIdDuringRightClick];
+    }
+    void runContributedCommand(extId, commandId);
+  }
+
+  private noteMenuTemplate(): string {
+    if (this.noteDuringRightClick == null) {
+      return "";
+    }
+    return `<menu-dropdown-item onclick="document.querySelector('element-timeline-canvas').addNoteHere()" item-name="Add a note" item-icon="add_comment"> </menu-dropdown-item>`;
+  }
+
+  /**
+   * Pin an empty note where the context menu was opened and open its card.
+   *
+   * Public because the dropdown's rows are an HTML string. The note is empty
+   * until the card keeps some text, and an empty note is never saved, so
+   * opening one and walking away leaves the project as it was.
+   */
+  public addNoteHere(): void {
+    const target = this.noteDuringRightClick;
+    if (target == null) {
+      return;
+    }
+    const id = uuidv4();
+    const notes = noteStore.getState();
+    notes.add({ id, ...target.anchor, text: "" });
+    notes.openAt(id, target.x, target.y);
+  }
+
+  showMenuDropdown({ x, y }) {
+    document.querySelector("#menuRightClick").innerHTML = `
+        <menu-dropdown-body top="${y}" left="${x}">
+          ${this.templateMenuTemplate()}
+          ${this.infoMenuTemplate()}
+          ${this.animationMenuTemplate()}
+          ${this.mediaMenuTemplate()}
+          ${this.audioMenuTemplate()}
+          ${this.rasterizeMenuTemplate()}
+          ${this.groupMenuTemplate()}
+          ${this.replaceableMenuTemplate()}
+          ${this.extensionMenuTemplate()}
+          ${this.noteMenuTemplate()}
+          <menu-dropdown-item onclick="document.querySelector('element-timeline-canvas').removeSeletedElements()" item-name="Remove" item-icon="delete"> </menu-dropdown-item>
+          <menu-dropdown-item onclick="document.querySelector('element-timeline-canvas').rippleDeleteSelected()" item-name="Remove and close gap" item-icon="delete_sweep"> </menu-dropdown-item>
+        </menu-dropdown-body>`;
+  }
+
+  /**
+   * Keyframe editing moved out of the timeline.
+   *
+   * An open animation panel used to consume four extra rows *inside* the
+   * timeline — one each for position, opacity, scale and rotation. That only
+   * worked while a row belonged to a single element; with many clips per track
+   * there is no row to borrow. The bottom keyframe editor already does this
+   * job, so these two just drive it.
+   */
+  public openAnimationPanel(targetId: string, animationType) {
+    const offcanvas = new bootstrap.Offcanvas(
+      document.getElementById("option_bottom"),
+    );
+    const target: any = document.querySelector("#timelineOptionTargetElement");
+
+    this.keyframeState.update({
+      elementId: targetId,
+      animationType,
+      isShow: true,
+    });
+
+    if (target) {
+      target.value = targetId;
+    }
+    offcanvas.show();
+  }
+
+  public closeAnimationPanel(targetId: string) {
+    this.keyframeState.update({
+      elementId: targetId,
+      animationType: "position",
+      isShow: false,
+    });
+  }
+
+  // ---------------------------------------------------------------- render
+
+  /**
+   * Re-apply the canvas sizing after every Lit render.
+   *
+   * The template writes the whole `style` attribute, so a re-render wipes the
+   * `width`/`height` that `drawCanvas` set imperatively — and with them the
+   * CSS box that `offsetY` is measured against. Redrawing here puts all four
+   * numbers back. The template no longer carries a hardcoded `width: 1122px`
+   * either; that was a fixed guess `drawCanvas` immediately overwrote.
+   */
+  protected updated(): void {
+    this.drawCanvas();
+  }
+
+  protected render(): unknown {
+    const canvasRef = document.querySelector("#elementTimelineCanvasRef");
+    if (canvasRef) {
+      this.timelineState.setCanvasWidth(canvasRef.clientWidth);
+    }
+
+    return html`
+      <canvas
+        id="elementTimelineCanvasRef"
+        style="left: ${this.resize.timelineVertical
+          .leftOption}px;position: absolute;"
+        @dragover=${this._handleDragOver}
+        @dragleave=${this._handleDragLeave}
+        @drop=${this._handleDrop}
+        @mousewheel=${this.applyWheel}
+        @mousemove=${this._handleMouseMove}
+        @mousedown=${this._handleMouseDown}
+        @mouseup=${this._handleMouseUp}
+        @contextmenu=${this._handleContextmenu}
+      ></canvas>
+    `;
+  }
+}

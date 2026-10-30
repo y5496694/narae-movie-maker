@@ -1,0 +1,177 @@
+@import "../var";
+
+// The docking window system. See `features/window/windowLayout.ts` for the
+// arithmetic these rules only have to draw.
+//
+// Geometry is never in here. Every rect comes from `layoutHost` and is written
+// as an inline `style` by the component, so there is exactly one place a size
+// is decided and a stylesheet cannot disagree with a test.
+
+.window-host {
+  // Every line this feature draws, in one place. It is declared here and not on
+  // `.app-window` because the splitter is that element's *sibling*, not its
+  // child, so a custom property on the window cannot reach it: the splitter had
+  // its own copy of the colour and the two could drift.
+  --app-window-border: #3a3f44;
+  // `display: block` is load-bearing, not tidiness. A custom element with no
+  // styles is `display: inline`, where `width` and `height` do nothing at all,
+  // so without this the host measures 0x0, every rect below it is 0x0, and the
+  // preview canvas comes up 1x1 with no error anywhere. Same trap
+  // `autoTrackPanel.connectedCallback` documents, and it was paid for twice.
+  display: block;
+  position: relative;
+  width: 100%;
+  height: 100%;
+  // The host is the clip boundary on purpose. `#split_col_2` already clips on
+  // both axes, so anything that escaped here would be cut off by an ancestor
+  // instead, with no border left to show where it went.
+  overflow: hidden;
+}
+
+.window-host-content {
+  position: absolute;
+  overflow: hidden;
+}
+
+.app-window {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  background-color: #111315;
+  // No outline around the window, and no radius. A docked window meets its
+  // splitter on one side and the region's own edges on the other three, so a
+  // border would be a second line beside the splitter and a box drawn around
+  // the column. The title bar's rule and the footer's are what give it shape.
+  overflow: hidden;
+}
+
+// The numbers are `<preview-top-bar>`'s (`.timeline-cursor-buttons` and its
+// `bg-darker p-1` strip). The frame stands beside that bar at the same height,
+// so any difference shows as a step in one line across the column.
+.app-window-titlebar {
+  flex: 0 0 auto;
+  height: 2rem;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0 0.25rem;
+  background-color: $background-color;
+  border-bottom: 0.05rem solid var(--app-window-border);
+  // A title bar is a handle, and a handle that selects its own text on a
+  // double click reads as broken.
+  user-select: none;
+}
+
+// `min-width: 0` is what lets the strip shrink past its tabs and scroll rather
+// than push the frame wider than its rect. No scrollbar, as in
+// `.preview-tab-scroll`: a bar 2rem tall has no room for one.
+.app-window-tabs {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 2px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+
+.app-window-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+// The tab itself is `.tb-tab` in `_toolbar.scss`, the preview top bar's own, so
+// the two strips cannot drift apart; the gap above is that bar's too.
+
+.app-window-body {
+  flex: 1 1 auto;
+  // Without this a flex item refuses to shrink below its content, and a long
+  // caption list pushes the window's own bottom border off the host.
+  min-height: 0;
+  position: relative;
+  overflow: hidden;
+  // The panel inside scrolls its own middle and pins its own footer, which is
+  // what `autoTrackPanel` already does. Naming the container lets that panel
+  // ask how wide *the window* is without a viewport media query, which would
+  // answer about the screen and be wrong in every docked position.
+  container: appwindow / inline-size;
+}
+
+// A custom element with no styles is `display: inline` and collapses to its
+// content, which is the trap `autoTrackPanel.connectedCallback` documents.
+// Giving the pane and whatever is in it a box here means a panel dropped into a
+// window does not have to know it was. A pane that is not on show carries
+// `hidden`, and Bootstrap's `[hidden] { display: none !important }` outranks
+// the `display: block` below.
+.app-window-pane,
+.app-window-pane > * {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+// Two numbers, and they are never the same pixels.
+//
+// The **strip** is the area the pointer has to hit. It is SPLITTER_PX wide and
+// is never painted, in any state: no background, no hover fill, no drag fill.
+// `.split-col-bar` makes the same trade one level up with 0.5rem of hit strip
+// that is fully transparent.
+//
+// The **line** is the divider, drawn in the strip's `::after` at 0.05rem, the
+// hairline weight `preview-top-bar` and the title bar use. It is always there
+// rather than appearing on hover, because it is the boundary between two panes
+// and not feedback about a gesture. The cursor is the affordance.
+.window-splitter {
+  position: absolute;
+  background-color: transparent;
+  z-index: 10;
+}
+
+.window-splitter.is-vertical {
+  cursor: col-resize;
+}
+
+.window-splitter.is-horizontal {
+  cursor: row-resize;
+}
+
+.window-splitter::after {
+  content: "";
+  position: absolute;
+  background-color: var(--app-window-border);
+}
+
+// Flush against the window, not centred in the strip. Centred leaves a pixel of
+// host background between the line and the window it divides, so the hairline
+// floats instead of reading as an edge, and that gap is what made it stand out
+// next to the app's other dividers. `.option-window` puts its `border-left` on
+// exactly this boundary, and `faces-*` says which side of the strip that is.
+.window-splitter.is-vertical::after {
+  top: 0;
+  bottom: 0;
+  width: 0.05rem;
+}
+
+.window-splitter.is-horizontal::after {
+  left: 0;
+  right: 0;
+  height: 0.05rem;
+}
+
+.window-splitter.faces-right::after {
+  right: 0;
+}
+
+.window-splitter.faces-left::after {
+  left: 0;
+}
+
+.window-splitter.faces-bottom::after {
+  bottom: 0;
+}
+
+.window-splitter.faces-top::after {
+  top: 0;
+}

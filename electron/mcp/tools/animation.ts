@@ -1,0 +1,306 @@
+/**
+ * Keyframe animation.
+ *
+ * Times here are absolute timeline milliseconds, like everywhere else in this
+ * surface. Internally keyframes are stored relative to the clip's own start;
+ * the renderer command does that conversion, because asking an agent that has
+ * just read `list_clips` to subtract is asking it to be wrong occasionally.
+ */
+
+import { z } from "zod";
+import { requestEditor } from "../bridge";
+import {
+  animatableProperty,
+  EASINGS,
+  LINKABLE,
+  PRESETS,
+  mutating,
+  tool,
+  type Registrar,
+} from "./define";
+
+export function registerAnimationTools(define: Registrar) {
+  define(
+    "apply_animation_preset",
+    {
+      title: "Apply an animation preset",
+      description:
+        "The common moves, correctly built — one undo step, the track activated for you, the units and the " +
+        "curve already right. Prefer this over hand-authoring keyframes. " +
+        "`fade_in`/`fade_out` on opacity. `drift` is a Ken Burns, constant-rate over seconds. `punch_in` " +
+        "lands hard in under a fifth of a second; `overshoot_in` passes its target and settles back. `pop` " +
+        "grows past full size, `slam` arrives oversized and lands. `shake` is a decaying rattle, " +
+        "`rotate_settle` rocks past level. `zoom_in`/`zoom_out` are the gentle pair. The eight `slide_*` " +
+        "move one box length and fade as they go, named for the direction of travel: `slide_in_up` " +
+        "arrives from below. " +
+        "Omit `durationMs` for each preset's own length; a punch stretched to a second is not a punch. " +
+        "Omit `atMs` and `_in` presets sit at the clip's start, `_out` at its end; give it and every preset " +
+        "starts there and runs forward — how you fade mid-shot. One that will not fit is shortened, not " +
+        "moved back. " +
+        "**`focus`** aims a zoom. Scale is about the clip's centre, so a zoom converges there unless the " +
+        "clip is pushed the other way as it grows; `focus` does that. A point in the clip's box, 0-100 per " +
+        "axis; scale presets only.",
+      inputSchema: {
+        elementIds: z.array(z.string()).min(1),
+        /*
+         * The nineteen this app ships, or one an extension contributed.
+         *
+         * A union of exactly two members, and shallow: `define.ts` records
+         * that `z.discriminatedUnion` and deep unions are the other known
+         * TS2589 generator on this path, and this is neither. The enum is kept
+         * as the first member rather than replaced by a plain string, because
+         * the enum is how the agent learns the nineteen names without reading
+         * the description.
+         */
+        preset: z.union([
+          z.enum(PRESETS),
+          z
+            .string()
+            .regex(
+              /^ext:[a-z0-9][a-z0-9-]*\.[a-z0-9][a-z0-9-]*:[a-zA-Z][a-zA-Z0-9._-]*$/,
+              "an extension preset is `ext:<publisher>.<name>:<preset>`",
+            ),
+        ]),
+        durationMs: z
+          .number()
+          .min(1)
+          .optional()
+          .describe("Defaults to the preset's own length."),
+        atMs: z
+          .number()
+          .optional()
+          .describe(
+            "Timeline ms the move starts at. Must be inside every clip in `elementIds`. " +
+              "Defaults to the preset's own anchor — the clip's start, or its end for an out preset.",
+          ),
+        focus: z
+          .object({ x: z.number().min(0).max(100), y: z.number().min(0).max(100) })
+          .optional()
+          .describe(
+            "Where to zoom towards, 0-100 in the clip's own box. {50,50} is the centre and changes nothing.",
+          ),
+      },
+      annotations: mutating,
+    },
+    tool((args) => requestEditor("apply_animation_preset", args)),
+  );
+
+  define(
+    "set_animation",
+    {
+      title: "Turn a property's animation on or off",
+      description:
+        "Activate or deactivate a keyframe track. Turning it on seeds a keyframe holding the clip's current " +
+        "value, so the picture does not jump. Turning it off leaves the keyframes in place but stops them " +
+        "driving the property. add_keyframes activates the track on its own, so you rarely need this first.",
+      inputSchema: {
+        elementId: z.string(),
+        property: animatableProperty,
+        active: z.boolean(),
+        seedAtMs: z.number().optional().describe("Defaults to the clip's start."),
+      },
+      annotations: mutating,
+    },
+    tool((args) => requestEditor("set_animation", args)),
+  );
+
+  define(
+    "add_keyframes",
+    {
+      title: "Add keyframes",
+      description:
+        "Author keyframes on one property, all in one undo step. Activates the track if it is not already on. " +
+        "`position`, `size`, `maskPosition`, `maskSize` need `x` and `y` per entry (`x` is the width on both " +
+        "sizes); the rest take `value`. Units: opacity 0-100, rotation deg, **scale in tenths — 10 is " +
+        "unscaled, 12 is 120%**, **size in px** (the clip's box, per axis — not a second scale), mask " +
+        "position/size in % of the clip, mask feather in clip px. " +
+        "`mask*` needs set_mask first. " +
+        "Times are absolute timeline ms and must fall inside the clip; one outside is refused, not clamped. " +
+        "**Set `easing` or the move will be soft.** With none, a keyframe gets handles that leave and arrive " +
+        "at zero velocity — the gentlest curve there is, and applied to everything it is what makes motion " +
+        "read as drifting rather than deliberate. `easing` shapes the segment *leaving* the entry it is on " +
+        "(as CSS reads it), so the last entry's is ignored. " +
+        "`snap` covers most of the distance immediately and settles: this is a punch-in. " +
+        "`overshoot` passes the target and comes back. `anticipate` winds up before it goes. " +
+        "`linear` for a constant drift, and `ease_in`/`ease_out`/`ease_in_out` where CSS would use them.",
+      inputSchema: {
+        elementId: z.string(),
+        property: animatableProperty,
+        keyframes: z
+          .array(
+            z.object({
+              atMs: z.number(),
+              value: z
+                .number()
+                .optional()
+                .describe("opacity / scale / rotation / maskRotation / maskFeather / maskRoundness"),
+              x: z
+                .number()
+                .optional()
+                .describe(
+                  "position / maskPosition, and the width of size / maskSize",
+                ),
+              y: z
+                .number()
+                .optional()
+                .describe(
+                  "position / maskPosition, and the height of size / maskSize",
+                ),
+              easing: z
+                .union([z.enum(EASINGS), z.array(z.number()).length(4)])
+                .optional()
+                .describe(
+                  "Shapes the segment leaving this keyframe. A name, or [x1,y1,x2,y2] control points as CSS writes them.",
+                ),
+            }),
+          )
+          .min(1),
+      },
+      annotations: mutating,
+    },
+    tool((args) => requestEditor("add_keyframes", args)),
+  );
+
+  define(
+    "set_keyframes",
+    {
+      title: "Add keyframes to many clips and properties at once",
+      description:
+        "The batch form of add_keyframes, and the one to reach for past a single move: every clip, every " +
+        "property, **one call and one undo step**. A twelve-card wheel with opacity and scale on each is " +
+        "one call here and twenty-four through add_keyframes. " +
+        "One bad time or easing anywhere refuses the whole batch rather than leaving half an edit. " +
+        "`replace: true` empties that track first, so running the same batch twice does not stack keys. " +
+        "Units: opacity 0-100, rotation deg, **scale in tenths — 10 is unscaled, 12 is 120%**, size in px " +
+        "per axis (the box, not a second scale), mask position/size in % of the clip. `position`, `size`, " +
+        "`maskPosition` and `maskSize` need `x` and `y` per entry; everything else takes `value`. " +
+        "Times are absolute timeline ms and must fall inside their clip. " +
+        "**Set `easing` or the move will be soft** — with none, keyframes leave and arrive at zero " +
+        "velocity, which reads as drifting. It shapes the segment *leaving* its entry, so the last is " +
+        "ignored. `snap` is a punch-in, `overshoot` passes and returns, `anticipate` winds up first.",
+      inputSchema: {
+        writes: z
+          .array(
+            z.object({
+              elementId: z.string(),
+              property: animatableProperty,
+              keyframes: z
+                .array(
+                  z.object({
+                    atMs: z.number(),
+                    value: z.number().optional(),
+                    x: z.number().optional(),
+                    y: z.number().optional(),
+                    easing: z
+                      .union([z.enum(EASINGS), z.array(z.number()).length(4)])
+                      .optional(),
+                  }),
+                )
+                .min(1),
+              replace: z
+                .boolean()
+                .optional()
+                .describe("Empty this track before writing."),
+            }),
+          )
+          .min(1),
+      },
+      annotations: mutating,
+    },
+    tool((args) => requestEditor("set_keyframes", args)),
+  );
+
+  define(
+    "remove_keyframes",
+    {
+      title: "Remove keyframes",
+      description:
+        "Delete the keyframes at the given absolute times. A time with no keyframe near it is ignored. " +
+        "Use get_keyframes to see what is there.",
+      inputSchema: {
+        elementId: z.string(),
+        property: animatableProperty,
+        atMs: z.array(z.number()).min(1),
+      },
+      annotations: mutating,
+    },
+    tool((args) => requestEditor("remove_keyframes", args)),
+  );
+
+  define(
+    "set_property_link",
+    {
+      title: "Drive a property from another clip's property",
+      description:
+        "Make one property **derive** from another — the place an expression would go, as data. " +
+        "`in`/`out` are matching stops: the source value is found in `in` and the answer read off `out`, " +
+        "interpolated between. Outside the stops it holds the end value unless `extend` says otherwise. " +
+        "**This is what a card wheel is.** Turn a null, then link each card's opacity and scale to the " +
+        "null's rotation with `in: [-90, 0, 90], out: [0, 100, 0]`, and give each card its own phase " +
+        "through `offsets` — one offset per id, added to the source before the map. One call for the row. " +
+        "The difference from computing keyframes yourself is what happens next: move the null and " +
+        "everything derived from it follows. " +
+        "A driven property is **read-only** — its keyframes are kept but stop driving it, and " +
+        "add_keyframes and update_clip refuse it until clear_property_link. " +
+        "`size` and `volumeDb` cannot be driven; the error says why. Units are the property's own, so " +
+        "scale is in tenths and opacity is 0-100.",
+      inputSchema: {
+        elementIds: z.array(z.string()).min(1),
+        property: z.enum(LINKABLE).describe("The property to drive."),
+        fromElementId: z.string().describe("The clip to read from."),
+        fromProperty: animatableProperty.describe("The property to read."),
+        fromLane: z
+          .enum(["x", "y"])
+          .optional()
+          .describe("Which lane of a paired source property. Defaults to x."),
+        in: z
+          .array(z.number())
+          .min(2)
+          .max(16)
+          .describe("Source values, strictly ascending."),
+        out: z
+          .array(z.number())
+          .min(2)
+          .max(16)
+          .describe("What each `in` stop maps to. Same count."),
+        easing: z
+          .enum(EASINGS)
+          .optional()
+          .describe("Shapes each segment between two stops. Default linear."),
+        extend: z
+          .enum(["clamp", "extrapolate"])
+          .optional()
+          .describe("Outside the stops: hold the end (default), or keep going."),
+        offsets: z
+          .array(z.number())
+          .optional()
+          .describe(
+            "One per id, in the same order, added to the source before mapping. This is how a row of clips shares one shape.",
+          ),
+      },
+      annotations: mutating,
+    },
+    tool((args) => requestEditor("set_property_link", args)),
+  );
+
+  define(
+    "clear_property_link",
+    {
+      title: "Stop driving a property from another",
+      description:
+        "Remove a link, so the property goes back to its own static value and keyframes — which were " +
+        "kept the whole time it was driven. Omit `property` to remove every link on those clips. " +
+        "Do this before authoring keyframes on a driven property; add_keyframes refuses one while a " +
+        "link is in force rather than writing numbers nothing would read.",
+      inputSchema: {
+        elementIds: z.array(z.string()).min(1),
+        property: z
+          .enum(LINKABLE)
+          .optional()
+          .describe("Omit for every link on the clip."),
+      },
+      annotations: mutating,
+    },
+    tool((args) => requestEditor("clear_property_link", args)),
+  );
+}

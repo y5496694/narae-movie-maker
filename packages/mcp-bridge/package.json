@@ -1,0 +1,40 @@
+{
+  "name": "narae-desktop-mcp-bridge",
+  "version": "1.0.0",
+  "description": "나래 무비메이커 데스크톱 앱의 MCP 연결을 위한 로컬 전용 stdio 브리지",
+  "type": "module",
+  "bin": {
+    "narae-desktop-mcp": "bin/narae-desktop-mcp.mjs"
+  },
+  "files": [
+    "bin",
+    "src",
+    "!src/**/*.test.mjs",
+    "NOTICE.txt"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "narae-movie-maker",
+    "video-editor",
+    "video-editing"
+  ],
+  "author": "Narae Movie Maker contributors",
+  "license": "MIT",
+  "private": true,
+  "contributors": [
+    {
+      "name": "cartesiancs",
+      "url": "https://github.com/cartesiancs/cartcut"
+    }
+  ],
+  "upstream": {
+    "name": "CartCut",
+    "version": "0.6.1",
+    "repository": "https://github.com/cartesiancs/cartcut",
+    "license": "MIT"
+  }
+}

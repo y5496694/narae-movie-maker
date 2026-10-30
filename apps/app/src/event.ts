@@ -1,0 +1,112 @@
+// The subpath, not the barrel: this is the only lodash call left in the
+// renderer, and `import _ from "lodash"` would pull the whole library into the
+// bundle for one function. It used to be a global from a CDN <script>.
+
+import { renderOptionStore } from "./states/renderOptionStore";
+import { rendererModal } from "./utils/modal";
+import { exportProgress } from "./features/export/exportProgress";
+import { exportStore } from "./states/exportStore";
+import {
+  clearCancelTimeout,
+  failExport,
+  finishExport,
+} from "./features/export/exportSession";
+import { runMenuCommand } from "./features/editor/menuCommands";
+import { installTextEditingShortcuts } from "./features/editor/textEditing";
+import { isProjectDirty } from "./features/project/projectDirty";
+
+// The legacy `PROCESSING` channel. Nothing in the renderer drives it any more
+// (`render/renderMain.ts` is the unused fluent-ffmpeg path), but a number
+// arriving here still belongs on the ring.
+window.electronAPI.res.render.progressing((evt, prog) => {
+  exportStore.getState().report(prog, null);
+});
+
+window.electronAPI.res.render.finish((evt, detail) => {
+  // The end of the finalizing phase `exportSession` handed over: FFmpeg has
+  // finished muxing, which nothing before this point can know. Main is
+  // authoritative about the file it actually wrote; the value set when the
+  // export began is only what we asked for. "Open Saved Folder" reads it.
+  finishExport(
+    detail?.destination ?? "",
+    renderOptionStore.getState().options.exportSettings,
+  );
+});
+
+window.electronAPI.res.render.error((evt, errormsg) => {
+  exportProgress.stop();
+  rendererModal.progressError.show();
+
+  document.querySelector("#progressErrorMsg").innerHTML = `${errormsg}`;
+});
+
+/**
+ * A `render:v2` export that failed.
+ *
+ * FFmpeg encodes behind the frame loop, so a mux or codec failure can surface
+ * after the last frame has been written and the loop has already resolved
+ * happily. Nothing listened for that, and the old `close` handler reported
+ * success whatever the exit code — so the user got a checkmark and a truncated
+ * file.
+ */
+window.electronAPI.res.render.v2Error((evt, detail) => {
+  failExport(detail?.message ?? "Export failed", detail?.stderrTail ?? "");
+  console.error("[render:v2]", detail?.message, detail?.stderrTail);
+});
+
+/**
+ * The main process has reaped FFmpeg and deleted the partial file.
+ *
+ * This is what settles the `cancelling` phase. Until it arrives a new export
+ * would be refused by `ipcRenderV2.start`, so the button stays a spinning ring
+ * rather than offering something that cannot work.
+ */
+window.electronAPI.res.render.v2Cancelled(() => {
+  clearCancelTimeout();
+  exportProgress.stop();
+});
+
+window.electronAPI.res.app.forceClose((evt) => {
+  // `isProjectDirty` rather than the hash table that used to live on
+  // `<element-timeline>`: that one covered elements only, so quitting with
+  // unsaved *track* work raised no warning at all. One owner for the
+  // question now, so this and File → Open cannot disagree.
+  if (isProjectDirty()) {
+    rendererModal.whenClose.show();
+  } else {
+    window.electronAPI.req.app.forceClose();
+  }
+});
+
+// The application menu, as one channel. `features/editor/menuCommands` holds
+// the table; `electron/lib/menuCommands.ts` is the other end of it.
+window.electronAPI.res.menu.command((evt, id, payload) => {
+  // The payload is `undefined` for all but the Auto Save rows, whose id is
+  // static and whose *entry* is what varies. See `electron/lib/menu.ts`.
+  runMenuCommand(id, payload);
+});
+
+// The Edit menu's items are the editor's own commands now, so a keystroke that
+// belongs to a text field needs somewhere to go. See `features/editor/textEditing`.
+installTextEditingShortcuts();
+
+window.addEventListener("load", (event) => {
+  let toastElList = [].slice.call(document.querySelectorAll(".toast"));
+  toastElList.map(function (toastEl) {
+    return new bootstrap.Toast(toastEl);
+  });
+});
+
+window.onresize = async function (event) {
+  const elementControlComponent = document.querySelector("element-control");
+
+  await elementControlComponent.resizeEvent();
+};
+
+// HTMLCanvasElement.prototype.render = function () {
+//     cartcut.canvas.preview.render(this);
+//   };
+
+//   HTMLCanvasElement.prototype.clear = function () {
+//     cartcut.canvas.preview.clear(this);
+//   };

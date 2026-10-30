@@ -1,0 +1,212 @@
+{
+  "name": "narae-movie-maker",
+  "version": "1.0.0",
+  "description": "나래 무비메이커: 데스크톱 및 독립 CLI 영상 편집기",
+  "main": "main/naraeBootstrap.js",
+  "author": "Narae Movie Maker contributors",
+  "scripts": {
+    "start": "electron .",
+    "start:hot": "node scripts/devElectron.mjs",
+    "dev": "npm run build:speech && npm run build:input && concurrently \"npm run compile\" \"npm run bundle:src\"",
+    "dev:hot": "npm run build:speech && npm run build:input && concurrently -k -n main,renderer,app \"npm run compile\" \"npm run bundle:src\" \"npm run start:hot\"",
+    "compile": "tsc -w -p ./.tsconfig",
+    "bundle": "npm run bundle:src",
+    "vendor:sync": "node scripts/syncVendor.mjs",
+    "bundle:src": "webpack --mode=development --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:cov": "vitest run --coverage",
+    "test:e2e:fixtures": "node tests/e2e/fixtures/fetch.mjs",
+    "test:e2e:check": "tsc --noEmit -p tests/e2e/tsconfig.json",
+    "test:e2e": "playwright test -c tests/e2e/playwright.config.ts --project=full",
+    "test:e2e:smoke": "playwright test -c tests/e2e/playwright.config.ts --project=smoke",
+    "test:e2e:smoke120": "playwright test -c tests/e2e/playwright.config.ts --project=smoke120",
+    "test:e2e:extreme": "playwright test -c tests/e2e/playwright.config.ts --project=extreme",
+    "bundle:prod:src": "webpack --mode=production",
+    "build:web": "npm run bundle:prod:src && node scripts/buildWeb.mjs",
+    "build:main": "tsc -p ./.tsconfig",
+    "build:overlay": "npm --prefix apps/overlay-record ci && npm --prefix apps/overlay-record run build",
+    "build:speech": "node scripts/buildSpeech.mjs",
+    "build:input": "node scripts/buildInput.mjs",
+    "build:osx": "npm run build:main && npm run bundle:prod:src && npm run build:overlay && node scripts/buildSpeech.mjs --all && node scripts/buildInput.mjs --all && electron-builder build --mac --arm64 --x64 --publish never",
+    "build:win": "npm run build:main && npm run bundle:prod:src && npm run build:overlay && electron-builder build --win --x64 --publish never",
+    "build:linux": "npm run build:main && npm run bundle:prod:src && npm run build:overlay && electron-builder build --linux --x64",
+    "build": "npm run build:osx && npm run build:win"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cartesiancs/cartcut"
+  },
+  "build": {
+    "productName": "나래 무비메이커",
+    "appId": "kr.narae.movie-maker",
+    "asar": true,
+    "asarUnpack": [
+      "**/*.node",
+      "**/*.so",
+      "**/*.so.*"
+    ],
+    "extraResources": [
+      {
+        "from": "./assets",
+        "to": "assets",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "./bin/${platform}-${arch}",
+        "to": "bin",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "protocols": {
+      "name": "Narae Movie Maker",
+      "schemes": [
+        "naraemovieapp"
+      ]
+    },
+    "mac": {
+      "publish": null,
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "icon": "assets/icons/mac/icon.icns",
+      "asarUnpack": "**/*.node",
+      "notarize": true,
+      "entitlements": "assets/entitlements.mac.plist",
+      "entitlementsInherit": "assets/entitlements.mac.plist",
+      "extendInfo": {
+        "NSCameraUsageDescription": "나래 무비메이커는 화면 녹화에 카메라 영상을 함께 담을 때 카메라를 사용합니다",
+        "NSMicrophoneUsageDescription": "나래 무비메이커는 영상 해설과 화면 녹화 음성을 녹음할 때 마이크를 사용합니다",
+        "NSSpeechRecognitionUsageDescription": "나래 무비메이커는 이 기기에서 영상의 음성을 분석해 자막을 만듭니다"
+      }
+    },
+    "dmg": {},
+    "win": {
+      "verifyUpdateCodeSignature": true,
+      "publish": null,
+      "target": [
+        "nsis"
+      ],
+      "icon": "./assets/icons/win/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "tar.gz"
+      ],
+      "executableName": "narae-movie-maker",
+      "category": "AudioVideo;Video;AudioVideoEditing;",
+      "icon": "assets/icons/png",
+      "maintainer": "cartesiancs <jun@cartesiancs.com>",
+      "synopsis": "Narae Movie Maker video editor",
+      "desktop": {
+        "entry": {
+          "MimeType": "x-scheme-handler/naraemovieapp;",
+          "StartupWMClass": "narae-movie-maker"
+        }
+      },
+      "publish": null
+    },
+    "directories": {
+      "buildResources": "./assets/",
+      "output": "./dist/",
+      "app": "."
+    },
+    "files": [
+      "!src/**/*",
+      "!electron/**/*",
+      "!dev-app-update.yml",
+      "!tests/**",
+      "!examples/**",
+      "!bin/**",
+      "!dist-web/**",
+      "!server/**",
+      "!docs/**",
+      "!.github/**",
+      "!apps/*/node_modules/**",
+      "!packages/*/node_modules/**",
+      "!apps/automatic-caption/dist/**",
+      "!apps/automatic-caption/public/**",
+      "!apps/app/src/**",
+      "!apps/app/sample/**"
+    ],
+    "artifactBuildCompleted": "./scripts/checkArtifactSize.mjs",
+    "publish": null,
+    "executableName": "narae-movie-maker"
+  },
+  "dependencies": {
+    "@fontsource-variable/noto-sans-kr": "^5.3.0",
+    "@imgly/background-removal-node": "^1.4.5",
+    "@lit/context": "^1.1.6",
+    "@mediabunny/aac-encoder": "1.61.3",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "axios": "^1.3.2",
+    "body-parser": "^1.20.3",
+    "bootstrap": "5.0.2",
+    "decompress": "4.2.1",
+    "electron-is-dev": "^2.0.0",
+    "electron-log": "^4.4.8",
+    "electron-progressbar": "^2.0.1",
+    "electron-store": "^8.1.0",
+    "electron-updater": "^6.8.9",
+    "express": "^4.21.2",
+    "fluent-ffmpeg": "^2.1.2",
+    "fs-extra": "^11.1.0",
+    "get-system-fonts": "^2.0.2",
+    "gifuct-js": "^2.1.2",
+    "jszip": "^3.10.1",
+    "lit": "^3.3.3",
+    "lodash": "^4.17.21",
+    "material-symbols": "^0.47.1",
+    "mediabunny": "1.61.3",
+    "parse5": "^7.3.0",
+    "path": "^0.12.7",
+    "postcss": "^8.5.28",
+    "request": "^2.88.2",
+    "socket.io": "^4.8.1",
+    "socket.io-client": "^4.8.1",
+    "uuid": "^9.0.0",
+    "zod": "^3.25.76",
+    "zustand": "^5.0.0"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.22.1",
+    "@babel/preset-env": "^7.22.4",
+    "@napi-rs/canvas": "^1.0.2",
+    "@playwright/test": "^1.62.1",
+    "@types/express": "4.17.21",
+    "babel-loader": "^9.1.2",
+    "concurrently": "^9.0.1",
+    "cross-env": "^7.0.3",
+    "css-loader": "^6.7.1",
+    "electron": "^44.4.3",
+    "electron-builder": "^26.15.3",
+    "electron-reload": "^2.0.0-alpha.1",
+    "eslint-config-airbnb": "^19.0.4",
+    "mini-css-extract-plugin": "^2.6.1",
+    "playwright": "^1.62.1",
+    "sass": "^1.55.0",
+    "sass-loader": "^13.0.2",
+    "style-loader": "^3.3.1",
+    "ts-loader": "^9.5.1",
+    "typescript": "^5.8.3",
+    "vitest": "^4.1.11",
+    "webpack": "^5.74.0",
+    "webpack-cli": "^4.10.0"
+  },
+  "contributors": [
+    {
+      "name": "cartesiancs",
+      "url": "https://github.com/cartesiancs"
+    }
+  ]
+}

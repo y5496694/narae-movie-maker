@@ -1,0 +1,26 @@
+나래 무비메이커 소스 빌드 (Windows x64)
+
+1. Node.js 24+와 npm을 설치합니다.
+2. npm ci
+3. bin/win32-x64에 ffmpeg.exe와 ffprobe.exe를 둡니다.
+   동봉 배포판 runtime/resources/bin의 동일한 바이너리를 사용할 수 있습니다.
+4. npm run build:main
+5. npm run bundle:prod:src
+6. npm run build:overlay
+7. node node_modules/electron-builder/cli.js --win --x64 --dir --publish never
+
+개발 GUI: npm start
+독립 CLI: node cli/narae.mjs --help
+독립 MCP: node cli/narae.mjs mcp
+테스트: npm test
+추가 CLI 테스트: node --test cli/mcp.test.mjs cli/record.test.mjs
+
+CLI 배포:
+  product/narae.cmd
+  product/cli/narae.mjs, record.mjs, mcp.mjs
+  product/runtime/에 dist/win-unpacked의 내용
+
+소스 배포에는 의존성 node_modules와 생성된 빌드 결과를 넣지 않습니다.
+원본 MIT LICENSE 및 NOTICE를 보존합니다. 클라우드 배포·자동 업데이트는
+기본 비활성화이며 별도의 나래 배포 서비스가 설정되어야 사용 가능합니다.
+원본 저장소: https://github.com/cartesiancs/cartcut (v0.6.1)

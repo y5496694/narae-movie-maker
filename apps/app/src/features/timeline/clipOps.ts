@@ -1,0 +1,638 @@
+/**
+ * Document-level editing: split, move, trim, delete, paste.
+ *
+ * `clipEdit` does the arithmetic on one element; this file is where the track
+ * model's rules live — a track never holds overlapping clips, and every op
+ * either produces a document that satisfies that or produces nothing at all.
+ *
+ * "Nothing at all" means the *same object reference* back. `withCheckpoint`
+ * uses identity to decide whether an undo step happened, so a declined edit
+ * costs the user nothing: a split with the playhead off the clip, a drag into
+ * an occupied slot, an arrow key at the top row.
+ */
+
+import type { TimelineElement } from "../../@types/timeline";
+import { splitAt, trimEnd, trimStart } from "./clipEdit";
+import { ADJACENCY_EPSILON_MS, spanLength, spanOf } from "./geometry";
+import { findCollisions, overlaps } from "./overlap";
+import { EDGE_SLACK_MS } from "../../utils/time";
+import { chooseTrackFor } from "./placement";
+import { cloneAnimation } from "../animation/keyframes";
+import { withDescendants } from "./hierarchy";
+import { dissolveRig } from "./groupOps";
+import { RIG_CAMERA, RIG_ZOOM, rigOf, rigRoleOf, withoutParent } from "./rig";
+import {
+  clipsOnTrack,
+  normalizeDocument,
+  trackIndexOf,
+  type TimelineDocument,
+} from "./tracks";
+
+/** Rebuild with a new element map, re-deriving indices, names and priorities. */
+function withElements(
+  doc: TimelineDocument,
+  elements: Record<string, TimelineElement>,
+): TimelineDocument {
+  return normalizeDocument({ ...doc, elements });
+}
+
+/**
+ * Cut one clip at `atMs`.
+ *
+ * Both halves keep the original's `trackId` — the single most important line in
+ * this file. The old split gave the right half a fresh `priority` of `max + 1`,
+ * and because a row *was* the priority-sorted index, that put every cut on a
+ * brand-new row.
+ */
+export function splitClip(
+  doc: TimelineDocument,
+  elementId: string,
+  atMs: number,
+  newId: string,
+): TimelineDocument {
+  const element = doc.elements[elementId];
+  if (element == null) {
+    return doc;
+  }
+
+  const parts = splitAt(element, atMs);
+  if (parts == null) {
+    return doc;
+  }
+
+  return withElements(doc, {
+    ...doc.elements,
+    [elementId]: parts.left,
+    [newId]: parts.right,
+  });
+}
+
+/** Cut every clip in `elementIds` that the playhead actually crosses. */
+export function splitAtPlayhead(
+  doc: TimelineDocument,
+  elementIds: string[],
+  atMs: number,
+  idGen: () => string,
+): TimelineDocument {
+  let next = doc;
+  for (const elementId of elementIds) {
+    next = splitClip(next, elementId, atMs, idGen());
+  }
+  return next;
+}
+
+/**
+ * Move clips in time and/or across tracks.
+ *
+ * Atomic: if any clip in the selection cannot go where it is asked, nothing
+ * moves. A partial move would silently break up a selection the user dragged as
+ * one thing, which is worse than refusing.
+ */
+export function moveClips(
+  doc: TimelineDocument,
+  elementIds: string[],
+  deltaMs: number,
+  deltaTrackIndex = 0,
+): TimelineDocument {
+  if (elementIds.length === 0) {
+    return doc;
+  }
+
+  const ordered = [...doc.tracks].sort((a, b) => a.index - b.index);
+  const moving = new Set(elementIds);
+  const next: Record<string, TimelineElement> = { ...doc.elements };
+  const placed: Array<{ trackId: string; start: number; end: number }> = [];
+
+  for (const elementId of elementIds) {
+    const element = doc.elements[elementId];
+    if (element == null) {
+      return doc;
+    }
+
+    const fromIndex = trackIndexOf(doc, element.trackId);
+    const toIndex = fromIndex + deltaTrackIndex;
+    if (toIndex < 0 || toIndex >= ordered.length) {
+      return doc;
+    }
+
+    const target = ordered[toIndex];
+    // Kinds stay apart: a caption on an audio row would neither render nor
+    // export, so the move is refused rather than quietly allowed.
+    if (deltaTrackIndex !== 0 && target.kind !== ordered[fromIndex].kind) {
+      return doc;
+    }
+
+    const start = element.startTime + deltaMs;
+    if (start < 0) {
+      return doc;
+    }
+
+    const span = { start, end: start + spanLength(element) };
+    if (findCollisions(doc, target.id, span, [...moving]).length > 0) {
+      return doc;
+    }
+
+    // Clips being moved together must not land on top of each other either.
+    if (
+      placed.some(
+        (other) => other.trackId === target.id && overlaps(other, span),
+      )
+    ) {
+      return doc;
+    }
+    placed.push({ trackId: target.id, ...span });
+
+    next[elementId] = { ...element, startTime: start, trackId: target.id };
+  }
+
+  return withElements(doc, next);
+}
+
+/** Convenience for the single-clip case. */
+export function moveClip(
+  doc: TimelineDocument,
+  elementId: string,
+  deltaMs: number,
+  deltaTrackIndex = 0,
+): TimelineDocument {
+  return moveClips(doc, [elementId], deltaMs, deltaTrackIndex);
+}
+
+/** The clip immediately before / after `elementId` on its own track. */
+function neighboursOf(doc: TimelineDocument, elementId: string) {
+  const element = doc.elements[elementId];
+  const siblings = clipsOnTrack(doc, element.trackId).filter(
+    ([id]) => id !== elementId,
+  );
+  const { start, end } = spanOf(element);
+
+  let before: number | null = null;
+  let after: number | null = null;
+
+  for (const [, sibling] of siblings) {
+    const span = spanOf(sibling);
+    if (span.end <= start && (before == null || span.end > before)) {
+      before = span.end;
+    }
+    if (span.start >= end && (after == null || span.start < after)) {
+      after = span.start;
+    }
+  }
+
+  return { before, after };
+}
+
+/**
+ * Drag a clip's left edge, stopping at the clip before it.
+ *
+ * Clamping rather than refusing: an editor should let you pull an edge until it
+ * butts against its neighbour, not freeze the moment the drag would overlap.
+ */
+export function trimClipStart(
+  doc: TimelineDocument,
+  elementId: string,
+  deltaMs: number,
+): TimelineDocument {
+  const element = doc.elements[elementId];
+  if (element == null) {
+    return doc;
+  }
+
+  const { before } = neighboursOf(doc, elementId);
+  const limit = before ?? 0;
+  // Negative delta extends leftwards; it may not reach past the neighbour.
+  const clamped = Math.max(deltaMs, limit - element.startTime);
+
+  const trimmed = trimStart(element, clamped);
+  if (trimmed.startTime === element.startTime && trimmed.duration === element.duration) {
+    return doc;
+  }
+
+  return withElements(doc, { ...doc.elements, [elementId]: trimmed });
+}
+
+/** Drag a clip's right edge, stopping at the clip after it. */
+export function trimClipEnd(
+  doc: TimelineDocument,
+  elementId: string,
+  deltaMs: number,
+): TimelineDocument {
+  const element = doc.elements[elementId];
+  if (element == null) {
+    return doc;
+  }
+
+  const { after } = neighboursOf(doc, elementId);
+  const room =
+    after == null ? Infinity : after - spanOf(element).end;
+  const clamped = Math.min(deltaMs, room);
+
+  const trimmed = trimEnd(element, clamped);
+  if (trimmed.duration === element.duration) {
+    return doc;
+  }
+
+  return withElements(doc, { ...doc.elements, [elementId]: trimmed });
+}
+
+export function deleteClips(
+  doc: TimelineDocument,
+  elementIds: string[],
+): TimelineDocument {
+  // A stabilize rig is the exception. Its groups are machinery the user never
+  // put anything into, so deleting either one removes the stabilization and
+  // leaves the footage exactly as it was; whatever the request also names is
+  // deleted after that, so select-all and Delete still empties the timeline.
+  const unrigged = dissolveRigsIn(doc, elementIds);
+
+  // A group takes its contents with it. That is what grouping means in every
+  // editor that has it, and the alternative — orphaning the children, which is
+  // what After Effects does when you delete a parent — would scatter them to
+  // wherever their parent-local coordinates happen to land in canvas space.
+  // `ungroup` is the way to keep the contents, and it is a separate gesture
+  // precisely so that neither outcome can arrive by surprise.
+  const present = withDescendants(unrigged.elements, elementIds);
+  if (present.length === 0) {
+    return unrigged;
+  }
+
+  const elements = { ...unrigged.elements };
+  for (const id of present) {
+    delete elements[id];
+  }
+  return withElements(unrigged, elements);
+}
+
+/** Dissolve every intact rig one of `elementIds` is a group of. */
+function dissolveRigsIn(
+  doc: TimelineDocument,
+  elementIds: string[],
+): TimelineDocument {
+  let next = doc;
+  for (const id of elementIds) {
+    if (rigRoleOf(next.elements[id]) == null) {
+      continue;
+    }
+    const rig = rigOf(next.elements, id);
+    if (rig != null) {
+      next = dissolveRig(next, rig);
+    }
+  }
+  return next;
+}
+
+/**
+ * Delete a clip and close the gap it leaves, pulling everything after it on the
+ * same track backwards. Other tracks are untouched — this is a lane-local
+ * ripple, not a magnetic timeline.
+ */
+export function rippleDelete(
+  doc: TimelineDocument,
+  elementId: string,
+): TimelineDocument {
+  const element = doc.elements[elementId];
+  if (element == null) {
+    return doc;
+  }
+  // A rig's bar leaves no gap anyone placed: removing it is dissolving it, and
+  // nothing on its row moves.
+  if (rigRoleOf(element) != null && rigOf(doc.elements, elementId) != null) {
+    return dissolveRigsIn(doc, [elementId]);
+  }
+
+  const { end, length } = spanOf(element);
+  const elements = { ...doc.elements };
+  // Same rule as `deleteClips`: a group's contents go with it. The gap that
+  // closes afterwards is still only the one this clip left on its own track —
+  // the children sit on other rows and their own lanes are not rippled, which
+  // keeps this a lane-local operation rather than a magnetic timeline.
+  const removed = withDescendants(doc.elements, [elementId]);
+  for (const id of removed) {
+    delete elements[id];
+  }
+
+  for (const [id, sibling] of clipsOnTrack(doc, element.trackId)) {
+    if (elements[id] == null) {
+      continue;
+    }
+    // Within `ADJACENCY_EPSILON_MS`, never exactly. The tail of a split starts
+    // where the deleted middle ends, but the two numbers come from different
+    // sums (`startTime + offset` against `startTime + duration / speed`) and can
+    // disagree in the last ULP: at 60fps a middle ending at 24266.66666666667
+    // against a tail starting at 24266.666666666668. A strict `>=` read that
+    // tail as starting inside the deleted clip and left it behind, so a caption
+    // session's silence cut left a hole as long as the silence. The track holds
+    // no overlaps, so nothing but a transition starts inside `[start, end)`,
+    // and a transition is far wider than this.
+    if (spanOf(sibling).start >= end - ADJACENCY_EPSILON_MS) {
+      elements[id] = {
+        ...sibling,
+        startTime: Math.max(0, sibling.startTime - length),
+      };
+    }
+  }
+
+  return withElements(doc, elements);
+}
+
+/** A half-open window of timeline time, in ms. */
+export type TimeRange = { startMs: number; endMs: number };
+
+/**
+ * Merge overlapping and touching ranges, latest first.
+ *
+ * Descending order is not cosmetic: cutting from the end backwards means each
+ * cut lands at coordinates the earlier cuts have not moved yet. Ascending order
+ * would need every remaining range rewritten after each removal, and a
+ * transcript's ranges arrive ascending, so this is the conversion that makes
+ * the caller's natural input safe.
+ */
+export function normalizeRanges(ranges: TimeRange[]): TimeRange[] {
+  const valid = ranges
+    .map((range) => ({
+      startMs: Math.max(0, Math.min(range.startMs, range.endMs)),
+      endMs: Math.max(range.startMs, range.endMs),
+    }))
+    .filter((range) => range.endMs > range.startMs)
+    .sort((a, b) => a.startMs - b.startMs);
+
+  const merged: TimeRange[] = [];
+  for (const range of valid) {
+    const last = merged[merged.length - 1];
+    if (last != null && range.startMs <= last.endMs) {
+      last.endMs = Math.max(last.endMs, range.endMs);
+      continue;
+    }
+    merged.push({ ...range });
+  }
+
+  return merged.reverse();
+}
+
+/**
+ * Cut a set of time windows out of one clip.
+ *
+ * This is the operation an automatic cut edit is made of — "drop every silence"
+ * or "drop these six filler words" is one call, not sixty. Doing it as one
+ * transform matters for two reasons beyond convenience: the caller gets a
+ * single undo step for what the user experienced as a single instruction, and
+ * the ranges are interpreted against the *original* timeline, so a caller
+ * holding a transcript does not have to re-derive coordinates after every cut.
+ *
+ * Each range becomes at most two splits and one delete. With `ripple`, the
+ * surviving tail slides back to close the hole, which is what makes the result
+ * play as continuous speech; without it the cut leaves a gap.
+ *
+ * Ranges that fall outside the clip contribute nothing, and a call where none
+ * of them bite returns `doc` unchanged — same identity, so no undo step.
+ */
+export function removeRanges(
+  doc: TimelineDocument,
+  elementId: string,
+  ranges: TimeRange[],
+  ripple: boolean,
+  idGen: () => string,
+): TimelineDocument {
+  if (doc.elements[elementId] == null) {
+    return doc;
+  }
+
+  const ordered = normalizeRanges(ranges);
+  if (ordered.length === 0) {
+    return doc;
+  }
+
+  let next = doc;
+
+  // Which elements are pieces of the clip we were asked to cut. Splitting
+  // grows this set; nothing else on the track may ever enter it. Without it
+  // the search below would happily find — and delete — a neighbouring clip
+  // that merely happens to overlap the range.
+  const pieces = new Set<string>([elementId]);
+
+  for (const range of ordered) {
+    // Re-read every iteration: an earlier (later-in-time) cut may have split
+    // this element, and the piece this range falls in is not necessarily the
+    // one that kept the original id.
+    const target = findPieceCovering(next, pieces, range);
+    if (target == null) {
+      continue;
+    }
+
+    const [targetId, element] = target;
+    const span = spanOf(element);
+    // Clamped to the piece, and held to its edge when within float noise of
+    // it. A cut meant to run to the end of the clip reaches here from
+    // `planCuts` or `shiftSpan` a few ULPs short, and taken literally it splits
+    // off a tail 1e-11 ms long, or 0: an invisible clip left on the track.
+    // Only noise, never `ADJACENCY_EPSILON_MS`: a clip off the frame grid can
+    // be planned to keep a real piece shorter than half a millisecond, and
+    // dropping it would put the footage where `rippleMap` says it is not.
+    const from =
+      range.startMs - span.start <= EDGE_SLACK_MS ? span.start : range.startMs;
+    const to = span.end - range.endMs <= EDGE_SLACK_MS ? span.end : range.endMs;
+    if (to <= from) {
+      continue;
+    }
+
+    // Each range is applied to a scratch document and only adopted once all
+    // three steps land. A split can still decline — a cut closer to the edge
+    // than the minimum window leaves an empty half — and committing the first
+    // split without the delete that justified it would leave the clip severed
+    // for no reason, which is a worse outcome than declining the range.
+    let attempt = next;
+    const added: string[] = [];
+
+    // Cut the tail off first. Splitting at `from` afterwards would have to
+    // hunt for the middle piece again, and `splitClip` names only the right
+    // half, so working right-to-left keeps every id known.
+    let middleId = targetId;
+    let declined = false;
+
+    if (to < span.end) {
+      const rightId = idGen();
+      const afterTail = splitClip(attempt, targetId, to, rightId);
+      if (afterTail === attempt) {
+        declined = true;
+      } else {
+        attempt = afterTail;
+        added.push(rightId);
+      }
+    }
+
+    if (!declined && from > span.start) {
+      const rightId = idGen();
+      const afterHead = splitClip(attempt, middleId, from, rightId);
+      if (afterHead === attempt) {
+        declined = true;
+      } else {
+        attempt = afterHead;
+        added.push(rightId);
+        middleId = rightId;
+      }
+    }
+
+    if (declined) {
+      continue;
+    }
+
+    next = ripple
+      ? rippleDelete(attempt, middleId)
+      : deleteClips(attempt, [middleId]);
+
+    for (const id of added) {
+      pieces.add(id);
+    }
+    pieces.delete(middleId);
+  }
+
+  return next;
+}
+
+/**
+ * The piece of a once-single clip that `range` falls in.
+ *
+ * After the first cut the original element is several elements, all still on
+ * the same track, and the one a later range lands in is not necessarily the one
+ * holding the original id — so the search is by position. It is confined to
+ * `pieces` because position alone would also match the clip sitting next to
+ * ours, and deleting a bystander because it shared a lane would be the worst
+ * possible reading of "remove this range".
+ */
+function findPieceCovering(
+  doc: TimelineDocument,
+  pieces: Set<string>,
+  range: TimeRange,
+): [string, TimelineElement] | null {
+  for (const id of pieces) {
+    const candidate = doc.elements[id];
+    if (candidate == null) {
+      continue;
+    }
+    if (
+      overlaps(spanOf(candidate), { start: range.startMs, end: range.endMs })
+    ) {
+      return [id, candidate];
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Paste clips so the earliest of them lands on `atMs`, preserving the shape of
+ * the copied group.
+ *
+ * Each clip prefers the track it came from; if that track is gone or occupied,
+ * it falls back to the same rule a newly added element follows.
+ */
+export function pasteClips(
+  doc: TimelineDocument,
+  clips: Record<string, TimelineElement>,
+  atMs: number,
+  idGen: () => string,
+): TimelineDocument {
+  const entries = Object.values(clips);
+  if (entries.length === 0) {
+    return doc;
+  }
+
+  const anchor = Math.min(...entries.map((clip) => clip.startTime));
+  let next = doc;
+
+  // Old id -> new id, for every clip in this paste. Without it a pasted child
+  // keeps a `parentId` pointing at the *original* group, so duplicating a
+  // group and its contents produces two groups sharing one set of children —
+  // and moving either group would move clips out from under the other.
+  //
+  // A `parentId` naming something outside the paste is left as it is: pasting
+  // a lone child back into the project it came from should land it in the
+  // group it belongs to. `repairHierarchy` drops it if that group has since
+  // gone.
+  const remap = new Map<string, string>();
+  for (const [oldId] of Object.entries(clips)) {
+    remap.set(oldId, idGen());
+  }
+
+  const reparent = (clip: TimelineElement): TimelineElement => {
+    const parentId = (clip as any).parentId;
+    if (parentId == null) {
+      return clip;
+    }
+    const moved = remap.get(parentId);
+    if (moved != null) {
+      return { ...clip, parentId: moved } as TimelineElement;
+    }
+    // A clip copied out of a stabilize rig, without the rig. Its numbers are
+    // the ones it had before it was stabilized, so at the root it is exactly
+    // the unstabilized original; put back in the camera it would be a second
+    // clip moved by a camera copied from somebody else's null.
+    if (rigRoleOf(doc.elements[parentId]) === RIG_CAMERA) {
+      return withoutParent(clip);
+    }
+    return clip;
+  };
+
+  // A rig group pasted without its partner is a plain group: a zoom with no
+  // camera, or a camera that would be a second one under the original zoom,
+  // is not a rig, and a marker left on it would make it look like one.
+  const partnered = (oldId: string, clip: TimelineElement): boolean => {
+    const role = rigRoleOf(clip);
+    if (role === RIG_ZOOM) {
+      return Object.values(clips).some(
+        (other) => rigRoleOf(other) === RIG_CAMERA && (other as any).parentId === oldId,
+      );
+    }
+    if (role === RIG_CAMERA) {
+      const parentId = (clip as any).parentId;
+      return parentId != null && rigRoleOf(clips[parentId]) === RIG_ZOOM;
+    }
+    return true;
+  };
+  const unmarked = (oldId: string, clip: TimelineElement): TimelineElement => {
+    if (partnered(oldId, clip)) {
+      return clip;
+    }
+    const { rig: _role, ...rest } = clip as TimelineElement & { rig?: unknown };
+    return rest as TimelineElement;
+  };
+
+  for (const [oldId, original] of Object.entries(clips)) {
+    const clip = reparent(unmarked(oldId, original));
+    const start = Math.max(0, atMs + (clip.startTime - anchor));
+    const span = { start, end: start + spanLength(clip) };
+    const newId = remap.get(oldId) as string;
+
+    const originalTrackExists = next.tracks.some(
+      (track) => track.id === clip.trackId,
+    );
+    const fitsOriginal =
+      originalTrackExists &&
+      findCollisions(next, clip.trackId, span).length === 0;
+
+    // `cloneAnimation`, because `{...clip}` shares the `animation` object with
+    // the clipboard entry: pasting the same clip twice gave two elements one
+    // animation, and editing a keyframe on either changed both. Cloning just
+    // the animation rather than the whole clip keeps `blob`, `shape` and
+    // `filter` shared, which is what makes a paste cheap.
+    if (fitsOriginal) {
+      next = withElements(next, {
+        ...next.elements,
+        [newId]: cloneAnimation({ ...clip, startTime: start }),
+      });
+      continue;
+    }
+
+    const chosen = chooseTrackFor(next, clip, start, idGen());
+    next = withElements(chosen.doc, {
+      ...chosen.doc.elements,
+      [newId]: cloneAnimation({
+        ...clip,
+        startTime: start,
+        trackId: chosen.trackId,
+      }),
+    });
+  }
+
+  return next;
+}

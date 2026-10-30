@@ -1,0 +1,399 @@
+# What the E2E suite found
+
+Everything here was found by running the suite against `main` at the commit it
+was written on. Each item says how to reproduce it and how confident the
+evidence is. Nothing here has been fixed — the suite reports, it does not
+repair.
+
+---
+
+## 1. A third to two thirds of exported frames showed the previous source frame
+
+**Severity: high. Fixed and verified — see below.** Worst at 60 fps, which is
+the app's own default and the only rate its UI allows.
+
+### What happens
+
+The exported file shows source frame `N-1` at output frame `N`, for a large and
+regular fraction of every export. Both figures below are measured end to end,
+by reading a frame index burned into the source clip back out of the delivered
+file — every frame of it, not a sample:
+
+| profile | frames | wrong | share | offsets |
+|---|---|---|---|---|
+| smoke — 640x360 @ **30** | 600 | 206 | **34.3 %** | `-1` only |
+| full — 1920x1080 @ **60** | 18,000 | 12,029 | **66.8 %** | `-1` only |
+
+The wrong frames are perfectly regular, not scattered.
+
+At 30 fps the ordinals where `N mod 3 === 2` are wrong, and the decoded index
+sequence reads `0, 1, 1, 3, 4, 4, 6, 7, 7, 9, 10, 10, …`.
+
+At 60 fps *two* frames in every three are wrong — the run-length encoding shows
+`{from:1,to:2}`, `{from:4,to:5}`, `{from:7,to:8}` … — and the sequence reads
+`0, 0, 1, 3, 3, 4, 6, 6, 7, 9, 9, 10, …`. Source frames 2, 5, 8, 11 … are never
+shown at all. A 60 fps timeline of 60 fps footage delivers roughly 40 distinct
+source frames per second, with judder, in every export.
+
+### Why
+
+`features/export/renderTimeline.ts` asks for each frame at exactly its boundary:
+
+```
+frameTimeMs(N, fps) = (N / fps) * 1000
+```
+
+and `features/asset/loadedAssetStore.ts#seek` turns that into
+
+```
+video.currentTime = sourceTimeAt(element, time) / 1000
+```
+
+Chromium stores that assignment as whole **microseconds**. Whenever `1e6 / fps`
+is not an integer, truncating the boundary lands one microsecond *below* the
+frame's presentation timestamp, and the decoder then correctly returns the
+previous frame.
+
+Measured in the running app — requested `0.0666667`, `video.currentTime` read
+back `0.066666`, and the composited frame carried index 1 instead of 2.
+
+That the truncation is real is not inferred — it was read back out of the
+running app.
+
+**How far the model goes, and where it stops.** A simple model of "truncate the
+request to microseconds, then take the frame whose PTS is at or below it"
+predicts the 30 fps result exactly, including which ordinals are affected:
+
+| fps | model predicts | measured |
+|---|---|---|
+| 24 | 33 %, `n mod 3 === 1` | not measured |
+| **25** | **0** — `1e6/25 = 40000`, exact | not measured |
+| 30 | 33 %, `n mod 3 === 2` | **34.3 %, `n mod 3 === 2`** ✓ |
+| **50** | **0** — `1e6/50 = 20000`, exact | not measured |
+| 60 | 33 %, `n mod 3 === 1` | **66.8 %, two in three** ✗ |
+
+At 60 fps the damage is **twice** what the model predicts, so something beyond
+plain truncation is compounding it — the container timebase the demuxer reports
+PTS in, or a second rounding inside the media pipeline. The mechanism above is
+demonstrated; the exact arithmetic at 60 fps is not yet fully accounted for, and
+the per-rate shares in the table should be treated as measured where marked and
+unverified otherwise. The rates predicted to be exempt (25 and 50) have not been
+confirmed by measurement.
+
+The float arithmetic in `frameTimeMs` is *not* at fault — `(N/fps)*1000/1000`
+round-trips exactly for every N tested. Nothing here is a floating-point bug in
+the app's own code.
+
+### Reproduce
+
+```
+npx playwright test -c tests/e2e/playwright.config.ts --project=smoke seek-diagnosis.spec.ts
+```
+
+The attached `seek-samples.json` lists requested time, `video.currentTime` as
+read back, and the frame index decoded off the composited canvas, per frame.
+
+The full assertion lives in `stress.spec.ts` under "every one of the exported
+frames carries its own index", and reports the offsets and the affected runs.
+
+### The fix, and why it is the standard algorithm
+
+Applied in `apps/app/src/features/timeline/frames.ts#frameSampleMs`, used by
+`loadedAssetStore#seek`:
+
+```ts
+export function frameSampleMs(ms: number, fps: number): number {
+  const rate = normalizeFps(fps);
+  return frameToMs(msToFrameFloor(ms, rate), rate) + frameDurationMs(rate) / 2;
+}
+```
+
+**Address a frame at its centre, not at its boundary.** This is not a tolerance
+bolted on to make a test pass; it is the conventional way to select a discrete
+sample through a continuous parameter, the same reason a texel is sampled at its
+centre rather than its corner.
+
+A professional NLE never faces the choice. It converts a timeline frame index to
+a *source frame index* with integer or rational arithmetic and addresses the
+decoder by presentation timestamp in the stream's own timebase, compared
+exactly — no float seconds anywhere, so there is no tie to lose. Cartcut cannot:
+an HTML `<video>` exposes only `currentTime`, a double in seconds, and the frame
+it selects is the one whose interval `[pts, pts + duration)` contains that
+value. Asking for exactly `pts` is a boundary case, and microsecond
+quantisation loses it.
+
+Centre sampling buys half a frame of clearance — 8,333 µs at 60fps against a
+1 µs quantisation, a factor of over eight thousand. The identical technique is
+used on the extraction side of this suite (`decode.ts#singleFrameCommand` seeks
+to `(N - 0.25) / fps`), arrived at independently for the same reason.
+
+Two details that are easy to get wrong, and were:
+
+- **The half-frame goes in on the timeline side of `sourceTimeAt`, not after
+  it.** `sourceTimeAt` multiplies by `speed`, so a 2x clip needs two source
+  frames of offset per timeline frame and a 0.25x clip a quarter of one. An
+  earlier draft of this note proposed `sourceTimeAt(...) + 500 / fps`, adding a
+  fixed offset in the *source* domain — correct only at speed 1.
+- **Visibility still uses the unbiased instant.** `isElementVisibleAtTime`
+  answers a question about the timeline moment; asking it half a frame late
+  would let a clip appear or vanish one frame off. Only the address *inside* an
+  already-visible clip moves.
+
+### Verified
+
+| check | before | after |
+|---|---|---|
+| `frameSample.test.ts` — survives µs truncation at 23.976/24/25/29.97/30/48/50/59.94/60/120 fps | — | 7 tests pass |
+| smoke export, 600 frames @ 30fps, every frame checked | 206 wrong (34.3 %) | **0 wrong** |
+| full export, 18,000 frames @ 1080p60, every frame checked | 12,029 wrong (66.8 %) | **0 wrong** |
+| in-page seek probe, 40 frames, no encoder involved | 39 wrong | **0 wrong** |
+| sampled frame parity (94 frames: fidelity, burned index, alignment) | 52 frames disagreed | **0** |
+| ticker alignment margin below the healthy 8x | 39 frames | **0** |
+| existing vitest suite | 117 files pass | 118 files pass, +7 tests, no regressions |
+
+The in-page probe shows the mechanism directly: frame 1 requests 33.333 ms, and
+`video.currentTime` now reads back 0.05 s — the boundary plus half a frame —
+and decodes source index 1.
+
+### What was deliberately not changed
+
+**The preview's own positioning.** `features/timeline/playback.ts#intentFor`
+computes `sourceTimeAt(element, cursorMs) / 1000` and has the same boundary
+problem, so scrubbing the preview still lands a frame early at 24/30/60 fps.
+It was left alone because `seek` has exactly one production caller (the export
+frame loop) and is therefore safe to change in isolation, whereas `intentFor`
+feeds real-time playback where a position is also used to correct audio/video
+drift — a change there deserves its own verification, and this suite's preview
+leg asserts presence rather than frame identity, so it could not confirm it.
+
+This means preview and export now disagree by one frame while scrubbing. That
+is a smaller defect than the one removed — the delivered file is now correct —
+but it is a real WYSIWYG gap and should be the next thing fixed, using the same
+`frameSampleMs`.
+
+---
+
+## 2. `add_media` ignores three of its documented parameters
+
+**Severity: medium.** The MCP tool advertises placement control it does not have.
+
+`electron/mcp/tools/media.ts` declares per-item `startMs`, `durationMs` and
+`trackId`:
+
+```ts
+items: z.array(z.object({
+  path: z.string(),
+  startMs: z.number().optional(),
+  durationMs: z.number().optional(),
+  trackId: z.string().optional(),
+}))
+```
+
+`apps/app/src/features/agent/commands/media.ts` reads none of them. It uses only
+the batch-level `params.startMs` and `params.sequential`, then hands everything
+to `placeImported`. A caller asking for a three-second clip on a named track
+gets a clip of the source's full length on whichever track placement chose.
+
+Observed: two clips requested at `startMs` 0 and 3000 with `durationMs` 3000 and
+an explicit `trackId` came back 30021 ms and 25021 ms long, on two *different*
+tracks, overlapping.
+
+The suite works around it in `scenario/kitchenSink.ts#addMediaAt` by following
+each import with `trim_clip` and `move_clips`, which do honour their arguments.
+
+---
+
+## 3. Switching sidebar tabs clears the selection, which silently disables the fx grid
+
+**Severity: medium** for automation, **low** for a human (who selects after
+switching anyway).
+
+`fxPresetBrowser.applyTransition` puts a transition on the bare cut nearest the
+playhead **on the selected clip's track**, and reads
+`selectionStore.getState().ids[0]`. Opening the Fx tab clears that selection, so
+a "select the clip, then open the panel, then click a preset" sequence finds an
+empty selection, toasts *"Select a clip next to a cut"* and places nothing.
+
+There is no error and no return value, so the caller cannot tell. The suite
+orders it the other way round (`harness/ui.ts#applyFxPreset` selects after the
+tab is open, and verifies the selection took).
+
+---
+
+## 4. `ElementControlAsset.templateAudio` throws on every audio clip added
+
+**Severity: low.** A Lit render error, logged and swallowed; the export is
+unaffected because it draws through the canvas renderer, not this DOM overlay.
+
+```
+TypeError: Cannot read properties of undefined (reading 'filetype')
+    at ElementControlAsset.templateAudio (elementControlAsset.ts:150)
+```
+
+```ts
+templateAudio() {
+  const element = this.timeline[this.elementId];
+  if (element.filetype !== "audio") { return ``; }
+```
+
+`element` is not guarded against being absent, and the component renders for an
+id its `timeline` map does not hold. Reproduced every time an audio clip is
+added — see `agent.spec.ts`.
+
+---
+
+## 5. `filesystem:removeDirectory` throws `ReferenceError: status is not defined`
+
+**Severity: low.** Fires during export cleanup.
+
+```
+Error invoking remote method 'filesystem:removeDirectory':
+  ReferenceError: status is not defined
+```
+
+A bare `status` in the main-process handler, reached on a path the happy case
+does not take.
+
+---
+
+## 6. Audio input is limited to three extensions
+
+**Severity: low**, but surprising.
+
+`apps/app/src/functions/mime.ts` accepts exactly `mp3`, `wav` and `m4a` for
+audio. `.ogg`, `.opus`, `.flac` and `.aac` are all refused with *"Cartcut has no
+renderer for …"*, even though FFmpeg and Chromium both handle them and the
+exporter can itself *produce* Opus and Vorbis for the WebM container.
+
+`.ogv` is likewise absent from the video list. (Theora would not have decoded
+anyway — Chromium removed it in M123, and this is Electron 33 / Chromium 130.)
+
+---
+
+## 7. `saveProjectFile` resolves before it has written anything
+
+**Severity: low.**
+
+`functions/project.ts#saveProjectFile` starts `zip.generateAsync(...).then(...)`
+and does not return that promise, so awaiting the call awaits nothing and the
+file does not exist yet when it resolves. The suite polls for the file instead.
+
+---
+
+## 9. `loadEntireTimeline` can resolve with clips still undecoded
+
+**Severity: medium**, and it sits directly on the export path.
+
+`assetBatch.ts#runAssetBatch` skips a task whose key is already in the in-flight
+set:
+
+```ts
+for (const task of tasks) {
+  if (task.inFlight.has(task.key)) {
+    continue;          // <- not awaited, just skipped
+  }
+  ...
+}
+await Promise.all(started);
+```
+
+It waits only for the loads *this* call started. The preview fires
+`loadAssetsNeededAtTime` un-awaited on every repaint, so a clip added moments
+earlier is usually already in flight — and `loadEntireTimeline` then resolves
+with that clip absent from `_loadedElementVideo`.
+
+`features/export/renderTimeline.ts` awaits `loadEntireTimeline` and immediately
+begins seeking. `seek` iterates `_loadedElementVideo`, so a clip missing from it
+is simply not positioned and not drawn. The window is short and the export is
+long, so most frames are unaffected — but the opening frames of an export
+started right after an import can legitimately be missing a clip.
+
+Observed twice while building this suite: `primeAssets` reported 17 of 18 videos
+decoded, and a reference frame rendered without one of its clips looks like the
+*export* drew something extra rather than like a missing handle — which cost a
+round of chasing the wrong instrument.
+
+The suite works around it by looping until the cache holds every video the
+timeline references (`harness/reference.ts#primeAssets`), and asserts the count
+before comparing anything. A fix in the app would be for `runAssetBatch` to
+await in-flight tasks rather than skip them — it would need a promise per key
+rather than a bare `Set`.
+
+---
+
+## 8. Smaller notes
+
+- **The export writes no colour metadata.** `videoOutputArgs` emits no
+  `-colorspace`, `-color_primaries` or `-color_range`, so the delivered file is
+  colorimetrically untagged and ffprobe reports `color_space=unknown`. The round
+  trip is self-consistent today, so this is not a defect the suite fails on —
+  and the suite deliberately does *not* pin decode flags, so adding correct
+  tagging later will not break it. The `swatch` canary verifies the round trip
+  empirically instead.
+- ~~**The fps field has no working control.**~~ *Fixed.* The field is
+  `#projectFps` now, live, with a preset list and a custom range, and the frame
+  rate is written to and read from `renderOptions.json` — it used to be dropped
+  on save and replaced by a literal 60 on load. Every profile drives it through
+  the panel (`harness/ui.ts#setFps`), and `project-roundtrip.spec.ts` reopens a
+  saved project to check the rate survived.
+- **`effect` and `transition` have no agent commands at all**, and are missing
+  from `define.ts`'s `FILETYPES`, so the read tools cannot even filter for them.
+  Two of the nine element types are invisible to the automation surface. The
+  suite places them by clicking the fx grid and reads them out of the document
+  directly (`harness/agent.ts#timelineDocument`).
+- **`CLAUDE.md` says transitions do not exist in the data model.** They do —
+  `TransitionElementType` is at `@types/timeline.ts:433`, with a full
+  `transitionOps.ts`, `transitionGeometry.ts` and an `option-transition` panel.
+  The note is stale. The tool count in the same file says 36; it is 37.
+
+---
+
+## 10. html-in-canvas in this Electron (the graphic layer's gate)
+
+Measured 2026-10-04 with `tests/spikes/html-in-canvas/` against Electron 44.4.3
+(Chromium 152.0.7977.130), `webPreferences.enableBlinkFeatures:
+"CanvasDrawElement"`. Every line below is a result the harness prints; rerun it
+before relying on any of them after an Electron upgrade, because the WICG
+explainer has already moved on to a `content="drawable"` shape that this build
+does not have.
+
+| question | answer |
+|---|---|
+| API present | `layoutsubtree`, `drawElementImage` (returns a `DOMMatrix`), `requestPaint`, `paint` event with `changedElements`, `captureElementImage` |
+| Hiding the host canvas | `clip-path: inset(50%)` works. **`opacity: 0` paints every child transparent**, a canvas at `left: -10000px` is culled to nothing, and `visibility: hidden` throws "No cached paint record" |
+| Shadow root under the canvas | drawn, closed or open |
+| iframe under the canvas | **crashes the renderer** (exit code 5), sandboxed or not, direct child or wrapped, before any draw. The mount is a shadow root |
+| CSS animation, paused and seeked | drawn at the seeked time (`currentTime = 500` of a red to blue 1s ramp reads `128,0,128`) |
+| SMIL, `pauseAnimations` + `setCurrentTime` | drawn at that time |
+| Freshness | **not synchronous.** A style change is invisible to `drawElementImage` after a forced layout and inside the next `requestAnimationFrame`; it is visible after the next `paint` event and inside that event's handler |
+| Scale | replayed as vectors: drawn under `ctx.scale(4, 4)`, or with a 4x destination size, the text edges match CSS `zoom: 4` and are 7x sharper than a 1x raster upscaled. No zoom trick is needed for resolution |
+| Root CSS transform | ignored by the draw (as specified); transforms on descendants are drawn |
+| Overflow | clipped to the element's border box, so a bleed has to be padding on the root, not overflow |
+| Document `@font-face` from `file://` | applies inside the shadow root and is drawn |
+| `blob:` and `file://` images | both drawn |
+| Canvas taint | none: `getImageData` works after drawing file fonts and file images |
+| `url(#id)` (CSS filter) and `textPath href="#id"` inside the shadow root | both resolve within the shadow tree |
+| `@property` inside the shadow root's adopted sheet | **ignored** (a registered colour animates discretely). Registered at document level it interpolates (`191,0,64` at a quarter), so the host hoists it and renames the property per program |
+| Several children changed before one `requestPaint` | all fresh inside one `paint` handler, so one paint serves many graphics |
+| Cost at 1920x1080 | about 6 ms per draw plus read, about 7 ms from `requestPaint` to `paint` |
+| ElementImage on another canvas | refused ("captured from a different canvas"); `drawImage` from the host canvas works, so rasters are copied |
+| Minimized window, throttling on | no `paint`, no `requestAnimationFrame`, "No cached paint record". With `webContents.setBackgroundThrottling(false)` it paints normally while minimized |
+| Hidden window (`show: false`, throttling off) | paints normally |
+
+### The shape Chrome ships, measured 2026-10-21
+
+Chrome turns html-in-canvas on by default in 157 (Intent to Ship approved
+2026-10-01), with the opt-in renamed. One red 8x8 child, drawn through a
+`clip-path: inset(50%)` canvas, then `getImageData` at its centre, in Chrome for
+Testing with no flags unless stated:
+
+| build | calls present | `layoutsubtree` only | `content="drawable"` + child `drawable` | both |
+|---|---|---|---|---|
+| Chrome 155.0.8059.85 | no | n/a | n/a | n/a |
+| Chrome 155 + `CanvasDrawElement` | yes | red | throws `InvalidStateError` | red |
+| Chrome 157.0.8103.6 (beta) | yes | throws `InvalidStateError` | red | red |
+| Chrome 158.0.8106.0 / 158.0.8114.0 | yes | throws `InvalidStateError` | red | red |
+
+`HTMLCanvasElement.prototype.layoutSubtree` is gone from 157, so a support check
+keyed on it reports no in a browser that draws. The host sets both opt-ins and
+decides support in a browser by drawing a pixel (`htmlHost.ts#htmlSupport`).

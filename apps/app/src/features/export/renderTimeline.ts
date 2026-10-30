@@ -1,0 +1,425 @@
+import type { Timeline } from "../../@types/timeline";
+import type { RenderOptions } from "../../states/renderOptionStore";
+import type { ILoadedAssetStore } from "../asset/loadedAssetStore";
+import {
+  renderTimelineAtTime,
+  type TimelineRenderers,
+} from "../renderer/timeline";
+import { preloadForComposite } from "./compositePrep";
+import { assetTimeline } from "../template/assetTimeline";
+import { templateFor } from "../template/templateRegistry";
+import {
+  templateExpanderFor,
+  withTemplateResolver,
+  type TemplateResolver,
+} from "../renderer/template";
+import { withoutHiddenClips } from "../timeline/tracks";
+import { createExportFxRuntime } from "../renderer/fx/createRuntime";
+import { releaseOverlayScope } from "../renderer/fx/overlaySource";
+import { createVideoScope, withVideoScope } from "../asset/videoScope";
+import {
+  createGraphicScope,
+  hasGraphicElements,
+  withGraphicScope,
+} from "../graphic/graphicScope";
+import { GraphicGl } from "../renderer/graphicGl";
+import {
+  needsHtmlHost,
+  prepareScopeFrame,
+  releaseScopeGraphics,
+} from "../graphic/graphicPipeline";
+import { paintHold } from "../graphic/paintHold";
+import { beginExportGraphics, endExportGraphics } from "../graphic/graphicQueue";
+import { hasFxElements } from "../renderer/fx/planFrame";
+import { setLutBlocking } from "../renderer/lut/apply";
+import { frameCount, frameTimeMs, inFlightWindow } from "./frames";
+import { createFrameProfiler } from "./profile";
+import { videoElementFrameSource, type ExportFrameSource } from "./frameSource";
+
+/**
+ * Extras the frame loop understands, none of which the older call sites pass.
+ *
+ * These are a field bag rather than positional parameters so the signature the
+ * existing suites drive stays exactly as it was.
+ */
+export type RenderTimelineControls = {
+  /** Aborts the loop between frames, and while waiting on a seek. */
+  signal?: AbortSignal;
+  /**
+   * Where templates are read from for the whole render: the project's own
+   * templates as they stood when Render was pressed
+   * (`timelineWorkspace.ts#snapshotTemplateResolver`), so one edited while
+   * this runs does not change the frames still to come. The live registry
+   * when absent.
+   */
+  resolveTemplate?: TemplateResolver;
+  /**
+   * The decoders. The scope's own `<video>` handles when absent, which is the
+   * desktop export; the browser export passes WebCodecs
+   * (`webMedia/webFrameSource.ts`).
+   */
+  frameSource?: ExportFrameSource;
+  /**
+   * Where each finished frame goes, in place of `frameCallback`.
+   *
+   * The canvas itself rather than its pixels: the browser export encodes it
+   * directly (`new VideoFrame(canvas)` copies on the GPU), so the 8 MB
+   * `getImageData` readback a frame costs the desktop export is never paid.
+   * The frame must be taken before the promise is first awaited, because the
+   * next composite draws over the same canvas.
+   */
+  sink?: FrameSink;
+};
+
+export type FrameSink = {
+  accept(
+    canvas: HTMLCanvasElement,
+    index: number,
+    total: number,
+  ): void | Promise<void>;
+  /** Frames that may be outstanding at once; `inFlightWindow` when absent. */
+  readonly window?: number;
+};
+
+/**
+ * Handed one finished frame.
+ *
+ * Returning a promise applies backpressure: the loop keeps at most
+ * `inFlightWindow` frames outstanding and will not render past that until the
+ * oldest settles. That is what stops the renderer outrunning FFmpeg now that
+ * frames are raw and cheap to produce — see `renderFrame.ts`.
+ *
+ * Frames are handed over in order, and the main-process handler writes them to
+ * stdin in the order it receives them, so a window wider than one does not
+ * reorder the stream.
+ */
+export type FrameCallback = (
+  currentFrameBuffer: ArrayBuffer,
+  currentFrame: number,
+  totalFrames: number,
+) => void | Promise<void>;
+
+/**
+ * Render timeline using canvas. Contains only rendering logic.
+ * If you want to implement various export methods, use this as a building block.
+ * @param assetStore Store for assets to load
+ * @param options Options for rendering. Part of ExportOptions.
+ * @param frameCallback Callback for frame processing.
+ * @param controls Optional abort plumbing.
+ */
+export async function renderTimeline(
+  assetStore: ILoadedAssetStore,
+  timeline: Timeline,
+  elementRenderers: TimelineRenderers,
+  options: RenderOptions,
+  frameCallback: FrameCallback,
+  controls: RenderTimelineControls = {},
+): Promise<void> {
+  const {
+    fps,
+    previewSize: { w: width, h: height },
+    backgroundColor,
+  } = options;
+  const { signal, sink } = controls;
+  const frameSource = controls.frameSource ?? videoElementFrameSource(assetStore);
+  const resolveTemplate = controls.resolveTemplate ?? templateFor;
+  const expandTemplate = templateExpanderFor(resolveTemplate);
+
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d");
+
+  if (ctx == null) {
+    throw new Error("Failed to create canvas context");
+  }
+
+  const profiler = createFrameProfiler();
+
+  /**
+   * This export's own decoders.
+   *
+   * The frame loop runs in the editor's renderer, and the preview repaints on
+   * every store write — its draw path calls `syncPlayback` and
+   * `releaseUnusedVideos` *with a cursor*, either of which would move or drop a
+   * handle mid-frame. Until the export button reached the title bar, the only
+   * thing preventing that was the progress modal's backdrop blocking the
+   * mouse, which is a property of the UI rather than of the code.
+   *
+   * Owned here rather than held in the store on purpose: an export that is
+   * cancelled halfway cannot then leave an orphan behind, because the only
+   * reference to it dies with this call. It also means the handles are
+   * released deterministically at the end of a run instead of sitting in the
+   * shared cache until the preview's decoder window happens to evict them.
+   */
+  const scope = createVideoScope(`export:${Date.now()}`);
+
+  /**
+   * Read every LUT this project refers to *before* the first frame.
+   *
+   * The registry loads lazily and answers `null` until a table has arrived,
+   * which is right for the preview — it repaints and picks the grade up on the
+   * next frame — and wrong here. An export's frame loop runs straight through,
+   * so a table that landed on frame three would leave frames one and two
+   * ungraded in the delivered file, and nothing downstream would ever say so.
+   */
+  await preloadForComposite(timeline, resolveTemplate);
+
+  /**
+   * And every template, for exactly the same reason.
+   *
+   * `templateFor` answers `null` until a document has been read, which the
+   * preview recovers from on its next repaint and an export cannot: a template
+   * that arrived on frame three would leave frames one and two showing nothing
+   * where it sits, and nothing downstream would ever say so.
+   */
+
+  /**
+   * The map the decoders work from, with every template's contents flattened in.
+   *
+   * Only the asset half takes this. The picture is still drawn from `timeline`,
+   * where a template is one element that composites its own document — handing
+   * the expansion to `renderTimelineAtTime` would draw every inner clip twice.
+   *
+   * A hidden row's clips are left out on both sides of the expansion. An
+   * export decodes a video only to draw it, and a hidden clip's sound is
+   * rebuilt by FFmpeg from the file in main, so seeking one every frame buys
+   * nothing. Filtering the input first also drops a hidden template's
+   * contents, which carry no flag of their own. The preview cannot do the
+   * same: there the decoder is also where the sound comes from.
+   */
+  const assets = withoutHiddenClips(
+    assetTimeline(withoutHiddenClips(timeline), resolveTemplate),
+  );
+
+  /**
+   * Effects and transitions for this export.
+   *
+   * Its own context and compositor, separate from the preview's: this one
+   * blocks on the GPU, because `captureFrame` reads the canvas back with
+   * `getImageData` immediately after compositing and that read must see the GL
+   * result. Sharing the preview's would also mean two frame loops writing the
+   * same drawing buffer.
+   *
+   * Built only when the project actually contains an effect, a transition or a
+   * backdrop, asked of the expanded map so one inside a template counts: the
+   * template draws it through the compositor's child (`renderer/template.ts`).
+   * Creating one allocates a canvas and a WebGL context, and most exports need
+   * neither, so an export of an ordinary edit costs exactly what it did before
+   * this feature existed, down to the number of canvases it creates.
+   *
+   * `null` where there is no WebGL, and every frame then renders exactly as it
+   * did before this feature: no effects, no transitions, no crash.
+   */
+  const fx = hasFxElements(assets) ? createExportFxRuntime(fps, scope.id) : null;
+
+  // The per-clip grade runs on the GPU and `captureFrame` reads the canvas
+  // back with `getImageData` on the next line, so that read has to see the
+  // result. Same split the compositor's `blocking` makes, and the same one
+  // `renderVideoWithWait` makes for a filtered clip.
+  setLutBlocking(true);
+
+  // Export never plays the `<audio>` handles — FFmpeg rebuilds the whole audio
+  // graph from the timeline itself — so decoding them here buys nothing but
+  // latency, memory, and a set of media elements nobody owns the state of.
+  // Into the scope, not the shared cache. Images and gifs still go to the
+  // shared one — they are keyed by path and immutable once decoded, so nothing
+  // can move one under a frame loop.
+  await frameSource.load(scope, assets);
+
+  /**
+   * The export's graphic scope: its own blocking generator, and the HTML
+   * rasters made for each frame. `null` for a project with no graphic, which
+   * then pays nothing for the feature.
+   */
+  const graphics = hasGraphicElements(assets)
+    ? createGraphicScope(scope.id, new GraphicGl({ blocking: true }), fps)
+    : null;
+
+  /**
+   * Whether frames need HTML rasters. While they do, the export holds the HTML
+   * host (the preview stops preparing, `graphicQueue.ts`), and the window is
+   * kept painting: a minimised window with background throttling on stops
+   * firing `paint` altogether, measured, and every frame would time out.
+   */
+  const html = graphics != null && needsHtmlHost(assets, expandTemplate);
+  const releasePainting = html ? await paintHold.hold() : null;
+  if (html) {
+    beginExportGraphics();
+  }
+
+  const totalFrames = frameCount(options);
+
+  // Frames handed to `frameCallback` but not yet acknowledged. Keeping more
+  // than one outstanding is what lets the next seek and composite overlap
+  // FFmpeg's consumption of the last frame.
+  const inFlight: Promise<void>[] = [];
+  const windowSize = Math.max(1, sink?.window ?? inFlightWindow(width, height));
+
+  // The first failure from any outstanding frame. They are caught as soon as
+  // they are queued — an in-flight rejection nobody is awaiting yet would
+  // otherwise surface as an unhandled rejection — and re-thrown from the loop
+  // at the next checkpoint.
+  let failure: unknown = null;
+  const queue = (result: void | Promise<void>) => {
+    if (result == null || typeof (result as Promise<void>).then !== "function") {
+      return;
+    }
+    inFlight.push(
+      (result as Promise<void>).catch((error) => {
+        failure ??= error;
+      }),
+    );
+  };
+  const throwIfFailed = () => {
+    if (failure != null) {
+      throw failure;
+    }
+  };
+
+  try {
+    for (let currentFrame = 0; currentFrame < totalFrames; currentFrame++) {
+      throwIfAborted(signal);
+      throwIfFailed();
+
+      const timeInMs = frameTimeMs(currentFrame, fps);
+
+      await profiler.measureAsync("seek", () =>
+        frameSource.advance(scope, assets, timeInMs, fps),
+      );
+
+      if (html && graphics != null) {
+        const painted = await profiler.measureAsync("graphics", () =>
+          prepareScopeFrame(graphics, timeline, timeInMs, { expandTemplate }),
+        );
+        // Not shipped blank. A graphic missing from one frame of a delivered
+        // file is worse than an export that stops and says why.
+        if (!painted) {
+          throw new Error(
+            "A graphic could not be drawn: the editor window stopped painting. Keep it open and try again.",
+          );
+        }
+      }
+
+      // A seek that lands after the abort would otherwise composite and ship a
+      // frame into a pipe that is already being torn down.
+      throwIfAborted(signal);
+
+      profiler.measure("composite", () =>
+        // Synchronous, which is what makes a dynamic extent safe: every
+        // renderer in the chain is, so the scope cannot leak past this call.
+        // It is also what covers a template's *nested* clips, which follow the
+        // one renderer table `App.ts` installs globally rather than the table
+        // passed here. See `withVideoScope`.
+        withTemplateResolver(resolveTemplate, () =>
+          withGraphicScope(graphics, () =>
+            withVideoScope(scope, () =>
+              renderTimelineAtTime(
+                ctx,
+                timeline,
+                timeInMs,
+                elementRenderers,
+                backgroundColor,
+                width,
+                height,
+                undefined,
+                undefined,
+                fx,
+              ),
+            ),
+          ),
+        ),
+      );
+
+      if (sink != null) {
+        queue(
+          profiler.measure("capture", () =>
+            sink.accept(canvas, currentFrame, totalFrames),
+          ),
+        );
+      } else {
+        const frameArrayBuffer = profiler.measure("capture", () =>
+          captureFrame(ctx, width, height),
+        );
+        queue(frameCallback(frameArrayBuffer, currentFrame, totalFrames));
+      }
+
+      // Only the wait counts as pipe time now. With a window wider than one,
+      // a frame's own transport overlaps the next frame's seek, so timing the
+      // handover itself would attribute work that cost no wall clock.
+      if (inFlight.length >= windowSize) {
+        await profiler.measureAsync("pipe", () => inFlight.shift()!);
+      }
+
+      profiler.endFrame();
+    }
+
+    // Nothing may report success until every outstanding frame has landed —
+    // the caller closes FFmpeg's stdin as soon as this resolves.
+    await Promise.all(inFlight);
+    inFlight.length = 0;
+    throwIfFailed();
+  } finally {
+    // On the abort and failure paths there may still be frames outstanding.
+    // Settle them before unwinding so no write is still running against a pipe
+    // the caller is about to tear down.
+    await Promise.allSettled(inFlight);
+    // Every decoder this export opened, whether it finished, failed or was
+    // cancelled. Nothing else can reach them, so nothing else would ever free
+    // them.
+    await frameSource.release(scope);
+    releaseOverlayScope(scope.id);
+    // Compiled programs, render targets and uploaded textures all belong to
+    // this export's context. An export that is cancelled halfway leaks every
+    // one of them without this.
+    fx?.compositor.dispose();
+    // The export's own generator, for the same reason: its context and every
+    // program compiled in it belong to this export alone.
+    graphics?.gl?.dispose();
+    // And its HTML host, whose mounts are canvases in the editor's document.
+    if (graphics != null) {
+      releaseScopeGraphics(graphics);
+    }
+    if (html) {
+      endExportGraphics();
+    }
+    await releasePainting?.();
+    // Restored even on the abort path: leaving it set would make every
+    // subsequent preview frame stall on `gl.finish()` for no benefit.
+    setLutBlocking(false);
+    profiler.report();
+  }
+}
+
+/**
+ * The raw RGBA bytes of the composited frame.
+ *
+ * This used to be `toBlob(..., "image/png")`. PNG cost roughly 120 ms of CPU
+ * per 1080p frame to deflate pixels that FFmpeg inflated again two
+ * milliseconds later, which was about 60% of export wall time; the raw
+ * round trip is ~3.6 ms. The pipe carries 8.29 MB per frame instead of ~1.5 MB
+ * and that trade is not close.
+ *
+ * The stride is fixed and unframed, so the receiving end must verify the
+ * length — a single short write silently shears every frame after it. See
+ * `ipcRenderV2.sendFrame`.
+ */
+function captureFrame(
+  ctx: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+): ArrayBuffer {
+  const { data } = ctx.getImageData(0, 0, width, height);
+  // `data.buffer` is the whole allocation; `getImageData` never returns a view
+  // into a larger one, but slicing on a non-zero offset would be silent
+  // corruption if that ever changed.
+  return data.byteOffset === 0 && data.byteLength === data.buffer.byteLength
+    ? data.buffer
+    : data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) {
+    throw new DOMException("Export cancelled", "AbortError");
+  }
+}

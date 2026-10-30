@@ -1,0 +1,48 @@
+/* Pretendard used to be pulled from jsDelivr here. It has gone: the app has to
+   run offline, and nothing in this file or the component ever named the
+   `Pretendard` family — only the local face below, which is confusingly named
+   `notosanskr` while pointing at a Pretendard file. Left as-is; renaming it
+   would be a behaviour change unrelated to the network. */
+
+@font-face {
+  font-family: notosanskr;
+  src: url(/Pretendard-Medium.otf);
+}
+
+html,
+body {
+  background-color: rgba(0, 0, 0, 0);
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+}
+
+.modal-dark {
+  background-color: #111315;
+  border: 1px solid #1f2225;
+  border-radius: 10px;
+}
+
+.modal-backdrop.show {
+  opacity: 0.61;
+}
+
+.modal-body-dark {
+  padding: 1.175rem 0.9rem;
+}
+
+.modal-footer-dark {
+  border-top: 1px solid #292c30;
+}
+
+.btn-nowarp {
+  white-space: nowrap;
+}
+
+.bg-default {
+  background-color: #1c1f23;
+}
+
+.btn-sm {
+  padding: 0.4rem 0.8rem 0.4rem 0.8rem !important;
+}

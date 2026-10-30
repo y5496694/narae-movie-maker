@@ -1,0 +1,61 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`golden frames > composites a stable frame at each sampled timecode 1`] = `
+{
+  "0": "ca97b8f5",
+  "1000": "ca97b8f5",
+  "2000": "f5e63009",
+  "3000": "9203f8f8",
+  "3999": "bd2b9e44",
+}
+`;
+
+exports[`golden frames — adjusted > composites a stable frame at each sampled timecode 1`] = `
+{
+  "0": "f83721ec",
+  "1000": "f83721ec",
+  "2000": "f83721ec",
+  "3000": "852acaf5",
+  "3999": "852acaf5",
+}
+`;
+
+exports[`golden frames — blended > composites a stable frame at each sampled timecode 1`] = `
+{
+  "0": "47ed7dee",
+  "1000": "47ed7dee",
+  "2000": "a1121a50",
+  "3000": "976dfa17",
+  "3999": "28c3cd11",
+}
+`;
+
+exports[`golden frames, rounded > composites a stable frame at each sampled timecode 1`] = `
+{
+  "0": "ccb1641e",
+  "1000": "ccb1641e",
+  "2000": "4239fdd0",
+  "3000": "c423341a",
+  "3999": "b8a38ddc",
+}
+`;
+
+exports[`golden frames, scaled > composites a stable frame at each sampled timecode 1`] = `
+{
+  "0": "0e3e242c",
+  "1000": "0e3e242c",
+  "2000": "70ad21b0",
+  "3000": "004918bf",
+  "3999": "a55a679b",
+}
+`;
+
+exports[`golden frames, with a shape recipe > composites a stable frame at each sampled timecode 1`] = `
+{
+  "0": "a1f58b2f",
+  "1000": "a1f58b2f",
+  "2000": "d73c55f3",
+  "3000": "0a91e3f6",
+  "3999": "44eb94ca",
+}
+`;

@@ -1,0 +1,84 @@
+나래 무비메이커 독립 녹화 CLI
+작성: 2026-10-30
+
+구현
+- cli/record.mjs는 Node.js 기본 모듈과 제공된 FFmpeg 경로만 사용합니다.
+- 나래 무비메이커 GUI, Electron, CartCut 설치나 실행이 필요하지 않습니다.
+- 내보낸 함수: runRecordingCommand(command, args, { ffmpegPath, signal? })
+- command: devices, record-screen, record-camera, record-audio
+- args: 명령 뒤의 문자열 인수 배열
+- 반환값은 JSON으로 출력할 수 있는 객체입니다. 모듈은 직접 콘솔에 출력하지 않습니다.
+- 테스트용 buildRecordingInvocation(command, args, options)도 내보냅니다.
+
+기본 사용법
+  devices
+  record-screen --output screen.mp4 --seconds 10
+  record-screen --output region.mp4 --seconds 10 --region 0,0,1080,1920 --fps 30
+  record-camera --output camera.mp4 --seconds 10 --video-device "USB Camera"
+  record-audio --output voice.wav --seconds 10 --audio-device "Microphone (USB Audio)"
+  record-screen --output screen.mp4 --seconds 10 --audio-device "Microphone (USB Audio)"
+
+실행 전 확인
+  record-screen --output screen.mp4 --seconds 10 --dry-run
+  devices --dry-run
+- --dry-run은 실제 실행 인수 배열을 반환하며 FFmpeg를 시작하거나 폴더와 파일을 만들지 않습니다.
+- devices의 command는 장치 목록 조회, capabilityCommand는 FFmpeg 입력 형식 조회입니다.
+- 실제 devices 명령은 영상이나 음성을 저장하지 않고 장치 이름과 입력 형식만 조회합니다.
+- --help는 FFmpeg 실행 없이 한국어 도움말을 반환합니다.
+
+인수와 출력
+- --output은 명시해야 하며, 단일 위치 인수로 파일 경로를 전달해도 됩니다.
+- --seconds는 유한한 양수여야 합니다. 무기한 녹화는 제공하지 않습니다.
+- --fps는 1~240의 수 또는 30000/1001 같은 비율을 받습니다. 기본값은 30입니다.
+- --region은 화면 녹화에서만 받으며 X,Y,WIDTH,HEIGHT 정수 형식입니다.
+- Windows는 음수 화면 좌표를 받아 왼쪽이나 위쪽의 보조 모니터 영역도 지정할 수 있습니다.
+- 홀수 크기 영상은 H.264/VP9 호환성을 위해 오른쪽 또는 아래에 1픽셀을 덧붙입니다.
+- 영상 파일: MP4, MOV, MKV, WebM
+- 음성 파일: WAV, FLAC, MP3, M4A, AAC, MP4, OGG, OPUS, MKV
+- 화면과 카메라는 기본적으로 음성을 기록하지 않습니다. --audio-device를 명시해야 합니다.
+- 파일이 이미 있으면 FFmpeg를 실행하기 전에 거부합니다. --overwrite를 명시할 때만 덮어씁니다.
+- FFmpeg에도 -n을 전달하여 실행 직전 생긴 기존 파일을 덮어쓰지 않게 합니다.
+- 출력 심볼릭 링크와 일반 파일이 아닌 기존 경로는 거부합니다.
+
+플랫폼
+- Windows: gdigrab으로 화면, dshow로 카메라와 오디오 장치를 엽니다.
+  화면은 desktop이 기본이며 --video-device "title=창이름"도 받습니다.
+  카메라와 오디오는 devices에 나온 정확한 DirectShow 이름을 지정해야 합니다.
+  ':'를 포함한 장치 이름 대신 목록의 대체 이름을 사용해야 합니다.
+- Linux: 화면은 X11 DISPLAY 또는 --video-device :0.0, 카메라는 /dev/videoN,
+  음성은 명시한 PulseAudio 소스 이름을 사용합니다.
+  장치 조회는 /dev/videoN 이름과 FFmpeg의 Pulse 소스 목록을 반환합니다.
+  Wayland 포털 녹화는 구현 범위에 포함되지 않습니다.
+- macOS: avfoundation을 사용합니다. 화면도 Capture screen 이름이나 번호를 명시해야 합니다.
+  카메라/마이크 이름 또는 목록의 번호를 사용할 수 있습니다.
+  화면 영역은 전체 화면 입력을 받은 후 자릅니다. X,Y는 0 이상이어야 합니다.
+
+종료와 오류
+- SIGINT, SIGTERM 또는 호출자의 AbortSignal은 이 함수가 시작한 FFmpeg 프로세스만 중지합니다.
+- 먼저 FFmpeg에 q를 전달해 파일 마무리를 요청하며, 응답이 없으면 해당 자식만 단계적으로 종료합니다.
+- 다른 녹화 프로그램이나 시스템 프로세스를 찾거나 종료하지 않습니다.
+- 지정 시간에 30초를 더한 감시 제한을 두어 장치 초기화나 종료가 멈출 때도 프로세스를 회수합니다.
+- 취소 결과는 cancelled: true와 생성된 파일 크기를 반환합니다.
+- 실패나 강제 종료 때 생긴 부분 파일은 사용자가 확인할 수 있도록 유지합니다.
+- FFmpeg 진단 문자열은 최대 약 64K 문자씩 보관합니다.
+
+검증한 내용
+- node --check cli/record.mjs 통과
+- node --test cli/record.test.mjs: 10개 통과
+- Windows, Linux, macOS 인수 생성, 장치 명시, 시간/영역/프레임 검증을 검사했습니다.
+- 실제 프로세스를 띄우지 않는 dry-run, 기존 파일 보존, 이미 취소된 요청 처리를 검사했습니다.
+- 제공된 Windows FFmpeg의 -devices와 -h demuxer=gdigrab/dshow를 조회했습니다.
+  이 빌드에는 gdigrab, dshow 입력과 사용한 프레임/영역 옵션이 포함되어 있습니다.
+- 실제 화면, 카메라, 마이크를 열거나 녹화하는 테스트는 실행하지 않았습니다.
+
+하드웨어 미검증 범위
+- 실제 장치 열기, 녹화 품질, 음영상 동기화, 장시간 안정성은 장치에서 검증하지 않았습니다.
+- 장치가 지원하는 프레임 속도와 OS의 화면/카메라/마이크 권한이 필요합니다.
+- Windows 시스템 소리를 녹음하려면 DirectShow로 노출되는 Stereo Mix나 루프백 입력 장치가 필요합니다.
+- Linux/macOS 실행 경로는 인수 생성만 검사했으며 해당 플랫폼의 하드웨어에서는 실행하지 않았습니다.
+- Linux와 macOS에서는 사용하는 FFmpeg 빌드에 해당 입력 장치와 출력 코덱이 포함되어 있어야 합니다.
+- GUI의 카메라 버블, 자동 확대, 그리기, 클릭 강조, 일시 정지 기능은 기존 GUI 녹화기에 유지됩니다.
+  이 독립 모듈은 원본 화면/카메라/음성의 유한 시간 파일 녹화를 제공합니다.
+
+입력 장치 형식 근거: FFmpeg 공식 장치 문서
+https://ffmpeg.org/ffmpeg-devices.html

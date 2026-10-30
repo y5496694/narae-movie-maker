@@ -1,0 +1,35 @@
+{
+  "ffmpegBin": {
+    "darwin-arm64": {
+      "ffmpeg": {
+        "url": "https://cdn.nugget.cartesiancs.com/darwin-arm64/ffmpeg",
+        "filename": "ffmpeg"
+      },
+      "ffprobe": {
+        "url": "https://cdn.nugget.cartesiancs.com/darwin-arm64/ffprobe",
+        "filename": "ffprobe"
+      }
+    },
+    "darwin-x64": {
+      "ffmpeg": {
+        "url": "https://cdn.nugget.cartesiancs.com/ffmpeg",
+        "filename": "ffmpeg"
+      },
+      "ffprobe": {
+        "url": "https://cdn.nugget.cartesiancs.com/ffprobe",
+        "filename": "ffprobe"
+      }
+    },
+    "win32-x64": {
+      "ffmpeg": {
+        "url": "https://cdn.nugget.cartesiancs.com/ffmpeg.exe",
+        "filename": "ffmpeg.exe"
+      },
+      "ffprobe": {
+        "url": "https://cdn.nugget.cartesiancs.com/ffprobe.exe",
+        "filename": "ffprobe.exe"
+      }
+    }
+  },
+  "cloudApiUrl": "https://cloud.cartcut.cartesiancs.com"
+}

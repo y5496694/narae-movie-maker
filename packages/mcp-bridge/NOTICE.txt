@@ -1,0 +1,10 @@
+Narae Movie Maker desktop MCP bridge / 나래 무비메이커 데스크톱 MCP 브리지
+
+Derived from the CartCut MCP bridge in CartCut v0.6.1.
+Original source: https://github.com/cartesiancs/cartcut/tree/main/packages/mcp-bridge
+Copyright (c) 2025 cartesiancs
+The original MIT license is preserved in LICENSE.
+
+This is a local, private derivative package. It is not published to npm or
+the MCP Registry and does not claim the original project's registry identity.
+The bridge's stdio relay, session recovery and call delivery rules are retained.

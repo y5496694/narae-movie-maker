@@ -1,0 +1,367 @@
+import axios from "axios";
+import { getLocationEnv } from "./getLocationEnv";
+import { sampleDemoFileList } from "../data/sampleDemoFiles";
+
+export function enableIpcWrapper() {
+  if (getLocationEnv() == "electron") return false;
+
+  window.electronAPI = {
+    req: {
+      app: {
+        forceClose: async function (lang) {
+          return "none";
+        },
+        restart: async function (lang) {
+          return "none";
+        },
+        getResourcesPath: async function (lang) {
+          return "none";
+        },
+        getTempPath: async function (lang) {
+          const request = await axios.get(`/api/path/temp`);
+          return request.data;
+        },
+        getAppInfo: async function (lang) {
+          if (getLocationEnv() == "demo") {
+            return {
+              data: {
+                version: "Demo",
+              },
+            };
+          }
+
+          return {
+            data: {
+              version: "SelfHosted",
+            },
+          };
+        },
+      },
+      dialog: {
+        openDirectory: async function (lang) {
+          return "/";
+        },
+        openFile: async function (lang) {
+          return "none";
+        },
+        openFiles: async function (lang) {
+          return [];
+        },
+        exportVideo: async function (lang) {
+          return "none";
+        },
+        saveSubtitles: async function () {
+          return "none";
+        },
+      },
+      store: {
+        set: async function (lang) {
+          return "none";
+        },
+        get: async function (lang) {
+          return "none";
+        },
+        delete: async function (lang) {
+          return "none";
+        },
+      },
+      font: {
+        getLists: async function (lang) {
+          return {
+            fonts: [],
+          };
+        },
+        getLocalFontLists: async function (lang) {
+          return "none";
+        },
+        getPresetFontLists: async function () {
+          return { status: 0, fonts: [] };
+        },
+      },
+      project: {
+        save: async function (lang) {
+          return "none";
+        },
+      },
+      desktopCapturer: {
+        getSources: async function (lang) {
+          return "none";
+        },
+      },
+      // The recorder is a desktop feature: it needs `desktopCapturer`, a tray,
+      // and a second BrowserWindow, none of which the web build has. Only
+      // `show` is ever reached from shared code — the rest is called by the
+      // recorder's own renderer, which does not exist here at all — but the
+      // surface is mirrored whole so a missing method is a `"none"` rather
+      // than a `TypeError` in whoever added the next call site.
+      overlayRecord: {
+        show: async function () {
+          return { status: 0, error: "Recording is only available in the desktop app." };
+        },
+        close: async function () {
+          return "none";
+        },
+        sources: async function () {
+          return "none";
+        },
+        platform: async function () {
+          return "none";
+        },
+        permissions: async function () {
+          return "none";
+        },
+        requestPermission: async function (kind) {
+          return "none";
+        },
+        setTray: async function (model) {
+          return "none";
+        },
+        setOverlay: async function (state) {
+          return "none";
+        },
+        armDisplayMedia: async function (sourceId, audio) {
+          return "none";
+        },
+        disarmDisplayMedia: async function () {
+          return "none";
+        },
+        start: async function (request) {
+          return "none";
+        },
+        append: async function (sessionId, key, chunk) {
+          return "none";
+        },
+        finishFile: async function (sessionId, key) {
+          return "none";
+        },
+        pause: async function (sessionId) {
+          return "none";
+        },
+        resume: async function (sessionId) {
+          return "none";
+        },
+        stroke: async function (message) {
+          return "none";
+        },
+        setDrawing: async function (value) {
+          return "none";
+        },
+        click: async function (sessionId, click) {
+          return "none";
+        },
+        stop: async function (sessionId) {
+          return "none";
+        },
+        deliver: async function (sessionId, request) {
+          return "none";
+        },
+        cancel: async function () {
+          return "none";
+        },
+        openFolder: async function () {
+          return "none";
+        },
+      },
+      filesystem: {
+        getDirectory: async function (dir) {
+          if (getLocationEnv() == "demo") {
+            return sampleDemoFileList;
+          }
+
+          const request = await axios.get(`/api/directory?dir=${dir}`);
+          return request.data;
+        },
+        openDirectory: async function (lang) {
+          return "none";
+        },
+        // There is no OS file manager behind a browser tab; the completion
+        // dialog's button simply does nothing rather than throwing.
+        showItemInFolder: async function (path) {
+          return "none";
+        },
+        mkdir: async function (lang) {
+          return "none";
+        },
+        emptyDirSync: async function (lang) {
+          return "none";
+        },
+        removeDirectory: async function (lang) {
+          return "none";
+        },
+
+        writeFile: async function (lang) {
+          return "none";
+        },
+        readFile: async function (lang) {
+          return "none";
+        },
+        existFile: async function (lang) {
+          return "none";
+        },
+        removeFile: async function (lang) {
+          return "none";
+        },
+        saveGeneratedAsset: async function () {
+          return { status: false, error: "not available in the web build" };
+        },
+      },
+      ai: {
+        getKey: async function (lang) {
+          return "";
+        },
+        setKey: async function (lang) {
+          return "";
+        },
+      },
+
+      ffmpeg: {
+        getMetadata: async function (bloburl, mediapath) {
+          const request = await axios.get(
+            `/api/file/metadata?path=${mediapath}`,
+          );
+          return request.data;
+        },
+        combineFrame: async function (lang) {
+          return "none";
+        },
+        extractAudioFromVideo: async function (lang) {
+          return "none";
+        },
+        installFFmpeg: async function (lang) {
+          return "none";
+        },
+      },
+      render: {
+        outputVideo: async function (lang) {
+          return "none";
+        },
+        v2: {
+          sendFrame: async function (lang) {
+            return "none";
+          },
+          finishStream: async function (lang) {
+            return "none";
+          },
+          start: async function (lang) {
+            return "none";
+          },
+        },
+      },
+      url: {
+        openUrl: async function (lang) {
+          return "none";
+        },
+      },
+      stream: {
+        saveBufferToVideo: async function (lang) {
+          return "none";
+        },
+
+        saveBufferToAudio: async function (lang) {
+          return "none";
+        },
+
+        saveBufferToTempFile: async function (lang) {
+          return "none";
+        },
+      },
+      extension: {
+        openDir: async function (lang) {
+          return "none";
+        },
+        openFile: async function (lang) {
+          return "none";
+        },
+      },
+      media: {
+        backgroundRemove: async function (lang) {
+          return "none";
+        },
+      },
+    },
+    res: {
+      app: {
+        forceClose: async function (lang) {
+          return "none";
+        },
+        getAppPath: async function (lang) {
+          return "none";
+        },
+      },
+      auth: {
+        loginSuccess: async function (lang) {
+          return "none";
+        },
+      },
+      filesystem: {
+        getAllDirectory: async function (lang) {
+          return "none";
+        },
+      },
+      render: {
+        progressing: async function (lang) {
+          return "none";
+        },
+        finish: async function (lang) {
+          return "none";
+        },
+        error: async function (lang) {
+          return "none";
+        },
+        finishCombineFrame: async function (lang) {
+          return "none";
+        },
+        // `event.ts` subscribes to both at module top level. Missing, they threw
+        // there, and every line of `index.ts` after `import "./event"` was
+        // skipped in the web and demo builds, `toast-box` registration included.
+        v2Error: async function (callback) {
+          return "none";
+        },
+        v2Cancelled: async function (callback) {
+          return "none";
+        },
+      },
+      overlayRecord: {
+        complete: async function (callback) {
+          return "none";
+        },
+        tray: async function (callback) {
+          return "none";
+        },
+        overlay: async function (callback) {
+          return "none";
+        },
+        stroke: async function (callback) {
+          return "none";
+        },
+        setDrawing: async function (callback) {
+          return "none";
+        },
+      },
+      ffmpeg: {
+        // Mirrors preload: `getMetadata` is request/response only, under `req`.
+        extractAudioFromVideoProgress: async function (lang) {
+          return "none";
+        },
+        extractAudioFromVideoFinish: async function (lang) {
+          return "none";
+        },
+      },
+      // There is no application menu outside Electron, so this never fires.
+      // It exists so `event.ts` can subscribe unconditionally.
+      menu: {
+        command: async function (lang) {
+          return "none";
+        },
+      },
+      timeline: {
+        get: async function (lang) {
+          return "none";
+        },
+        add: async function (lang) {
+          return "none";
+        },
+      },
+    },
+  };
+}

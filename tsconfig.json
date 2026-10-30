@@ -1,0 +1,51 @@
+{
+  "compilerOptions": {
+    "target": "ES2015",
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "outDir": "./main",
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    // Dependencies ship .d.ts files written against their own lib/module
+    // settings, not ours: @napi-rs/canvas wants Float16Array, @vitest/utils
+    // wants WeakKey (both post-ES2015 lib), vite re-exports "rollup/parseAst"
+    // which only resolves under bundler resolution, and @types/glob expects an
+    // older minimatch. None of that is fixable from here, and type-checking
+    // other people's declarations tells us nothing about this codebase — which
+    // is why `tsc --init` turns this on by default.
+    "skipLibCheck": true,
+    "sourceMap": true,
+    "allowJs": true,
+    "strict": true,
+    "noUnusedLocals": false,
+    "emitDecoratorMetadata": true,
+    "experimentalDecorators": true,
+    "removeComments": false,
+    "noImplicitAny": false
+  },
+  "exclude": [
+    "./node_modules",
+    "packages",
+    "main",
+    // The recorder, for the same reason `packages` is excluded above it and
+    // `tests` is below: with no `include`, this config takes in every .ts file
+    // under the repo root. `apps/overlay-record` is a standalone Vite app with
+    // its own tsconfig, its own `@app/*` path mapping and its own lockfile, so
+    // pulled in here its imports resolve to nothing and `webpack` fails on
+    // errors in code the editor bundle does not contain.
+    "apps/overlay-record",
+    // The E2E suite. With no `include`, this config takes in every .ts file
+    // under the repo root, so without this the Playwright harness lands in the
+    // app's own program and its type errors fail `webpack` — a test breaking
+    // the build it is supposed to be checking. `**/*.spec.ts` already covered
+    // the specs; `tests/e2e/harness` and `tests/e2e/scenario` are not specs.
+    // The suite is type-checked on its own, against Playwright's config.
+    "tests",
+    // The scripts that rebuild an example template from its measurements. They
+    // run under jiti as ES modules with top-level await, which this program's
+    // `module: commonjs` refuses, and nothing in the bundle imports them.
+    "examples/templates-source",
+    "**/*.test.ts",
+    "**/*.spec.ts"
+  ]
+}

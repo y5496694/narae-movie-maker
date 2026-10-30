@@ -1,0 +1,169 @@
+{
+  "ok": true,
+  "generatedAt": "2026-10-30T10:42:42.536Z",
+  "results": [
+    {
+      "name": "inventory",
+      "exit": 0,
+      "ok": true,
+      "steps": 9,
+      "verificationExit": 0
+    },
+    {
+      "name": "visual",
+      "exit": 0,
+      "ok": true,
+      "steps": 25,
+      "verificationExit": 0
+    },
+    {
+      "name": "editing",
+      "exit": 0,
+      "ok": true,
+      "steps": 24,
+      "verificationExit": 0
+    },
+    {
+      "name": "graphics",
+      "exit": 0,
+      "ok": true,
+      "steps": 6,
+      "verificationExit": 0
+    },
+    {
+      "name": "parity",
+      "exit": 0,
+      "ok": true,
+      "steps": 27,
+      "verificationExit": 0
+    },
+    {
+      "name": "reopen",
+      "exit": 0,
+      "ok": true,
+      "steps": 2,
+      "verificationExit": 0
+    }
+  ],
+  "steps": 93,
+  "uniqueTools": 64,
+  "tools": [
+    "add_effect",
+    "add_graphic",
+    "add_keyframes",
+    "add_media",
+    "add_shape",
+    "add_subtitles",
+    "add_template",
+    "add_text",
+    "add_transition",
+    "apply_animation_preset",
+    "apply_typewriter",
+    "check_program",
+    "close_timeline",
+    "delete_clips",
+    "detach_audio",
+    "duplicate_clips",
+    "expand_template",
+    "export_subtitles",
+    "export_template",
+    "generate_proxies",
+    "get_clip",
+    "get_contact_sheet",
+    "get_keyframes",
+    "get_program",
+    "get_project_overview",
+    "get_proxy_status",
+    "get_template_detail",
+    "group_clips",
+    "import_subtitles",
+    "install_template",
+    "list_clips",
+    "list_compositions",
+    "list_effect_presets",
+    "list_fonts",
+    "list_graphic_presets",
+    "list_luts",
+    "list_templates",
+    "list_transition_presets",
+    "mark_template_slots",
+    "merge_clips",
+    "narae_capabilities",
+    "redo",
+    "remove_ranges",
+    "reverse_clips",
+    "rotate_clips",
+    "set_clip_speed",
+    "set_color_adjustments",
+    "set_crop",
+    "set_lut",
+    "set_mask",
+    "set_mirror",
+    "set_proxy_mode",
+    "set_speed_curve",
+    "set_template_fill",
+    "set_text_font",
+    "set_text_range_style",
+    "set_video_filters",
+    "split_clip",
+    "switch_timeline",
+    "trim_clip",
+    "undo",
+    "ungroup",
+    "unreverse_clips",
+    "update_clip"
+  ],
+  "visualAudioRms": 0.1249489677546824,
+  "fullVideoDecodeVerified": true,
+  "htmlContactSheetWarning": null,
+  "formats": {
+    "ok": true,
+    "generatedAt": "2026-10-30T10:42:59.697Z",
+    "formats": [
+      {
+        "extension": "mov",
+        "codec": "prores",
+        "bytes": 1321541,
+        "duration": 1,
+        "rms": 0.12500991099671083,
+        "engine": {
+          "name": "나래 무비메이커 엔진",
+          "version": "1.0.0",
+          "headless": true,
+          "guiInstalledRequired": false,
+          "mcpHttpRequired": false
+        },
+        "decoded": true
+      },
+      {
+        "extension": "webm",
+        "codec": "vp9",
+        "bytes": 89981,
+        "duration": 1.008,
+        "rms": 0.12497905840306875,
+        "engine": {
+          "name": "나래 무비메이커 엔진",
+          "version": "1.0.0",
+          "headless": true,
+          "guiInstalledRequired": false,
+          "mcpHttpRequired": false
+        },
+        "decoded": true
+      },
+      {
+        "extension": "gif",
+        "codec": "gif",
+        "bytes": 105421,
+        "duration": 0.99,
+        "engine": {
+          "name": "나래 무비메이커 엔진",
+          "version": "1.0.0",
+          "headless": true,
+          "guiInstalledRequired": false,
+          "mcpHttpRequired": false
+        },
+        "decoded": true
+      }
+    ]
+  }
+}

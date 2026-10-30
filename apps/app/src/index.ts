@@ -1,0 +1,292 @@
+import mime from "./functions/mime";
+import project from "./functions/project";
+import fonts from "./functions/fonts";
+import { loadedAssetStore } from "./features/asset/loadedAssetStore";
+import { enableIpcWrapper } from "./functions/ipcWrapper";
+import { watchOverlayRecordings } from "./features/record/saveRecording";
+import {
+  count as perfCount,
+  installFrameStats,
+} from "./features/debug/frameStats";
+import { useTimelineStore } from "./states/timelineStore";
+import { installProxyBridge } from "./features/proxy/proxyBridge";
+import { installAutosave } from "./features/project/autosaveBridge";
+import { installTimelineSwitchEffects } from "./features/composition/installSwitchEffects";
+import { initProjectBaseline } from "./features/project/projectDirty";
+import { installHoverMotion } from "./features/motion/hoverSpring";
+import { installBrowseMotion } from "./features/motion/browseMotion";
+import {
+  SCROLLBAR_ALPHA,
+  installScrollActivity,
+} from "./features/ui/scrollActivity";
+import { installScrollerWatch } from "./features/ui/scrollerWatch";
+import { getLocationEnv } from "./functions/getLocationEnv";
+import { installNativeContextMenuGuard } from "./features/editor/nativeContextMenu";
+import { installMobile } from "./features/mobile/install";
+import {
+  browserLocalFontPort,
+  restoreLocalFonts,
+} from "./features/font/localFonts";
+import { installFontUrlResolver } from "./features/font/fontFaces";
+import { installGraphicAssetUrlResolver } from "./features/graphic/fileUrl";
+import { mediaUrlFor } from "./functions/mediaUrl";
+
+enableIpcWrapper();
+
+// The browser builds only: the fonts installed on this computer, listed without
+// asking when the browser already holds the permission. The desktop app lists
+// them from main.
+if (getLocationEnv() !== "electron") {
+  void restoreLocalFonts(browserLocalFontPort());
+  // A face, or a graphic's own picture, that a template or project names by
+  // path loads from where the site serves its media, not from a `file://` the
+  // page cannot read.
+  installFontUrlResolver((path) => mediaUrlFor(path, getLocationEnv()));
+  installGraphicAssetUrlResolver((path) => mediaUrlFor(path, getLocationEnv()));
+}
+
+// The browser builds only. Electron already shows no native right-click menu.
+installNativeContextMenuGuard(getLocationEnv(), window);
+
+// The browser builds only: finger input for the mouse-driven surfaces, and on
+// a phone the phone layout. Before `App` first renders, which is a microtask
+// after this module finishes evaluating, so the layout class is already on
+// `<html>` when the template that depends on it is chosen.
+installMobile();
+
+// A recording made in the recorder's own windows arrives here as a path, once,
+// when it is finished. Subscribed before anything else mounts so a take that
+// completes while the editor is still painting is not missed.
+watchOverlayRecordings();
+
+import "./App";
+
+import "./features/preview/previewCanvas";
+
+import "./features/asset/assetList";
+import "./features/asset/assetBrowser";
+import "./features/asset/assetUploader";
+
+import "./features/element/elementTimelineLeftOption";
+
+import "./features/element/elementTimeline";
+import "./features/element/elementTimelineCanvas";
+
+import "./features/element/elementTimelineRuler";
+import "./features/element/elementTimelineCursor";
+import "./features/element/elementControlAsset";
+import "./features/element/elementTimelineRange";
+
+import "./features/keyframe/keyframeEditor";
+import "./features/proxy/proxyPanel";
+import "./features/menu/menuDropdown";
+import "./features/onboarding/onboardingOverlay";
+import "./features/tutorial/tutorialCoachmark";
+import "./features/update/updatePrompt";
+import "./features/subtitle/importDialog";
+import "./features/mediaInfo/mediaInfoDialog";
+import "./features/settings/settingsDialog";
+import "./features/settings/settingsButton";
+import "./features/note/noteCard";
+import "./features/record/processDialog";
+
+
+import "./features/option/optionGroup";
+import "./features/option/optionText";
+import "./features/option/optionImage";
+import "./features/option/optionVideo";
+import "./features/option/optionAudio";
+import "./features/option/optionShape";
+import "./features/option/optionGroupElement";
+import "./features/option/optionTemplate";
+import "./features/option/optionEffect";
+import "./features/option/optionTransition";
+import "./features/option/optionGraphic";
+
+import "./features/input/inputText";
+// The title bar's export trigger. The settings it exports with live in
+// `ui/control/ControlSetting.ts`; this is the button and the progress popover.
+import "./features/export/exportButton";
+// The bottom-left tray of long-running work, e.g. reversing a clip.
+import "./features/task/backgroundTasks";
+
+import { Toast } from "./features/toast/toast";
+import { ToastBox } from "./features/toast/toastBox";
+import "./context/timelineContext";
+
+import "./sass/style.scss";
+
+import "./ui/timeline/Timeline";
+import "./ui/control/Control";
+import "./ui/modal/Modal";
+import "./ui/offcanvas/TimelineOptions";
+
+import "./features/element/elementControl";
+import "./features/font/selectFont";
+
+import "./event";
+
+// Imported for effect: this is what connects the editor to Claude Code. It
+// must come after the components it drives, since a command may reach for
+// `<element-control>` the moment the first tool call arrives.
+import "./features/agent/bridge";
+
+// The same arrangement for extensions, and after the agent bridge for the same
+// reason plus one more: an extension's first call may run an agent command, so
+// the table those commands register into has to exist first.
+import "./features/extension/bridge";
+
+// `__cartcutPerf.on()` in the console starts it; nothing runs until it does.
+// Installed after the components, so the counters it exposes are the ones those
+// components already registered against.
+installFrameStats();
+
+// The spring every sidebar tile's highlight opens on, as custom properties on
+// the document root. Sampled once here rather than per grid: the tiles are
+// spread across nine components and `_asset.scss` reads the same five names
+// for all of them.
+installHoverMotion(document.documentElement.style);
+
+// The asset browser's search field opens and closes on these, with the same
+// numbers `<asset-browser>` times the rest of the cloud switch by.
+installBrowseMotion(document.documentElement.style);
+
+// Vertical scrollbars fade in while their list is moving, or has just grown,
+// and out once it settles. Both watch the whole document, so a list added later
+// needs nothing. Every target handed to the reader is a real `Element`.
+installScrollerWatch(
+  installScrollActivity(document, (target) =>
+    parseFloat(
+      getComputedStyle(target as unknown as Element).getPropertyValue(
+        SCROLLBAR_ALPHA,
+      ),
+    ),
+  ),
+);
+
+// Reads the proxy index off disk and keeps it current. Nothing is generated
+// here — this only learns what already exists, so a session with no proxies
+// costs one IPC round trip.
+installProxyBridge();
+
+// Auto Save. Writes a recovery copy of the project into `userData/autosave`
+// after five seconds of quiet, and at least once a minute while editing
+// continues; a successful ⌘S drops that project's ring. Nothing reads a
+// recovery point without the user asking — File → Auto Save is the only way
+// back in. A no-op in the web build, which has no bridge.
+// Before `installAutosave`, and unconditionally — the web build has no
+// autosave but still has a quit guard. This records the empty project the app
+// starts with, so an untouched session quits quietly and an edited one does
+// not. See `projectDirty.ts` for what happens without it.
+initProjectBaseline();
+installAutosave();
+// What follows a change of the timeline being edited, from whatever caused it.
+installTimelineSwitchEffects();
+
+// One more subscriber, to count the subscribers.
+//
+// Every `useTimelineStore` listener is unfiltered — they all run on every write
+// of any field — so one of them counting is a faithful measure of how often the
+// whole set is woken. During playback this should equal the project's frame
+// rate. Anything higher is a write that changed nothing, and the difference
+// between this and `store.setCursor:changed` says so directly.
+useTimelineStore.subscribe(() => perfCount("store.notify"));
+
+customElements.define("toast-item", Toast);
+customElements.define("toast-box", ToastBox);
+
+/**
+ * `loadedAssetStore` is exported for diagnostics.
+ *
+ * The media layer — which `<video>` is where, muted, playing — is the one part
+ * of the editor that node tests cannot observe, and it is where the playback
+ * bugs lived. Being able to ask the running app "is anything audible outside
+ * its own clip?" is what turns those into a checkable question rather than a
+ * listening exercise. The filmstrip's `cachedTiles`/`failedPaths` counters
+ * earned their keep the same way.
+ */
+export { mime, project, fonts, loadedAssetStore };
+
+/**
+ * The compositor and the stores it reads, exported for the same reason.
+ *
+ * `tests/e2e` drives the real app and then has to answer one question node
+ * tests cannot: *does the frame in the exported file match the frame the app
+ * would show?* Answering it means re-running the export's own per-frame work —
+ * `seek`, then `renderTimelineAtTime` with `exportElementRenderers` and an
+ * export FX runtime — at project resolution, and diffing that against the
+ * decoded video. Screenshotting the visible preview canvas cannot stand in for
+ * it: that canvas is device-sized, carries the viewport's pan and zoom, and has
+ * a dimmed pass and selection chrome composited over it.
+ *
+ * Every name below is a re-export of a module the app already loads. There is
+ * no test-only code path here, nothing branches on whether a test is attached,
+ * and removing these lines would change no behaviour — which is the property
+ * that makes exposing them acceptable at all.
+ */
+export { useTimelineStore } from "./states/timelineStore";
+export { renderOptionStore } from "./states/renderOptionStore";
+export { selectionStore } from "./states/selectionStore";
+export { previewViewportStore } from "./states/previewViewportStore";
+export { windowStore } from "./features/window/windowStore";
+// Whether the timeline is somebody else's, and the command surface that has to
+// refuse while it is. `tests/e2e/specs/caption-session.spec.ts` drives the
+// shipping refusal through these rather than reimplementing a gesture, which
+// would prove only that the spec can decline.
+export { timelineLockStore } from "./states/timelineLockStore";
+// How tall each timeline row is. View state kept outside the document, so a
+// spec that resizes a row by its header's edge reads the result here rather
+// than in anything `getDocument()` returns.
+export { trackHeightStore } from "./states/trackHeightStore";
+export * as editorActions from "./features/editor/actions";
+export { proxyStore } from "./states/proxyStore";
+// How far along an export is, and whether one is running at all. `harness/
+// export.ts` reads this instead of scraping a progress dialog that no longer
+// exists.
+export { exportStore } from "./states/exportStore";
+export { renderTimelineAtTime } from "./features/renderer/timeline";
+export { exportElementRenderers } from "./features/export/renderers";
+export {
+  createExportFxRuntime,
+  previewFxRuntime,
+} from "./features/renderer/fx/createRuntime";
+export { frameCount, frameTimeMs } from "./features/export/frames";
+// Authoring a speed ramp, for `specs/speed-ramp.spec.ts`. The graph in the
+// option panel is a canvas, so a spec that drove it would be proving Playwright
+// can hit a pixel rather than that the ramp reaches the delivered file; this is
+// the same op the graph itself calls.
+export { setClipSpeedCurve } from "./features/timeline/speedOps";
+// Re-reading the preset folders, for the one thing a spec cannot otherwise
+// reach: whether a LUT a *user* dropped into `userData/presets` is picked up by
+// the real scanner, validated by the real validator and graded by the real
+// renderer. Everything else about importing — the file dialog, the copy, the
+// generated manifest — is main-process work with its own suite; this is the
+// half that has to be proved end to end.
+export { loadPresets, presetsOfKind } from "./features/fx/presetRegistry";
+export { preloadLutsForDocument } from "./features/lut/lutRegistry";
+// Subtitle import and export, minus their two native dialogs. Same argument as
+// the LUT pair above: the dialogs are main-process work with their own filters,
+// and this is the half that has to be proved end to end — that a real file's
+// cues reach real text clips, and that those clips come back as the same file.
+// `runImportSubtitlePaths` is the function a dropped `.srt` already calls, and
+// `collectSubtitleText` is what the save dialog would have written.
+export { runImportSubtitlePaths } from "./features/subtitle/subtitleCommands";
+export { collectSubtitleText } from "./features/subtitle/exportSubtitleFile";
+// A template's own timeline, for `specs/template-timeline.spec.ts`. Placing a
+// template and expanding it are the functions the library tile and the clip's
+// context menu call; the tabs are clicked for real. `projectSnapshot` is what
+// a save writes, read back without unzipping it.
+export {
+  installTemplateFromPath,
+} from "./features/template/templateInstall";
+export {
+  installedTemplates,
+  refreshTemplateLibrary,
+} from "./features/template/templateRegistry";
+export { addTemplateToTimeline } from "./features/template/addTemplate";
+export { expandTemplate } from "./features/composition/expandTemplate";
+export { requestTimelineSwitch } from "./features/composition/navigation";
+export { projectSnapshot } from "./features/composition/projectSnapshot";
+// The browser build's list of the fonts on this computer, so a check in real
+// Chrome can wait for it to arrive instead of polling the font menu.
+export { localFontStore } from "./features/font/localFonts";

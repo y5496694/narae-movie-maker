@@ -1,0 +1,58 @@
+const CARTCUT_WEBSITE = "https://nugget.studio";
+let APP_;
+
+let toastElList = [].slice.call(document.querySelectorAll(".toast"));
+let toastList = toastElList.map(function (toastEl) {
+  return new bootstrap.Toast(toastEl);
+});
+
+const elementControlComponent = document.querySelector("element-control");
+let preview = document.getElementById("preview");
+let control = document.getElementById("control-inner");
+let video = document.getElementById("video");
+// let exportVideoModal = new bootstrap.Modal(
+//   document.getElementById("exportVideoModal"),
+//   {
+//     keyboard: false,
+//   }
+// );
+
+class ModalClass {
+  id: any;
+  action: any;
+  constructor(id) {
+    try {
+      this.id = id;
+      this.action = new bootstrap.Modal(document.getElementById(id), {
+        keyboard: false,
+      });
+    } catch (error) {}
+  }
+
+  show() {
+    try {
+      this.action.show();
+    } catch (error) {
+      this.action = new bootstrap.Modal(document.getElementById(this.id), {
+        keyboard: false,
+      });
+      this.action.show();
+    }
+  }
+
+  hide() {
+    this.action.hide();
+  }
+}
+
+export const rendererModal = {
+  // No `progressModal` any more. The render dialog it named is gone: progress
+  // is the title bar's ring and its popover, which is what lets the user keep
+  // editing — the modal's backdrop was the only thing stopping them.
+  progressFinish: new ModalClass("progressFinish"),
+  progressError: new ModalClass("progressError"),
+  whenClose: new ModalClass("whenClose"),
+  whenTimelineChanged: new ModalClass("whenTimelineChanged"),
+  // Help → Keyboard Shortcuts, and the keyboard button in the settings panel.
+  shortKey: new ModalClass("shortKey"),
+};

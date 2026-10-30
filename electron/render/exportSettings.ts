@@ -1,0 +1,587 @@
+/**
+ * Export settings, as the main process sees them, plus the mapping from those
+ * settings onto FFmpeg flags.
+ *
+ * The vocabulary below is a **deliberate copy** of
+ * `apps/app/src/features/export/settings.ts`. Importing that file would pull the
+ * renderer tree into the Electron `tsc` build: `.tsconfig/tsconfig.json` pins
+ * `rootDir: ../electron`, so a single cross-boundary import widens it, the whole
+ * build relocates from `main/` to `main/electron/`, and `package.json`'s
+ * `"main": "main/main.js"` stops resolving. This is the same reason
+ * `ffmpegArgs.ts` restates the geometry formulas rather than importing them.
+ *
+ * `exportSettings.test.ts` imports **both** sides and asserts the tables are
+ * identical, so the pair cannot drift apart silently. Test files are excluded
+ * from the Electron tsc pass, so they may reach across freely.
+ */
+
+export const CONTAINERS = ["mp4", "mov", "webm", "gif"] as const;
+export type Container = (typeof CONTAINERS)[number];
+
+export const VIDEO_CODECS = ["h264", "h265", "vp9", "prores", "gif"] as const;
+export type VideoCodec = (typeof VIDEO_CODECS)[number];
+
+export const AUDIO_CODECS = ["aac", "mp3", "opus", "vorbis", "pcm_s16le"] as const;
+export type AudioCodec = (typeof AUDIO_CODECS)[number];
+
+export const ENCODE_PRESETS = [
+  "ultrafast",
+  "superfast",
+  "veryfast",
+  "faster",
+  "fast",
+  "medium",
+  "slow",
+  "slower",
+  "veryslow",
+] as const;
+export type EncodePreset = (typeof ENCODE_PRESETS)[number];
+
+export type QualityMode = "crf" | "bitrate";
+
+export type ExportSettings = {
+  container: Container;
+  videoCodec: VideoCodec;
+  qualityMode: QualityMode;
+  crf: number;
+  preset: EncodePreset;
+  videoBitrate: number;
+  proresProfile: number;
+  audioCodec: AudioCodec;
+  audioBitrate: number;
+  sampleRate: number;
+  channels: 1 | 2;
+  hardwareAccel: boolean;
+  /** GIF only, and absent otherwise; see the renderer copy. */
+  gifFps?: number;
+  gifWidth?: number;
+};
+
+export const GIF_FPS = [10, 15, 20, 25, 30, 50] as const;
+export const GIF_DEFAULT_FPS = 15;
+export const GIF_WIDTHS = [320, 480, 640, 800, 1280, 0] as const;
+export const GIF_DEFAULT_WIDTH = 480;
+
+export const CODEC_CONTAINERS: Record<VideoCodec, readonly Container[]> = {
+  h264: ["mp4", "mov"],
+  h265: ["mp4", "mov"],
+  vp9: ["webm"],
+  prores: ["mov"],
+  gif: ["gif"],
+};
+
+export const CONTAINER_VIDEO_CODECS: Record<Container, readonly VideoCodec[]> = {
+  mp4: ["h264", "h265"],
+  mov: ["h264", "h265", "prores"],
+  webm: ["vp9"],
+  gif: ["gif"],
+};
+
+export const CONTAINER_AUDIO_CODECS: Record<Container, readonly AudioCodec[]> = {
+  mp4: ["aac", "mp3"],
+  mov: ["aac", "pcm_s16le"],
+  webm: ["opus", "vorbis"],
+  gif: [],
+};
+
+export const AUDIO_SAMPLE_RATES: Record<AudioCodec, readonly number[]> = {
+  aac: [44100, 48000],
+  mp3: [44100, 48000],
+  opus: [48000],
+  vorbis: [44100, 48000],
+  pcm_s16le: [44100, 48000],
+};
+
+export const CRF_RANGE: Record<
+  VideoCodec,
+  { min: number; max: number; default: number }
+> = {
+  h264: { min: 0, max: 51, default: 23 },
+  h265: { min: 0, max: 51, default: 28 },
+  vp9: { min: 0, max: 63, default: 31 },
+  prores: { min: 0, max: 0, default: 0 },
+  gif: { min: 0, max: 0, default: 0 },
+};
+
+export const CODEC_SUPPORTS_CRF: Record<VideoCodec, boolean> = {
+  h264: true,
+  h265: true,
+  vp9: true,
+  prores: false,
+  gif: false,
+};
+
+export const PRESET_NAMES = ["high", "medium", "low"] as const;
+export type PresetName = (typeof PRESET_NAMES)[number];
+
+export const EXPORT_PRESETS: Record<PresetName, ExportSettings> = {
+  high: {
+    container: "mp4",
+    videoCodec: "h264",
+    qualityMode: "crf",
+    crf: 18,
+    preset: "slow",
+    videoBitrate: 12000,
+    proresProfile: 3,
+    audioCodec: "aac",
+    audioBitrate: 320,
+    sampleRate: 48000,
+    channels: 2,
+    hardwareAccel: false,
+  },
+  medium: {
+    container: "mp4",
+    videoCodec: "h264",
+    qualityMode: "crf",
+    crf: 23,
+    preset: "medium",
+    videoBitrate: 5000,
+    proresProfile: 3,
+    audioCodec: "aac",
+    audioBitrate: 192,
+    sampleRate: 48000,
+    channels: 2,
+    hardwareAccel: false,
+  },
+  low: {
+    container: "mp4",
+    videoCodec: "h264",
+    qualityMode: "crf",
+    crf: 28,
+    preset: "veryfast",
+    videoBitrate: 2500,
+    proresProfile: 3,
+    audioCodec: "aac",
+    audioBitrate: 128,
+    sampleRate: 44100,
+    channels: 2,
+    hardwareAccel: false,
+  },
+};
+
+export const DEFAULT_EXPORT_SETTINGS: ExportSettings = EXPORT_PRESETS.medium;
+
+function pick<T>(value: unknown, allowed: readonly T[], fallback: T): T {
+  return allowed.includes(value as T) ? (value as T) : fallback;
+}
+
+function clampInt(
+  value: unknown,
+  min: number,
+  max: number,
+  fallback: number,
+): number {
+  const n = Math.round(Number(value));
+  return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
+}
+
+function positive(value: unknown, fallback: number): number {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? Math.round(n) : fallback;
+}
+
+/** See the renderer copy for the rationale behind the resolution order. */
+export function normalizeExportSettings(
+  input: Partial<ExportSettings> | undefined | null,
+  base: ExportSettings = DEFAULT_EXPORT_SETTINGS,
+): ExportSettings {
+  const raw = { ...base, ...(input ?? {}) };
+
+  const videoCodec = pick(raw.videoCodec, VIDEO_CODECS, base.videoCodec);
+
+  const allowedContainers = CODEC_CONTAINERS[videoCodec];
+  const container = allowedContainers.includes(raw.container as Container)
+    ? (raw.container as Container)
+    : allowedContainers[0];
+
+  const allowedAudio =
+    CONTAINER_AUDIO_CODECS[container].length > 0
+      ? CONTAINER_AUDIO_CODECS[container]
+      : AUDIO_CODECS;
+  const audioCodec = allowedAudio.includes(raw.audioCodec as AudioCodec)
+    ? (raw.audioCodec as AudioCodec)
+    : allowedAudio[0];
+
+  const allowedRates = AUDIO_SAMPLE_RATES[audioCodec];
+  const sampleRate = allowedRates.includes(Number(raw.sampleRate))
+    ? Number(raw.sampleRate)
+    : allowedRates[0];
+
+  const range = CRF_RANGE[videoCodec];
+
+  // See the renderer copy: kept, not pinned, for the codecs without one.
+  const rateControl = CODEC_SUPPORTS_CRF[videoCodec];
+  const qualityMode: QualityMode = raw.qualityMode === "crf" ? "crf" : "bitrate";
+
+  return {
+    container,
+    videoCodec,
+    qualityMode,
+    crf: rateControl
+      ? clampInt(raw.crf, range.min, range.max, range.default)
+      : clampInt(raw.crf, 0, 63, base.crf),
+    preset: pick(raw.preset, ENCODE_PRESETS, base.preset),
+    videoBitrate: positive(raw.videoBitrate, base.videoBitrate),
+    proresProfile: clampInt(raw.proresProfile, 0, 5, base.proresProfile),
+    audioCodec,
+    audioBitrate: positive(raw.audioBitrate, base.audioBitrate),
+    sampleRate,
+    channels: Number(raw.channels) === 1 ? 1 : 2,
+    // Strict `=== true`, so a project file written before this field existed
+    // normalizes to software encoding rather than to `undefined`, which would
+    // then reach the arg builder and read as falsy anyway — but only by luck.
+    hardwareAccel: raw.hardwareAccel === true,
+    ...(container === "gif"
+      ? {
+          gifFps: pick<number>(Number(raw.gifFps), GIF_FPS, GIF_DEFAULT_FPS),
+          gifWidth: pick<number>(Number(raw.gifWidth), GIF_WIDTHS, GIF_DEFAULT_WIDTH),
+        }
+      : {}),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// FFmpeg mapping — the part that has no counterpart on the renderer side.
+// ---------------------------------------------------------------------------
+
+export const VIDEO_ENCODERS: Record<VideoCodec, string> = {
+  h264: "libx264",
+  h265: "libx265",
+  vp9: "libvpx-vp9",
+  prores: "prores_ks",
+  gif: "gif",
+};
+
+/**
+ * The VideoToolbox encoder for each codec that has one, used when
+ * `settings.hardwareAccel` is set and the export is running on macOS.
+ *
+ * VP9 is deliberately absent — Apple's media engine does not encode it — and
+ * absence here is what `CODEC_SUPPORTS_HW_ACCEL` on the renderer side mirrors,
+ * asserted in `exportSettings.test.ts`.
+ */
+export const HW_ENCODERS: Partial<Record<VideoCodec, string>> = {
+  h264: "h264_videotoolbox",
+  h265: "hevc_videotoolbox",
+  prores: "prores_videotoolbox",
+};
+
+/** Where an export is running, and therefore which encoders it can reach. */
+export type EncodeTarget = {
+  platform: string;
+  arch: string;
+};
+
+export const HOST_TARGET: EncodeTarget = {
+  platform: process.platform,
+  arch: process.arch,
+};
+
+/**
+ * Whether this export actually takes the hardware path.
+ *
+ * Three conditions, and the platform one is not paranoia: `hardwareAccel` rides
+ * along inside a saved project, so a file authored on a Mac opens on Windows
+ * with the flag still set. Ignoring it there is what keeps that project
+ * exportable instead of failing on an encoder the build does not have.
+ */
+export function usesHardwareEncoder(
+  settings: ExportSettings,
+  target: EncodeTarget = HOST_TARGET,
+): boolean {
+  return (
+    settings.hardwareAccel === true &&
+    target.platform === "darwin" &&
+    HW_ENCODERS[settings.videoCodec] != null
+  );
+}
+
+/**
+ * A CRF value as VideoToolbox's `-q:v`.
+ *
+ * The two scales run in opposite directions — CRF is "smaller is better" over
+ * the codec's own range, `-q:v` is 1..100 where bigger is better — so this is a
+ * reversed linear map through the codec's declared range rather than a constant
+ * offset. It cannot be exact: the numbers mean different things to different
+ * encoders, and only the ordering carries over.
+ */
+export function videotoolboxQuality(settings: ExportSettings): number {
+  const range = CRF_RANGE[settings.videoCodec];
+  const span = range.max - range.min;
+  if (!(span > 0)) {
+    return 50;
+  }
+  const normalized = (settings.crf - range.min) / span;
+  return Math.min(100, Math.max(1, Math.round(100 - normalized * 99)));
+}
+
+export const AUDIO_ENCODERS: Record<AudioCodec, string> = {
+  aac: "aac",
+  mp3: "libmp3lame",
+  opus: "libopus",
+  vorbis: "libvorbis",
+  pcm_s16le: "pcm_s16le",
+};
+
+/** libvpx has no `-preset`; the same axis is `-cpu-used`, and it runs backwards. */
+export const VP9_CPU_USED: Record<EncodePreset, number> = {
+  ultrafast: 8,
+  superfast: 7,
+  veryfast: 6,
+  faster: 5,
+  fast: 4,
+  medium: 3,
+  slow: 2,
+  slower: 1,
+  veryslow: 0,
+};
+
+/**
+ * What an options object that predates this feature meant.
+ *
+ * The flat `{videoDuration, videoBitrate, videoDestination}` shape predates
+ * `exportSettings` (the HTTP render path that last built it is gone), so "no
+ * exportSettings" has to keep meaning "H.264 at the given bitrate" rather than
+ * "whatever the UI now defaults to".
+ */
+export const LEGACY_EXPORT_SETTINGS: ExportSettings = {
+  container: "mp4",
+  videoCodec: "h264",
+  qualityMode: "bitrate",
+  crf: 23,
+  preset: "medium",
+  videoBitrate: 5000,
+  proresProfile: 3,
+  audioCodec: "aac",
+  audioBitrate: 128,
+  sampleRate: 44100,
+  channels: 2,
+  // The offscreen path has no UI to set this from, and "what an options object
+  // that predates the feature meant" is unambiguously "software".
+  hardwareAccel: false,
+};
+
+function containerFromPath(destination: unknown): Container | undefined {
+  const match = /\.([a-z0-9]+)$/i.exec(String(destination ?? ""));
+  const extension = match?.[1]?.toLowerCase();
+  return CONTAINERS.includes(extension as Container)
+    ? (extension as Container)
+    : undefined;
+}
+
+/** Reads settings off an options object of either the current or the legacy shape. */
+export function resolveExportSettings(options: any): ExportSettings {
+  const raw = options?.exportSettings;
+
+  const base: ExportSettings = raw
+    ? DEFAULT_EXPORT_SETTINGS
+    : {
+        ...LEGACY_EXPORT_SETTINGS,
+        container:
+          containerFromPath(options?.videoDestination) ??
+          LEGACY_EXPORT_SETTINGS.container,
+      };
+
+  return normalizeExportSettings(
+    {
+      ...(raw ?? {}),
+      videoBitrate:
+        raw?.videoBitrate ?? options?.videoBitrate ?? base.videoBitrate,
+    },
+    base,
+  );
+}
+
+export function pixelFormatFor(settings: ExportSettings): string {
+  if (settings.videoCodec === "prores") {
+    // 4444 and 4444 XQ carry alpha; the 422 family does not.
+    return settings.proresProfile >= 4 ? "yuva444p10le" : "yuv422p10le";
+  }
+  return "yuv420p";
+}
+
+export function videoOutputArgs(
+  settings: ExportSettings,
+  target: EncodeTarget = HOST_TARGET,
+): string[] {
+  if (settings.videoCodec === "gif") {
+    // Rate, preset and pixel format are all the palette's business
+    // (`gifFilterGraph`), which hands the encoder `pal8` frames.
+    return ["-c:v", "gif"];
+  }
+  const hardware = usesHardwareEncoder(settings, target);
+
+  const args: string[] = [
+    "-c:v",
+    hardware ? HW_ENCODERS[settings.videoCodec]! : VIDEO_ENCODERS[settings.videoCodec],
+  ];
+
+  if (settings.videoCodec === "prores") {
+    // ProRes is intra-only at fixed per-profile rates; `-crf` and `-b:v` are
+    // both meaningless here, and `-preset` is rejected outright. The profile
+    // numbering is the same for `prores_ks` and `prores_videotoolbox`.
+    args.push("-profile:v", `${settings.proresProfile}`);
+  } else if (hardware) {
+    // VideoToolbox has never understood `-crf`. Its constant-quality mode is
+    // `-q:v`, and that mode exists **only on Apple Silicon** — an Intel Mac
+    // answers "qscale not available for encoder" and the export dies during
+    // startup, after the renderer has already been told it began. So x64 falls
+    // back to the bitrate the settings already carry rather than failing.
+    if (settings.qualityMode === "crf" && target.arch === "arm64") {
+      args.push("-q:v", `${videotoolboxQuality(settings)}`);
+    } else {
+      args.push("-b:v", `${settings.videoBitrate}k`);
+    }
+  } else if (settings.qualityMode === "crf") {
+    args.push("-crf", `${settings.crf}`);
+    if (settings.videoCodec === "vp9") {
+      // libvpx reads a nonzero `-b:v` as a *target*, which silently downgrades
+      // `-crf` from constant quality to a quality ceiling. The explicit zero is
+      // what makes it constant quality.
+      args.push("-b:v", "0");
+    }
+  } else {
+    args.push("-b:v", `${settings.videoBitrate}k`);
+  }
+
+  if (hardware) {
+    // Nothing. The x264 preset names are not in VideoToolbox's vocabulary and
+    // it exits rather than ignoring one; the media engine has no equivalent
+    // speed/compression axis to map them onto anyway.
+  } else if (settings.videoCodec === "h264" || settings.videoCodec === "h265") {
+    args.push("-preset", settings.preset);
+  } else if (settings.videoCodec === "vp9") {
+    args.push(
+      "-deadline",
+      "good",
+      "-cpu-used",
+      `${VP9_CPU_USED[settings.preset]}`,
+      "-row-mt",
+      "1",
+    );
+  }
+
+  args.push("-pix_fmt", pixelFormatFor(settings));
+
+  if (settings.videoCodec === "h265" && settings.container !== "webm") {
+    // Without hvc1 the ISOBMFF sample entry is hev1, which QuickTime and Safari
+    // refuse to play even though the bitstream itself is fine.
+    args.push("-tag:v", "hvc1");
+  }
+
+  return args;
+}
+
+export function audioOutputArgs(settings: ExportSettings): string[] {
+  const args: string[] = ["-c:a", AUDIO_ENCODERS[settings.audioCodec]];
+
+  if (!settings.audioCodec.startsWith("pcm_")) {
+    args.push("-b:a", `${settings.audioBitrate}k`);
+  }
+
+  args.push("-ar", `${settings.sampleRate}`, "-ac", `${settings.channels}`);
+
+  return args;
+}
+
+export function containerOutputArgs(settings: ExportSettings): string[] {
+  const args: string[] = [];
+
+  if (settings.container === "mp4" || settings.container === "mov") {
+    // Moves the moov atom to the front so the file is seekable before it has
+    // finished downloading; harmless locally, required for a served file.
+    args.push("-movflags", "+faststart");
+  }
+  if (settings.container === "gif") {
+    // Loop forever, which is what anyone sharing a GIF expects of it.
+    args.push("-loop", "0");
+  }
+
+  // The muxer is inferrable from the extension, but the save dialog does not
+  // guarantee one, so pin it.
+  args.push("-f", settings.container);
+
+  return args;
+}
+
+// ---------------------------------------------------------------------------
+// GIF: a palette, not an encoder setting.
+// ---------------------------------------------------------------------------
+
+/**
+ * Frames a single palette may hold before a GIF switches to one palette per
+ * frame.
+ *
+ * The best GIF has one palette for the whole clip, and ffmpeg can only build
+ * it from every frame, so it holds every frame (after the resize) until the
+ * last one arrives. Measured on 20 s of 1080p30 at 480px and 15 fps: one
+ * palette made 3.4 MB in 298 MB of memory, one per frame 6.0 MB in 139 MB,
+ * and only the first grows with the length. Past this budget the export
+ * stays in constant memory and pays in size instead.
+ */
+export const GIF_PALETTE_BUDGET_BYTES = 512 * 1024 * 1024;
+
+export type GifPlan = {
+  fps: number;
+  /** The output size, or `null` where the frame size is not known (the PNG pipe). */
+  size: { w: number; h: number } | null;
+  /** The target width when `size` is unknown; 0 keeps the source's. */
+  width: number;
+  /** One palette for the whole clip, or one per frame. */
+  globalPalette: boolean;
+};
+
+/**
+ * What a GIF export will do, from its settings and the frames it is fed.
+ *
+ * Never faster than the project (the `fps` filter would only repeat frames)
+ * and never wider than the frames, which it would only blur.
+ */
+export function gifPlan(
+  settings: ExportSettings,
+  source: { fps: number; size: { w: number; h: number } | null; durationSec: number },
+): GifPlan {
+  const fps = Math.min(settings.gifFps ?? GIF_DEFAULT_FPS, source.fps);
+  const width = settings.gifWidth ?? GIF_DEFAULT_WIDTH;
+  if (source.size == null) {
+    return { fps, size: null, width, globalPalette: false };
+  }
+  const { w, h } = source.size;
+  const outW = width > 0 && width < w ? width : w;
+  const outH = Math.max(1, Math.round((h * outW) / w));
+  const frames = Math.ceil(Math.max(0, source.durationSec) * fps);
+  return {
+    fps,
+    size: { w: outW, h: outH },
+    width,
+    globalPalette: frames * outW * outH * 4 <= GIF_PALETTE_BUDGET_BYTES,
+  };
+}
+
+/**
+ * The video graph of a GIF export, from the frame pipe to `[vout]`.
+ *
+ * Resampled to the GIF's rate and resized first, so the palette is built
+ * from, and the budget counts, the frames that are actually kept. Ordered
+ * dither, because error diffusion makes every frame's noise different and
+ * the GIF then stores the noise as change. `diff_mode=rectangle` re-dithers
+ * only what moved. The frames are opaque (the composite fills its
+ * background), so no palette entry is spent on transparency.
+ */
+export function gifFilterGraph(plan: GifPlan): string {
+  let scale = "";
+  if (plan.size == null) {
+    if (plan.width > 0) {
+      scale = `,scale='min(${plan.width},iw)':-1:flags=lanczos`;
+    }
+  } else {
+    scale = `,scale=${plan.size.w}:${plan.size.h}:flags=lanczos`;
+  }
+  const perFrame = plan.globalPalette ? "" : ":stats_mode=single";
+  const newPalette = plan.globalPalette ? "" : ":new=1";
+  return (
+    `[0:v]fps=${plan.fps}${scale},split[gifa][gifb];` +
+    `[gifa]palettegen=reserve_transparent=0${perFrame}[gifp];` +
+    `[gifb][gifp]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle${newPalette}[vout]`
+  );
+}

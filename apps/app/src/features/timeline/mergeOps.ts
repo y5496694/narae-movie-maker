@@ -1,0 +1,322 @@
+/**
+ * Rejoin clips that a split took apart.
+ *
+ * `clipEdit.ts#splitAt` already promises this is possible: "Adjacency is exact
+ * — `left` ends precisely where `right` begins — which is what lets the two
+ * pieces sit side by side on one track and be rejoined without drift." This is
+ * the other half of that sentence.
+ *
+ * Merge is deliberately narrow. It is the inverse of a cut, not a general
+ * "combine these clips" — two unrelated videos butted against each other have
+ * no single source window that could describe the result, and a merge that
+ * quietly threw one of them away would be worse than no merge at all. So every
+ * condition below is really the same question asked from a different angle:
+ * *were these one clip a moment ago?* When the answer is no, the document comes
+ * back by identity and `withCheckpoint` records nothing.
+ */
+
+import { sameProgram } from "../fx/inlineProgram";
+import {
+  backdropFxOf,
+  fillOpacityOf,
+  sameBackdropFx,
+} from "../shape/backdropFx";
+import { sameShapeGeometry } from "../shape/shapeGeometry";
+import { sameParams } from "./effectOps";
+import type { TimelineElement } from "../../@types/timeline";
+import {
+  ADJACENCY_EPSILON_MS,
+  isDurationLocked,
+  isDynamicElement,
+  spanEnd,
+  spanStart,
+  speedOf,
+  type DynamicElement,
+} from "./geometry";
+import { withDerivedSpeed } from "./clipEdit";
+import { sameSpeedCurve, speedCurveOf } from "./speedCurve";
+import { normalizeDocument, type TimelineDocument } from "./tracks";
+
+/**
+ * How far apart two edges may be and still count as touching, in ms.
+ *
+ * Now `geometry.ts#ADJACENCY_EPSILON_MS`, which carries the reasoning. It moved
+ * because transitions ask the same question of the same two numbers — "is there
+ * a cut here?" — and the two answers must agree, or a cut that offers a
+ * transition could refuse to merge. Re-exported under the old name so this
+ * module's own documentation keeps referring to something real.
+ */
+export const MERGE_EPSILON_MS = ADJACENCY_EPSILON_MS;
+
+function near(a: number, b: number): boolean {
+  return Math.abs(a - b) <= MERGE_EPSILON_MS;
+}
+
+/** Whether any animation track on this element holds keyframes. */
+function isAnimated(element: TimelineElement): boolean {
+  const animation = (element as any).animation;
+  if (animation == null) {
+    return false;
+  }
+  return Object.keys(animation).some(
+    (property) =>
+      animation[property]?.isActivate === true &&
+      (animation[property]?.x?.length ?? 0) > 0,
+  );
+}
+
+/**
+ * Whether `right` is the piece that used to follow `left`.
+ *
+ * The source-window test is the one that does the real work. Two clips can be
+ * flush on the timeline and still be showing frames from opposite ends of the
+ * file — that is what happens the moment anyone trims a cut — and joining those
+ * would silently splice out everything in between.
+ */
+function canJoin(left: TimelineElement, right: TimelineElement): boolean {
+  if (left.trackId !== right.trackId) {
+    return false;
+  }
+
+  // Merging across a group boundary would carry a clip out of the coordinate
+  // space its position is expressed in, moving it on screen.
+  const leftParent = (left as any).parentId ?? null;
+  const rightParent = (right as any).parentId ?? null;
+  if (leftParent !== rightParent) {
+    return false;
+  }
+
+  if (left.filetype !== right.filetype) {
+    return false;
+  }
+
+  // A template is never half of a cut. The `localpath` test below is what
+  // decides two clips share a source, and every template carries the same
+  // `"TEMPLATE"` sentinel — so two *different* templates sitting edge to edge
+  // passed every test here, and merging them dropped one while the survivor
+  // claimed its span and went on rendering only its own six seconds. The
+  // length guard is the honest statement of why: merging changes a duration,
+  // and a template's belongs to its author.
+  if (isDurationLocked(left) || isDurationLocked(right)) {
+    return false;
+  }
+
+  if (left.localpath !== right.localpath) {
+    return false;
+  }
+
+  // Two text clips sharing the empty `localpath` every text element has are not
+  // halves of one cut unless they also say the same thing.
+  if (left.filetype === "text" && (left as any).text !== (right as any).text) {
+    return false;
+  }
+
+  // Every graphic shares the "GRAPHIC" placeholder, so the path proves nothing,
+  // the template comment above in another form. Two graphics are halves of one
+  // cut only when they run the same program with the same values and the right
+  // one's clock picks up exactly where the left one's stops.
+  if (left.filetype === "graphic" && right.filetype === "graphic") {
+    if (left.presetId !== right.presetId) {
+      return false;
+    }
+    if (!sameProgram(left.program, right.program)) {
+      return false;
+    }
+    if (!sameParams(left.params ?? {}, right.params ?? {})) {
+      return false;
+    }
+    if (!near((left.clockHead ?? 0) + left.duration, right.clockHead ?? 0)) {
+      return false;
+    }
+  }
+
+  // Every shape shares the "SHAPE" placeholder too. The merge keeps the left
+  // clip's fields, so two shapes are halves of one cut only when they would
+  // draw the same thing: joining a plain bar onto a mosaicked face kept the
+  // bar and silently dropped the mosaic for the length of the right half.
+  if (left.filetype === "shape" && right.filetype === "shape") {
+    if (left.option?.fillColor !== right.option?.fillColor) {
+      return false;
+    }
+    if (fillOpacityOf(left) !== fillOpacityOf(right)) {
+      return false;
+    }
+    if (!sameBackdropFx(backdropFxOf(left), backdropFxOf(right))) {
+      return false;
+    }
+    if (!sameShapeGeometry(left.geometry, right.geometry)) {
+      return false;
+    }
+    if (!samePoints(left.shape, right.shape)) {
+      return false;
+    }
+  }
+
+  if (isAnimated(left) || isAnimated(right)) {
+    return false;
+  }
+
+  if (!near(spanEnd(left), spanStart(right))) {
+    return false;
+  }
+
+  if (isDynamicElement(left) && isDynamicElement(right)) {
+    // The ramp first, because on a ramped clip the scalar is *derived* and the
+    // two halves of a split carry different ones by construction: each half's
+    // mean is the mean of its own part of the curve. Comparing the scalars
+    // there would refuse to rejoin a clip this module's own header promises can
+    // be rejoined. Two clips with no ramp both answer `true` here and fall
+    // through to the scalar test, which is the only case it still governs.
+    if (!sameSpeedCurve(left.speedCurve, right.speedCurve)) {
+      return false;
+    }
+    if (speedCurveOf(left) == null && speedOf(left) !== speedOf(right)) {
+      return false;
+    }
+    if (!near(left.trim.endTime, right.trim.startTime)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/** Whether two hand-drawn outlines hold the same points, in the same order. */
+function samePoints(a: unknown, b: unknown): boolean {
+  if (a === b) {
+    return true;
+  }
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) {
+    return false;
+  }
+  return a.every((point, i) => {
+    const other = b[i];
+    return (
+      Array.isArray(point) &&
+      Array.isArray(other) &&
+      point[0] === other[0] &&
+      point[1] === other[1]
+    );
+  });
+}
+
+/**
+ * The selection in timeline order, or `null` if any id is unknown.
+ *
+ * Carries the map id alongside each element rather than reading `element.key`,
+ * which is *not* the id it is filed under: `splitClip` files the right half
+ * under a fresh uuid while the element's own `key` stays whatever the original
+ * had. Deleting by `key` would miss the clip and take an unrelated one.
+ */
+type Link = { id: string; element: TimelineElement };
+
+function ordered(doc: TimelineDocument, elementIds: string[]): Link[] | null {
+  const unique = [...new Set(elementIds)];
+  if (unique.length < 2) {
+    return null;
+  }
+
+  const links: Link[] = [];
+  for (const id of unique) {
+    const element = doc.elements[id];
+    if (element == null) {
+      return null;
+    }
+    links.push({ id, element });
+  }
+
+  return links.sort((a, b) => spanStart(a.element) - spanStart(b.element));
+}
+
+/**
+ * Whether `mergeClips` would do anything.
+ *
+ * Exported so the toolbar can grey the button out without restating the rules —
+ * there is one definition of "these can be joined" and both callers read it.
+ */
+export function canMergeClips(
+  doc: TimelineDocument,
+  elementIds: string[],
+): boolean {
+  const chain = ordered(doc, elementIds);
+  if (chain == null) {
+    return false;
+  }
+
+  for (let i = 0; i < chain.length - 1; i += 1) {
+    if (!canJoin(chain[i].element, chain[i + 1].element)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/**
+ * Fuse a run of adjacent clips back into one.
+ *
+ * All-or-nothing, like `moveClips`: one bad link and the whole chain declines.
+ * A partial merge would leave the user staring at a selection that half
+ * collapsed, with no way to tell which half.
+ *
+ * The survivor is the **leftmost** clip, keeping its id. That matters beyond
+ * tidiness — the selection, the keyframe editor's `target.elementId` and the
+ * agent's last `list_clips` all name ids, and minting a fresh one for the
+ * result would invalidate every reference to a clip the user still sees.
+ */
+export function mergeClips(
+  doc: TimelineDocument,
+  elementIds: string[],
+): TimelineDocument {
+  if (!canMergeClips(doc, elementIds)) {
+    return doc;
+  }
+
+  // `ordered` cannot be null here: `canMergeClips` just returned true.
+  const chain = ordered(doc, elementIds) as Link[];
+  const head = chain[0].element;
+  const tail = chain[chain.length - 1].element;
+
+  let merged: TimelineElement;
+  if (isDynamicElement(head) && isDynamicElement(tail)) {
+    const trim = { startTime: head.trim.startTime, endTime: tail.trim.endTime };
+    // Restated rather than summed, so the invariant
+    // `duration === trim.endTime - trim.startTime` holds by construction and
+    // cannot drift across a long chain.
+    // `withDerivedSpeed` because this writes `trim` itself rather than going
+    // through `clipEdit.ts#withTrim`: the merged window is the whole of both
+    // halves, so a ramped chain's mean rate is neither half's and has to be
+    // integrated again. `canJoin` has already proved the two ramps are the same
+    // curve, so `head`'s copy is the right one to keep.
+    merged = withDerivedSpeed({
+      ...head,
+      trim,
+      duration: trim.endTime - trim.startTime,
+    } as DynamicElement) as TimelineElement;
+  } else {
+    merged = {
+      ...head,
+      duration: chain.reduce(
+        (total, link) => total + link.element.duration,
+        0,
+      ),
+    } as TimelineElement;
+    // The head keeps its own `clockHead`; the tail of the joined program is
+    // whatever followed the last piece, not the first.
+    if (merged.filetype === "graphic") {
+      const last = chain[chain.length - 1].element as typeof merged;
+      const { clockTail: _tail, ...rest } = merged;
+      merged = {
+        ...rest,
+        ...((last.clockTail ?? 0) !== 0 ? { clockTail: last.clockTail } : {}),
+      } as TimelineElement;
+    }
+  }
+
+  const elements = { ...doc.elements, [chain[0].id]: merged };
+  for (const link of chain.slice(1)) {
+    delete elements[link.id];
+  }
+
+  return normalizeDocument({ ...doc, elements });
+}

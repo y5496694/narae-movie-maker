@@ -1,0 +1,452 @@
+import { describe, it, expect } from "vitest";
+import {
+  MAX_CORNER_RADIUS,
+  ROUNDABLE_FILETYPES,
+  coerceCornerRadius,
+  cornerRadiusAt,
+  cornerRadiusOf,
+  cornerRadiusOffOf,
+  cornersOn,
+  defaultCornerRadius,
+  isRoundable,
+  setCornerRadius,
+  setCornerRadiusMany,
+  setCornerRadiusOff,
+  showCorners,
+} from "./cornerOps";
+import {
+  SCHEMA_VERSION,
+  createTrack,
+  normalizeDocument,
+  type TimelineDocument,
+} from "./tracks";
+import {
+  addKeyframe,
+  normalizeAnimations,
+  setTrackActive,
+  toggleKeyframe,
+} from "../animation/keyframeOps";
+import {
+  audioElement,
+  gifElement,
+  groupElement,
+  imageElement,
+  shapeElement,
+  textElement,
+  videoElement,
+} from "../renderer/testing";
+
+/** One clip of every type, built through `normalizeDocument` like the app. */
+function doc(): TimelineDocument {
+  return normalizeDocument({
+    schemaVersion: SCHEMA_VERSION,
+    tracks: [
+      createTrack("v0", "video", 0),
+      createTrack("a0", "audio", 1),
+      createTrack("g0", "video", 2),
+    ],
+    elements: {
+      video: videoElement({ trackId: "v0", startTime: 0, duration: 4000 }),
+      image: imageElement({ trackId: "v0", startTime: 4000, duration: 1000 }),
+      gif: gifElement({ trackId: "v0", startTime: 5000, duration: 1000 }),
+      shape: shapeElement({ trackId: "v0", startTime: 6000, duration: 1000 }),
+      text: textElement({ trackId: "v0", startTime: 7000, duration: 1000 }),
+      sound: audioElement({ trackId: "a0", startTime: 0, duration: 4000 }),
+      group: groupElement({ trackId: "g0", startTime: 0, duration: 4000 }),
+    },
+  });
+}
+
+/** A live radius track holding these baked `[clip ms, value]` samples. */
+function track(ax: number[][], isActivate = true) {
+  return { isActivate, x: [], ax };
+}
+
+describe("ROUNDABLE_FILETYPES", () => {
+  it("is exactly image and video", () => {
+    expect([...ROUNDABLE_FILETYPES].sort()).toEqual(["image", "video"]);
+  });
+
+  it("isRoundable agrees with the list", () => {
+    for (const [id, element] of Object.entries(doc().elements)) {
+      expect(isRoundable(element), id).toBe(
+        (ROUNDABLE_FILETYPES as readonly string[]).includes(element.filetype),
+      );
+    }
+  });
+});
+
+describe("cornerRadiusOf", () => {
+  it("reads absent as square", () => {
+    expect(cornerRadiusOf(imageElement())).toBe(0);
+    expect(cornerRadiusOf(null)).toBe(0);
+  });
+
+  it("reads what is stored", () => {
+    expect(cornerRadiusOf(imageElement({ cornerRadius: 24 }))).toBe(24);
+    expect(cornerRadiusOf(videoElement({ cornerRadius: 12.5 }))).toBe(12.5);
+  });
+
+  it("floors a negative and reads junk as square, never throwing", () => {
+    // A negative radius reaching `roundRect` is a RangeError in Chromium.
+    expect(cornerRadiusOf(imageElement({ cornerRadius: -5 }))).toBe(0);
+    expect(cornerRadiusOf(imageElement({ cornerRadius: Number.NaN }))).toBe(0);
+    expect(cornerRadiusOf(imageElement({ cornerRadius: Infinity }))).toBe(0);
+    expect(cornerRadiusOf(imageElement({ cornerRadius: "24" } as any))).toBe(0);
+  });
+
+  it("caps at the stored maximum", () => {
+    expect(cornerRadiusOf(imageElement({ cornerRadius: 1e9 }))).toBe(
+      MAX_CORNER_RADIUS,
+    );
+  });
+
+  it("reads nothing off a type that cannot be rounded", () => {
+    // A hand-edited project could put the key anywhere; only image and video
+    // are drawn with it, so only they may report it.
+    expect(cornerRadiusOf(shapeElement({ cornerRadius: 24 } as any))).toBe(0);
+    expect(cornerRadiusOf(textElement({ cornerRadius: 24 } as any))).toBe(0);
+  });
+});
+
+describe("coerceCornerRadius", () => {
+  it("clamps a number into range", () => {
+    expect(coerceCornerRadius(30)).toBe(30);
+    expect(coerceCornerRadius(-1)).toBe(0);
+    expect(coerceCornerRadius(MAX_CORNER_RADIUS + 1)).toBe(MAX_CORNER_RADIUS);
+  });
+
+  it("refuses what is not a number", () => {
+    expect(coerceCornerRadius("30")).toBeNull();
+    expect(coerceCornerRadius(Number.NaN)).toBeNull();
+    expect(coerceCornerRadius(undefined)).toBeNull();
+  });
+});
+
+describe("setCornerRadius", () => {
+  it("rounds an image and a video", () => {
+    let d = setCornerRadius(doc(), "image", 24);
+    d = setCornerRadius(d, "video", 40);
+    expect(d.elements.image).toMatchObject({ cornerRadius: 24 });
+    expect(d.elements.video).toMatchObject({ cornerRadius: 40 });
+  });
+
+  it("clamps what it stores", () => {
+    const d = setCornerRadius(doc(), "image", -10);
+    // Clamped to 0, which on a clip with no radius is no change at all.
+    expect(d.elements.image).not.toHaveProperty("cornerRadius");
+    expect(setCornerRadius(doc(), "image", 1e9).elements.image).toMatchObject({
+      cornerRadius: MAX_CORNER_RADIUS,
+    });
+  });
+
+  it("deletes the key at 0, so the clip is byte-identical to one never rounded", () => {
+    const original = doc();
+    const cleared = setCornerRadius(
+      setCornerRadius(original, "image", 24),
+      "image",
+      0,
+    );
+    expect(cleared.elements.image).not.toHaveProperty("cornerRadius");
+    expect(JSON.stringify(cleared.elements.image)).toBe(
+      JSON.stringify(original.elements.image),
+    );
+  });
+
+  it("declines by identity for the radius a clip already has", () => {
+    const rounded = setCornerRadius(doc(), "image", 24);
+    expect(setCornerRadius(rounded, "image", 24)).toBe(rounded);
+  });
+
+  it("declines by identity when clearing a clip that was never rounded", () => {
+    const d = doc();
+    expect(setCornerRadius(d, "image", 0)).toBe(d);
+  });
+
+  it("declines by identity for a type that cannot be rounded", () => {
+    const d = doc();
+    for (const id of ["shape", "text", "gif", "sound", "group"]) {
+      expect(setCornerRadius(d, id, 24), id).toBe(d);
+    }
+  });
+
+  it("declines by identity for a missing id and a non-number", () => {
+    const d = doc();
+    expect(setCornerRadius(d, "nope", 24)).toBe(d);
+    expect(setCornerRadius(d, "image", Number.NaN)).toBe(d);
+  });
+
+  it("clears a junk stored value when asked for 0", () => {
+    const d = doc();
+    const junk = {
+      ...d,
+      elements: {
+        ...d.elements,
+        image: { ...d.elements.image, cornerRadius: "x" } as any,
+      },
+    };
+    expect(setCornerRadius(junk, "image", 0).elements.image).not.toHaveProperty(
+      "cornerRadius",
+    );
+  });
+});
+
+describe("setCornerRadiusMany", () => {
+  it("rounds what it can and skips the rest", () => {
+    const d = setCornerRadiusMany(doc(), ["image", "video", "shape"], 16);
+    expect(d.elements.image).toMatchObject({ cornerRadius: 16 });
+    expect(d.elements.video).toMatchObject({ cornerRadius: 16 });
+    expect(d.elements.shape).not.toHaveProperty("cornerRadius");
+  });
+
+  it("declines by identity when nothing in the selection changes", () => {
+    const d = doc();
+    expect(setCornerRadiusMany(d, ["shape", "text"], 16)).toBe(d);
+  });
+});
+
+describe("cornerRadiusAt", () => {
+  const animated = (over: Record<string, unknown> = {}) =>
+    imageElement({
+      startTime: 1000,
+      cornerRadius: 10,
+      animation: {
+        ...imageElement().animation,
+        // Baked lanes are dense samples, read by lookup rather than
+        // interpolated, so the middle is a sample of its own.
+        cornerRadius: track([
+          [0, 0],
+          [500, 25],
+          [1000, 50],
+        ]),
+      },
+      ...over,
+    } as any);
+
+  it("answers the static field with no track", () => {
+    expect(cornerRadiusAt(imageElement({ cornerRadius: 24 }), 0)).toBe(24);
+  });
+
+  it("samples a live track, which replaces the field", () => {
+    expect(cornerRadiusAt(animated(), 1000)).toBe(0);
+    expect(cornerRadiusAt(animated(), 1500)).toBe(25);
+    expect(cornerRadiusAt(animated(), 2000)).toBe(50);
+  });
+
+  it("answers the field before the clip starts", () => {
+    expect(cornerRadiusAt(animated(), 500)).toBe(10);
+  });
+
+  it("ignores a track that is switched off", () => {
+    const off = animated();
+    (off as any).animation.cornerRadius.isActivate = false;
+    expect(cornerRadiusAt(off, 2000)).toBe(10);
+  });
+
+  it("floors an overshooting curve at the read", () => {
+    const under = animated();
+    (under as any).animation.cornerRadius = track([
+      [0, -30],
+      [1000, -30],
+    ]);
+    expect(cornerRadiusAt(under, 1500)).toBe(0);
+  });
+
+  it("answers 0 for a type that cannot be rounded, track or not", () => {
+    const shape = shapeElement({
+      animation: {
+        ...shapeElement().animation,
+        cornerRadius: track([[0, 40]]),
+      },
+    } as any);
+    expect(cornerRadiusAt(shape, 0)).toBe(0);
+  });
+});
+
+describe("the cornerRadius keyframe track", () => {
+  it("is minted on an image when the stopwatch is armed, seeded from the field", () => {
+    const d = setCornerRadius(doc(), "image", 24);
+    expect((d.elements.image as any).animation.cornerRadius).toBeUndefined();
+
+    // `atMs` is clip-local: the image starts at 4000 on the timeline.
+    const armed = setTrackActive(d, "image", "cornerRadius", true, { atMs: 0 });
+    const minted = (armed.elements.image as any).animation.cornerRadius;
+    expect(minted.isActivate).toBe(true);
+    expect(minted.x).toHaveLength(1);
+    expect(minted.x[0].p[1]).toBe(24);
+  });
+
+  it("is refused on a shape, which has its own radius", () => {
+    const d = doc();
+    expect(setTrackActive(d, "shape", "cornerRadius", true, { atMs: 0 })).toBe(d);
+  });
+
+  it("is deleted when disarmed with no curve on it", () => {
+    const original = doc();
+    const armed = setTrackActive(original, "image", "cornerRadius", true);
+    expect((armed.elements.image as any).animation.cornerRadius).toBeDefined();
+
+    const disarmed = setTrackActive(armed, "image", "cornerRadius", false);
+    expect(JSON.stringify(disarmed.elements.image)).toBe(
+      JSON.stringify(original.elements.image),
+    );
+  });
+
+  it("writes its last value back to the field when its last key goes", () => {
+    let d = setTrackActive(doc(), "image", "cornerRadius", true, { atMs: 0 });
+    d = addKeyframe(d, "image", "cornerRadius", "x", 0, 40);
+    d = toggleKeyframe(d, "image", "cornerRadius", 4000, 30);
+
+    expect((d.elements.image as any).animation.cornerRadius).toBeUndefined();
+    expect(d.elements.image).toMatchObject({ cornerRadius: 40 });
+  });
+
+  it("leaves a clip keyed down to square exactly as one never rounded", () => {
+    const original = doc();
+    let d = setCornerRadius(original, "image", 24);
+    d = setTrackActive(d, "image", "cornerRadius", true, { atMs: 0 });
+    d = addKeyframe(d, "image", "cornerRadius", "x", 0, 0);
+    d = toggleKeyframe(d, "image", "cornerRadius", 4000, 30);
+
+    expect(JSON.stringify(d.elements.image)).toBe(
+      JSON.stringify(original.elements.image),
+    );
+  });
+
+  it("is collected on load from a type that cannot carry it", () => {
+    // `normalizeAnimations` is the ingress pass project load runs, and
+    // deliberately not part of `normalizeDocument`.
+    const loaded = normalizeAnimations(normalizeDocument({
+      schemaVersion: SCHEMA_VERSION,
+      tracks: [createTrack("v0", "video", 0)],
+      elements: {
+        shape: shapeElement({
+          trackId: "v0",
+          animation: {
+            ...shapeElement().animation,
+            cornerRadius: track([[0, 40]]),
+          },
+        } as any),
+        image: imageElement({
+          trackId: "v0",
+          startTime: 4000,
+          animation: {
+            ...imageElement().animation,
+            cornerRadius: track([[0, 40]]),
+          },
+        } as any),
+      },
+    }));
+    expect((loaded.elements.shape as any).animation.cornerRadius).toBeUndefined();
+    expect((loaded.elements.image as any).animation.cornerRadius).toBeDefined();
+  });
+});
+
+describe("the Corners eye", () => {
+  /** An image at 4000 with a radius of 24, through the op like the app. */
+  const rounded = () => setCornerRadius(doc(), "image", 24);
+
+  /** The same image with an armed curve and a square static field. */
+  function keyed(): TimelineDocument {
+    let d = setTrackActive(doc(), "image", "cornerRadius", true, { atMs: 0 });
+    d = addKeyframe(d, "image", "cornerRadius", "x", 0, 40);
+    return d;
+  }
+
+  it("reads only a literal true as off", () => {
+    expect(cornerRadiusOffOf(imageElement({ cornerRadiusOff: true }))).toBe(true);
+    expect(cornerRadiusOffOf(imageElement())).toBe(false);
+    expect(
+      cornerRadiusOffOf(imageElement({ cornerRadiusOff: "yes" } as any)),
+    ).toBe(false);
+    expect(
+      cornerRadiusOffOf(shapeElement({ cornerRadiusOff: true } as any)),
+    ).toBe(false);
+  });
+
+  it("is on for a radius or an armed curve, and off for a square clip", () => {
+    expect(cornersOn(rounded().elements.image)).toBe(true);
+    expect(cornersOn(keyed().elements.image)).toBe(true);
+    expect(cornersOn(doc().elements.image)).toBe(false);
+    expect(cornersOn(doc().elements.shape)).toBe(false);
+  });
+
+  it("switches off without losing the radius", () => {
+    const off = setCornerRadiusOff(rounded(), "image", true);
+    const image = off.elements.image;
+
+    expect(cornersOn(image)).toBe(false);
+    expect(cornerRadiusAt(image, 4000)).toBe(0);
+    // What is stored is untouched; only what is drawn changes.
+    expect(cornerRadiusOf(image)).toBe(24);
+  });
+
+  it("switches back on to exactly the clip it was", () => {
+    const before = rounded();
+    const after = showCorners(
+      setCornerRadiusOff(before, "image", true),
+      "image",
+      99,
+    );
+    // The radius that was there, not the default handed in.
+    expect(JSON.stringify(after.elements.image)).toBe(
+      JSON.stringify(before.elements.image),
+    );
+  });
+
+  it("keeps a curve while off, and plays it again once on", () => {
+    const off = setCornerRadiusOff(keyed(), "image", true);
+    expect(cornerRadiusAt(off.elements.image, 4000)).toBe(0);
+    expect((off.elements.image as any).animation.cornerRadius.x).toHaveLength(1);
+
+    const on = showCorners(off, "image", 99);
+    expect(cornerRadiusAt(on.elements.image, 4000)).toBe(40);
+    expect(on.elements.image).not.toHaveProperty("cornerRadius");
+  });
+
+  it("rounds a square clip with the radius it is handed", () => {
+    const d = showCorners(doc(), "image", 54);
+    expect(d.elements.image).toMatchObject({ cornerRadius: 54 });
+    expect(cornersOn(d.elements.image)).toBe(true);
+  });
+
+  it("declines by identity for the state a clip is already in", () => {
+    const on = rounded();
+    expect(showCorners(on, "image", 54)).toBe(on);
+    expect(setCornerRadiusOff(on, "image", false)).toBe(on);
+
+    const off = setCornerRadiusOff(on, "image", true);
+    expect(setCornerRadiusOff(off, "image", true)).toBe(off);
+  });
+
+  it("declines to switch off a clip with nothing to hide", () => {
+    const d = doc();
+    expect(setCornerRadiusOff(d, "image", true)).toBe(d);
+    expect(setCornerRadiusOff(d, "shape", true)).toBe(d);
+    expect(showCorners(d, "shape", 54)).toBe(d);
+  });
+
+  it("drops the switch with the radius, unless a curve is left to hide", () => {
+    const squared = setCornerRadius(
+      setCornerRadiusOff(rounded(), "image", true),
+      "image",
+      0,
+    );
+    expect(JSON.stringify(squared.elements.image)).toBe(
+      JSON.stringify(doc().elements.image),
+    );
+
+    let d = setCornerRadius(keyed(), "image", 24);
+    d = setCornerRadiusOff(d, "image", true);
+    d = setCornerRadius(d, "image", 0);
+    expect(d.elements.image).toMatchObject({ cornerRadiusOff: true });
+  });
+
+  it("defaults to a twentieth of the shorter side, never below 1", () => {
+    expect(defaultCornerRadius(1920, 1080)).toBe(54);
+    expect(defaultCornerRadius(3600, 2338)).toBe(117);
+    expect(defaultCornerRadius(10, 10)).toBe(1);
+    expect(defaultCornerRadius(0, 100)).toBe(1);
+    expect(defaultCornerRadius(Number.NaN, 100)).toBe(1);
+  });
+});

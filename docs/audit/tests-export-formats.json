@@ -1,0 +1,50 @@
+{
+  "ok": true,
+  "generatedAt": "2026-10-30T10:42:59.697Z",
+  "formats": [
+    {
+      "extension": "mov",
+      "codec": "prores",
+      "bytes": 1321541,
+      "duration": 1,
+      "rms": 0.12500991099671083,
+      "engine": {
+        "name": "나래 무비메이커 엔진",
+        "version": "1.0.0",
+        "headless": true,
+        "guiInstalledRequired": false,
+        "mcpHttpRequired": false
+      },
+      "decoded": true
+    },
+    {
+      "extension": "webm",
+      "codec": "vp9",
+      "bytes": 89981,
+      "duration": 1.008,
+      "rms": 0.12497905840306875,
+      "engine": {
+        "name": "나래 무비메이커 엔진",
+        "version": "1.0.0",
+        "headless": true,
+        "guiInstalledRequired": false,
+        "mcpHttpRequired": false
+      },
+      "decoded": true
+    },
+    {
+      "extension": "gif",
+      "codec": "gif",
+      "bytes": 105421,
+      "duration": 0.99,
+      "engine": {
+        "name": "나래 무비메이커 엔진",
+        "version": "1.0.0",
+        "headless": true,
+        "guiInstalledRequired": false,
+        "mcpHttpRequired": false
+      },
+      "decoded": true
+    }
+  ]
+}

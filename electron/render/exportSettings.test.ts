@@ -1,0 +1,484 @@
+import { describe, expect, it } from "vitest";
+
+// Reaching across the rootDir boundary is safe here and nowhere else: test files
+// are excluded from the Electron tsc pass, so importing the renderer copy cannot
+// widen `rootDir` and relocate the build.
+import * as renderer from "../../apps/app/src/features/export/settings";
+import * as main from "./exportSettings";
+
+import {
+  AUDIO_CODECS,
+  DEFAULT_EXPORT_SETTINGS,
+  LEGACY_EXPORT_SETTINGS,
+  VIDEO_CODECS,
+  audioOutputArgs,
+  containerOutputArgs,
+  GIF_PALETTE_BUDGET_BYTES,
+  gifFilterGraph,
+  gifPlan,
+  normalizeExportSettings,
+  pixelFormatFor,
+  resolveExportSettings,
+  videoOutputArgs,
+} from "./exportSettings";
+
+/** Reads the value FFmpeg would see for a flag, or undefined if it is absent. */
+const valueOf = (args: string[], flag: string) => {
+  const index = args.indexOf(flag);
+  return index === -1 ? undefined : args[index + 1];
+};
+
+describe("the main-process mirror", () => {
+  it("matches the renderer's settings vocabulary exactly", () => {
+    expect(main.DEFAULT_EXPORT_SETTINGS).toEqual(renderer.DEFAULT_EXPORT_SETTINGS);
+    expect(main.EXPORT_PRESETS).toEqual(renderer.EXPORT_PRESETS);
+    expect(main.CODEC_CONTAINERS).toEqual(renderer.CODEC_CONTAINERS);
+    expect(main.CONTAINER_VIDEO_CODECS).toEqual(renderer.CONTAINER_VIDEO_CODECS);
+    expect(main.CONTAINER_AUDIO_CODECS).toEqual(renderer.CONTAINER_AUDIO_CODECS);
+    expect(main.AUDIO_SAMPLE_RATES).toEqual(renderer.AUDIO_SAMPLE_RATES);
+    expect(main.CRF_RANGE).toEqual(renderer.CRF_RANGE);
+    expect(main.CODEC_SUPPORTS_CRF).toEqual(renderer.CODEC_SUPPORTS_CRF);
+    expect(main.CONTAINERS).toEqual(renderer.CONTAINERS);
+    expect(main.VIDEO_CODECS).toEqual(renderer.VIDEO_CODECS);
+    expect(main.AUDIO_CODECS).toEqual(renderer.AUDIO_CODECS);
+    expect(main.ENCODE_PRESETS).toEqual(renderer.ENCODE_PRESETS);
+    expect(main.GIF_FPS).toEqual(renderer.GIF_FPS);
+    expect(main.GIF_DEFAULT_FPS).toEqual(renderer.GIF_DEFAULT_FPS);
+    expect(main.GIF_WIDTHS).toEqual(renderer.GIF_WIDTHS);
+    expect(main.GIF_DEFAULT_WIDTH).toEqual(renderer.GIF_DEFAULT_WIDTH);
+  });
+
+  it("normalizes identically to the renderer copy", () => {
+    const inputs: any[] = [
+      undefined,
+      {},
+      { videoCodec: "vp9", container: "mp4", audioCodec: "aac" },
+      { videoCodec: "prores", qualityMode: "crf", proresProfile: 9 },
+      { videoCodec: "h264", crf: 99, channels: 1, sampleRate: 12345 },
+      { videoCodec: "av1", preset: "turbo" },
+      { videoCodec: "gif" },
+      { videoCodec: "gif", gifFps: 25, gifWidth: 0, audioCodec: "opus" },
+      { videoCodec: "gif", gifFps: 60, gifWidth: 333 },
+      { container: "gif", videoCodec: "h264", gifFps: 10 },
+    ];
+
+    for (const input of inputs) {
+      expect(main.normalizeExportSettings(input)).toEqual(
+        renderer.normalizeExportSettings(input),
+      );
+    }
+  });
+
+  it("has an encoder name for every codec it offers", () => {
+    for (const codec of VIDEO_CODECS) {
+      expect(main.VIDEO_ENCODERS[codec]).toBeTruthy();
+    }
+    for (const codec of AUDIO_CODECS) {
+      expect(main.AUDIO_ENCODERS[codec]).toBeTruthy();
+    }
+  });
+
+  it("maps every encode preset onto a VP9 cpu-used level", () => {
+    for (const preset of main.ENCODE_PRESETS) {
+      expect(main.VP9_CPU_USED[preset]).toBeTypeOf("number");
+    }
+  });
+
+  /**
+   * The renderer decides whether to *show* the hardware toggle and main decides
+   * what flag it becomes, so the two answer "does this codec have a hardware
+   * encoder?" independently. Comparing the derivation rather than duplicating a
+   * table is the stronger check: adding a VideoToolbox encoder on one side
+   * without the other fails here.
+   */
+  it("offers the hardware toggle for exactly the codecs that have an encoder", () => {
+    for (const codec of VIDEO_CODECS) {
+      expect(renderer.CODEC_SUPPORTS_HW_ACCEL[codec]).toBe(
+        main.HW_ENCODERS[codec] != null,
+      );
+    }
+  });
+});
+
+describe("hardware-accelerated output", () => {
+  const APPLE_SILICON = { platform: "darwin", arch: "arm64" };
+  const INTEL_MAC = { platform: "darwin", arch: "x64" };
+  const WINDOWS = { platform: "win32", arch: "x64" };
+
+  const hw = (patch: any) =>
+    normalizeExportSettings({ hardwareAccel: true, ...patch });
+
+  it("switches H.264 onto VideoToolbox and drops the x264 preset", () => {
+    const args = videoOutputArgs(
+      hw({ videoCodec: "h264", qualityMode: "crf", crf: 23 }),
+      APPLE_SILICON,
+    );
+    expect(args.slice(0, 2)).toEqual(["-c:v", "h264_videotoolbox"]);
+    // VideoToolbox exits on an x264 preset name rather than ignoring it.
+    expect(args).not.toContain("-preset");
+    expect(args).not.toContain("-crf");
+    expect(valueOf(args, "-q:v")).toBeDefined();
+    expect(valueOf(args, "-pix_fmt")).toBe("yuv420p");
+  });
+
+  it("keeps H.265's hvc1 tag on the hardware path", () => {
+    const args = videoOutputArgs(
+      hw({ videoCodec: "h265", container: "mp4" }),
+      APPLE_SILICON,
+    );
+    expect(args.slice(0, 2)).toEqual(["-c:v", "hevc_videotoolbox"]);
+    expect(valueOf(args, "-tag:v")).toBe("hvc1");
+  });
+
+  it("gives hardware ProRes the same profile and no rate control", () => {
+    const args = videoOutputArgs(
+      hw({ videoCodec: "prores", proresProfile: 3 }),
+      APPLE_SILICON,
+    );
+    expect(args.slice(0, 2)).toEqual(["-c:v", "prores_videotoolbox"]);
+    expect(valueOf(args, "-profile:v")).toBe("3");
+    expect(args).not.toContain("-q:v");
+    expect(args).not.toContain("-b:v");
+    expect(args).not.toContain("-preset");
+  });
+
+  it("maps a lower CRF onto a higher VideoToolbox quality", () => {
+    const better = videoOutputArgs(hw({ videoCodec: "h264", crf: 18 }), APPLE_SILICON);
+    const worse = videoOutputArgs(hw({ videoCodec: "h264", crf: 40 }), APPLE_SILICON);
+    expect(Number(valueOf(better, "-q:v"))).toBeGreaterThan(
+      Number(valueOf(worse, "-q:v")),
+    );
+    for (const crf of [0, 18, 23, 28, 51]) {
+      const q = Number(
+        valueOf(videoOutputArgs(hw({ videoCodec: "h264", crf }), APPLE_SILICON), "-q:v"),
+      );
+      expect(q).toBeGreaterThanOrEqual(1);
+      expect(q).toBeLessThanOrEqual(100);
+    }
+  });
+
+  it("falls back to a bitrate on Intel, where -q:v is not available", () => {
+    const args = videoOutputArgs(
+      hw({ videoCodec: "h264", qualityMode: "crf", videoBitrate: 5000 }),
+      INTEL_MAC,
+    );
+    expect(args.slice(0, 2)).toEqual(["-c:v", "h264_videotoolbox"]);
+    expect(args).not.toContain("-q:v");
+    expect(valueOf(args, "-b:v")).toBe("5000k");
+  });
+
+  it("ignores the flag off macOS, so a Mac project still exports on Windows", () => {
+    const args = videoOutputArgs(hw({ videoCodec: "h264", crf: 23 }), WINDOWS);
+    expect(args.slice(0, 2)).toEqual(["-c:v", "libx264"]);
+    expect(valueOf(args, "-crf")).toBe("23");
+    expect(valueOf(args, "-preset")).toBe("medium");
+  });
+
+  it("ignores the flag for VP9, which has no VideoToolbox encoder", () => {
+    const args = videoOutputArgs(
+      hw({ videoCodec: "vp9", qualityMode: "crf", crf: 31 }),
+      APPLE_SILICON,
+    );
+    expect(args.slice(0, 2)).toEqual(["-c:v", "libvpx-vp9"]);
+    expect(valueOf(args, "-crf")).toBe("31");
+    expect(valueOf(args, "-cpu-used")).toBe("3");
+  });
+
+  /**
+   * The regression that matters most. Everything above is new behaviour behind a
+   * flag nobody has set yet; this is the promise that not setting it changes
+   * nothing, on every codec, on the machine most likely to run the tests.
+   */
+  it("produces the software argument vector whenever the flag is off", () => {
+    for (const codec of VIDEO_CODECS) {
+      const off = normalizeExportSettings({ videoCodec: codec });
+      expect(off.hardwareAccel).toBe(false);
+      expect(videoOutputArgs(off, APPLE_SILICON)).toEqual(
+        videoOutputArgs(off, WINDOWS),
+      );
+      expect(videoOutputArgs(off, APPLE_SILICON).slice(0, 2)).toEqual([
+        "-c:v",
+        main.VIDEO_ENCODERS[codec],
+      ]);
+    }
+  });
+
+  it("treats a missing hardwareAccel as off", () => {
+    const { hardwareAccel, ...withoutTheField } = DEFAULT_EXPORT_SETTINGS;
+    expect(normalizeExportSettings(withoutTheField).hardwareAccel).toBe(false);
+    expect(normalizeExportSettings({ hardwareAccel: "yes" as any }).hardwareAccel).toBe(
+      false,
+    );
+  });
+});
+
+describe("resolveExportSettings", () => {
+  it("reads a legacy options object as bitrate-mode H.264", () => {
+    const settings = resolveExportSettings({
+      videoDuration: 10,
+      videoBitrate: 4000,
+      videoDestination: "/tmp/out.mp4",
+    });
+
+    expect(settings.videoCodec).toBe("h264");
+    expect(settings.qualityMode).toBe("bitrate");
+    expect(settings.videoBitrate).toBe(4000);
+    expect(settings.container).toBe("mp4");
+    expect(settings.audioCodec).toBe(LEGACY_EXPORT_SETTINGS.audioCodec);
+    expect(settings.sampleRate).toBe(LEGACY_EXPORT_SETTINGS.sampleRate);
+  });
+
+  it("infers the legacy container from the destination extension", () => {
+    expect(
+      resolveExportSettings({ videoDestination: "/tmp/out.mov" }).container,
+    ).toBe("mov");
+    // An unknown extension is not a reason to guess; fall back to the legacy mp4.
+    expect(
+      resolveExportSettings({ videoDestination: "/tmp/out.mkv" }).container,
+    ).toBe("mp4");
+    expect(resolveExportSettings({}).container).toBe("mp4");
+  });
+
+  it("prefers exportSettings.videoBitrate over the legacy mirror", () => {
+    const settings = resolveExportSettings({
+      videoBitrate: 4000,
+      exportSettings: { qualityMode: "bitrate", videoBitrate: 9000 },
+    });
+    expect(settings.videoBitrate).toBe(9000);
+  });
+
+  it("falls back to the legacy mirror when the settings omit a bitrate", () => {
+    const settings = resolveExportSettings({
+      videoBitrate: 4000,
+      exportSettings: { qualityMode: "bitrate" },
+    });
+    expect(settings.videoBitrate).toBe(4000);
+  });
+
+  it("uses the modern defaults once exportSettings is present at all", () => {
+    expect(resolveExportSettings({ exportSettings: {} })).toEqual(
+      DEFAULT_EXPORT_SETTINGS,
+    );
+  });
+
+  it("repairs an illegal stored combination rather than trusting it", () => {
+    const settings = resolveExportSettings({
+      exportSettings: { videoCodec: "vp9", container: "mp4", audioCodec: "aac" },
+    });
+    expect(settings.container).toBe("webm");
+    expect(settings.audioCodec).toBe("opus");
+  });
+});
+
+describe("videoOutputArgs", () => {
+  it("emits a CRF and no bitrate in constant-quality mode", () => {
+    const args = videoOutputArgs(
+      normalizeExportSettings({ videoCodec: "h264", qualityMode: "crf", crf: 20 }),
+    );
+    expect(args.slice(0, 2)).toEqual(["-c:v", "libx264"]);
+    expect(valueOf(args, "-crf")).toBe("20");
+    expect(args).not.toContain("-b:v");
+    expect(valueOf(args, "-preset")).toBe("medium");
+    expect(valueOf(args, "-pix_fmt")).toBe("yuv420p");
+  });
+
+  it("emits a bitrate and no CRF in target-bitrate mode", () => {
+    const args = videoOutputArgs(
+      normalizeExportSettings({
+        videoCodec: "h264",
+        qualityMode: "bitrate",
+        videoBitrate: 8000,
+      }),
+    );
+    expect(valueOf(args, "-b:v")).toBe("8000k");
+    expect(args).not.toContain("-crf");
+  });
+
+  it("tags H.265 as hvc1 so QuickTime will play it", () => {
+    const mp4 = videoOutputArgs(
+      normalizeExportSettings({ videoCodec: "h265", container: "mp4" }),
+    );
+    expect(mp4.slice(0, 2)).toEqual(["-c:v", "libx265"]);
+    expect(valueOf(mp4, "-tag:v")).toBe("hvc1");
+
+    const mov = videoOutputArgs(
+      normalizeExportSettings({ videoCodec: "h265", container: "mov" }),
+    );
+    expect(valueOf(mov, "-tag:v")).toBe("hvc1");
+  });
+
+  it("never tags a codec that is not H.265", () => {
+    const args = videoOutputArgs(normalizeExportSettings({ videoCodec: "h264" }));
+    expect(args).not.toContain("-tag:v");
+  });
+
+  it("pins VP9's bitrate to zero so -crf stays constant quality", () => {
+    const args = videoOutputArgs(
+      normalizeExportSettings({
+        videoCodec: "vp9",
+        qualityMode: "crf",
+        crf: 31,
+        preset: "medium",
+      }),
+    );
+    expect(args.slice(0, 2)).toEqual(["-c:v", "libvpx-vp9"]);
+    expect(valueOf(args, "-crf")).toBe("31");
+    expect(valueOf(args, "-b:v")).toBe("0");
+    // libvpx rejects -preset outright; the same axis is -cpu-used.
+    expect(args).not.toContain("-preset");
+    expect(valueOf(args, "-cpu-used")).toBe("3");
+    expect(valueOf(args, "-deadline")).toBe("good");
+  });
+
+  it("gives ProRes a profile and no rate control at all", () => {
+    const args = videoOutputArgs(
+      normalizeExportSettings({ videoCodec: "prores", proresProfile: 3 }),
+    );
+    expect(args.slice(0, 2)).toEqual(["-c:v", "prores_ks"]);
+    expect(valueOf(args, "-profile:v")).toBe("3");
+    expect(args).not.toContain("-crf");
+    expect(args).not.toContain("-b:v");
+    expect(args).not.toContain("-preset");
+  });
+
+  it("picks a ProRes pixel format that can carry alpha only when the profile can", () => {
+    expect(
+      pixelFormatFor(
+        normalizeExportSettings({ videoCodec: "prores", proresProfile: 3 }),
+      ),
+    ).toBe("yuv422p10le");
+    expect(
+      pixelFormatFor(
+        normalizeExportSettings({ videoCodec: "prores", proresProfile: 4 }),
+      ),
+    ).toBe("yuva444p10le");
+    expect(
+      pixelFormatFor(
+        normalizeExportSettings({ videoCodec: "prores", proresProfile: 5 }),
+      ),
+    ).toBe("yuva444p10le");
+  });
+});
+
+describe("audioOutputArgs", () => {
+  it("carries codec, bitrate, sample rate and channels", () => {
+    const args = audioOutputArgs(
+      normalizeExportSettings({
+        audioCodec: "aac",
+        audioBitrate: 192,
+        sampleRate: 48000,
+        channels: 2,
+      }),
+    );
+    expect(args).toEqual([
+      "-c:a",
+      "aac",
+      "-b:a",
+      "192k",
+      "-ar",
+      "48000",
+      "-ac",
+      "2",
+    ]);
+  });
+
+  it("omits the bitrate for PCM, which is uncompressed", () => {
+    const args = audioOutputArgs(
+      normalizeExportSettings({
+        videoCodec: "prores",
+        audioCodec: "pcm_s16le",
+      }),
+    );
+    expect(args.slice(0, 2)).toEqual(["-c:a", "pcm_s16le"]);
+    expect(args).not.toContain("-b:a");
+  });
+
+  it("uses the libopus / libvorbis encoder names for webm", () => {
+    expect(
+      audioOutputArgs(
+        normalizeExportSettings({ videoCodec: "vp9", audioCodec: "opus" }),
+      ).slice(0, 2),
+    ).toEqual(["-c:a", "libopus"]);
+    expect(
+      audioOutputArgs(
+        normalizeExportSettings({ videoCodec: "vp9", audioCodec: "vorbis" }),
+      ).slice(0, 2),
+    ).toEqual(["-c:a", "libvorbis"]);
+  });
+});
+
+describe("containerOutputArgs", () => {
+  it("front-loads the moov atom for the ISOBMFF containers only", () => {
+    expect(
+      containerOutputArgs(normalizeExportSettings({ container: "mp4" })),
+    ).toEqual(["-movflags", "+faststart", "-f", "mp4"]);
+    expect(
+      containerOutputArgs(
+        normalizeExportSettings({ videoCodec: "prores", container: "mov" }),
+      ),
+    ).toEqual(["-movflags", "+faststart", "-f", "mov"]);
+    expect(
+      containerOutputArgs(normalizeExportSettings({ videoCodec: "vp9" })),
+    ).toEqual(["-f", "webm"]);
+  });
+});
+
+describe("GIF output", () => {
+  const gif = (patch: object = {}) => normalizeExportSettings({ videoCodec: "gif", ...patch });
+
+  it("hands the palette's frames to the GIF encoder with no rate control", () => {
+    expect(videoOutputArgs(gif())).toEqual(["-c:v", "gif"]);
+    expect(videoOutputArgs(gif({ hardwareAccel: true }), { platform: "darwin", arch: "arm64" })).toEqual([
+      "-c:v",
+      "gif",
+    ]);
+  });
+
+  it("loops forever", () => {
+    expect(containerOutputArgs(gif())).toEqual(["-loop", "0", "-f", "gif"]);
+  });
+
+  it("never plays faster than the project, nor grows wider than its frames", () => {
+    const slow = gifPlan(gif({ gifFps: 50 }), { fps: 24, size: { w: 1920, h: 1080 }, durationSec: 2 });
+    expect(slow.fps).toBe(24);
+    const small = gifPlan(gif({ gifWidth: 1280 }), { fps: 30, size: { w: 640, h: 360 }, durationSec: 2 });
+    expect(small.size).toEqual({ w: 640, h: 360 });
+    const original = gifPlan(gif({ gifWidth: 0 }), { fps: 30, size: { w: 1080, h: 1920 }, durationSec: 2 });
+    expect(original.size).toEqual({ w: 1080, h: 1920 });
+  });
+
+  it("keeps the frame's shape when it shrinks it", () => {
+    const plan = gifPlan(gif({ gifWidth: 480 }), { fps: 30, size: { w: 1920, h: 1080 }, durationSec: 2 });
+    expect(plan.size).toEqual({ w: 480, h: 270 });
+    const portrait = gifPlan(gif({ gifWidth: 320 }), { fps: 30, size: { w: 1080, h: 1920 }, durationSec: 2 });
+    expect(portrait.size).toEqual({ w: 320, h: 569 });
+  });
+
+  it("uses one palette while the frames fit the budget, and one per frame after", () => {
+    const short = gifPlan(gif(), { fps: 30, size: { w: 1920, h: 1080 }, durationSec: 10 });
+    expect(short.globalPalette).toBe(true);
+    // 480x270 at 15 fps is 518,400 bytes a frame: the budget holds about 1,035.
+    const frameBytes = 480 * 270 * 4;
+    const longest = Math.floor(GIF_PALETTE_BUDGET_BYTES / frameBytes / 15);
+    expect(gifPlan(gif(), { fps: 30, size: { w: 1920, h: 1080 }, durationSec: longest }).globalPalette).toBe(true);
+    expect(gifPlan(gif(), { fps: 30, size: { w: 1920, h: 1080 }, durationSec: longest + 1 }).globalPalette).toBe(false);
+    // With no frame size to count, it cannot know, and streams.
+    expect(gifPlan(gif(), { fps: 30, size: null, durationSec: 1 }).globalPalette).toBe(false);
+  });
+
+  it("builds the palette after the resample and the resize", () => {
+    const graph = gifFilterGraph(
+      gifPlan(gif(), { fps: 30, size: { w: 1920, h: 1080 }, durationSec: 5 }),
+    );
+    expect(graph).toBe(
+      "[0:v]fps=15,scale=480:270:flags=lanczos,split[gifa][gifb];" +
+        "[gifa]palettegen=reserve_transparent=0[gifp];" +
+        "[gifb][gifp]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle[vout]",
+    );
+    const streamed = gifFilterGraph(
+      gifPlan(gif(), { fps: 30, size: { w: 1920, h: 1080 }, durationSec: 100_000 }),
+    );
+    expect(streamed).toContain("palettegen=reserve_transparent=0:stats_mode=single");
+    expect(streamed).toContain("diff_mode=rectangle:new=1[vout]");
+  });
+});

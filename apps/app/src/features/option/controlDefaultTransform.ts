@@ -1,0 +1,604 @@
+// position, rotation, opacity, scale, width, height
+import { LitElement, PropertyValues, html } from "lit";
+import { customElement, property } from "lit/decorators.js";
+import { ITimelineStore, useTimelineStore } from "../../states/timelineStore";
+import { LocaleController } from "../../controllers/locale";
+import {
+  sampleTrack,
+  sampleTrackXY,
+} from "../animation/keyframes";
+import { addKeyframe } from "../animation/keyframeOps";
+import { fromDisplay, toDisplay } from "../animation/propertyUnits";
+import { projectBakeHz } from "../editor/frameRate";
+import { setIn } from "../../utils/immutable";
+import { GestureCommit } from "./gestureCommit";
+import { section } from "./optionKit";
+import { withFittedTextHeights } from "../element/textFit";
+import { scaleTenthsOf, setClipScale } from "../timeline/scaleOps";
+import type { TimelineDocument } from "../timeline/tracks";
+import type { AnimatableProperty } from "../../@types/timeline";
+import "./controlKeyframeNav";
+import "../filter/backgroundRemove";
+import "./controlParent";
+
+@customElement("default-transform")
+export class OptionImage extends LitElement {
+  private lc = new LocaleController(this);
+  /** Coalesces a spinner scrub into a single undo step. */
+  private gesture = new GestureCommit();
+
+  @property()
+  elementId;
+
+  @property()
+  timeline;
+
+  @property()
+  timelineCursor;
+
+  @property()
+  timelineState;
+
+  @property()
+  isShow;
+
+  createRenderRoot() {
+    useTimelineStore.subscribe((state) => {
+      if (this.isExistElement(this.targetId) && this.isShow) {
+        this.updateValue();
+      }
+    });
+
+    // A spinner drag abandoned with Escape. `onCancel` bubbles, so one listener
+    // covers every field in the panel — and cancelling is the only correct
+    // answer: the gesture has been previewing into the store, and on an
+    // animated property its first move already wrote a keyframe at the
+    // playhead. `GestureCommit.cancel` puts the whole pre-gesture document
+    // back and records no history; writing the old number back would instead
+    // read as an edit and leave that keyframe behind.
+    this.addEventListener("onCancel", () => this.gesture.cancel());
+
+    return this;
+  }
+
+  constructor() {
+    super();
+  }
+
+  /**
+   * The clip these fields act on.
+   *
+   * Two shapes arrive on `elementId`. `option-image`, `option-video`,
+   * `option-shape` and `option-groupelement` pass a bare id; `option-text`
+   * passes the whole selection as an array, because
+   * `elementTimelineCanvas.showSideOption` routes *every* text selection —
+   * single included — through `showOptions`.
+   *
+   * A one-element array used to work by accident: `timeline[["a"]]` coerces the
+   * key to `"a"`. A two-element one becomes `"a,b"`, which names nothing, so
+   * `updateValue` was skipped and every handler below declined in silence.
+   * Normalising once, here, is what makes the "single-element only" contract
+   * `controlParent.ts` states true rather than accidental.
+   *
+   * Empty means nothing is selected, the same sentinel `parent-select` uses.
+   * `timeline[""]` is undefined, so every `isExistElement` and `element == null`
+   * guard below already reads it as "no clip" — and a `string` keeps it out of
+   * the computed keys and index expressions those guards protect.
+   */
+  private get targetId(): string {
+    const id: any = this.elementId;
+    return (Array.isArray(id) ? id[0] : id) ?? "";
+  }
+
+  /**
+   * Re-read the fields when the panel is pointed at a different clip.
+   *
+   * `updateValue` is the only thing that writes these inputs, and its other
+   * caller is a *timeline store* subscription — but selecting a clip changes
+   * `selectionStore`, which that subscription never hears. The one notification
+   * a click does produce is `setCursorType("pointer")` at the top of
+   * `elementTimelineCanvas._handleMouseDown`, and it fires *before*
+   * `showSideOption` swaps `elementId`, so it refreshes the boxes with the
+   * outgoing clip's numbers.
+   *
+   * The result was a panel showing the previously selected clip's position while
+   * a new one was selected — most visible right after a duplicate, where the
+   * copy starts at the original's coordinates and the two look linked.
+   *
+   * `optionText.resetValue` already does exactly this for the font fields; this
+   * is the missing half of it. Runs after render, so the inputs exist.
+   */
+  updated(changed: PropertyValues) {
+    if (!changed.has("elementId") && !changed.has("isShow")) {
+      return;
+    }
+    if (this.isExistElement(this.targetId) && this.isShow) {
+      this.updateValue();
+    }
+  }
+
+  /**
+   * One named value: its name, its boxes, and its stopwatch.
+   *
+   * The boxes stay `<number-input>`, which is the one widget in the inspector
+   * that says "this value scrubs" by being a blue draggable number, and whose
+   * `aria-event` is how `updateValue` and every handler below find it. Only the
+   * frame around them is the panel's own.
+   */
+  private row(
+    label: string,
+    inputs: unknown,
+    property: AnimatableProperty,
+  ) {
+    return html`
+      <div class="opt-field">
+        <div class="opt-row">
+          <label class="opt-label" title=${label}>${label}</label>
+          <div class="opt-row-controls">
+            ${inputs}
+            <control-keyframe-nav
+              .elementId=${this.targetId}
+              .property=${property}
+              .label=${property}
+            ></control-keyframe-nav>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  render() {
+    // Position, Size, Scale, Opacity and Rotation are one section, in the order
+    // the transform composes rather than in five stacked cards: they are the
+    // same act on the same box, and five heads saying one word each would be
+    // more frame than content.
+    //
+    // `parent-select` stays above it and draws a section of its own, because
+    // the parent decides which space every number below is written in. It
+    // renders nothing at all when there is no group to pick, so a project that
+    // has never made one sees one card here.
+    return html`
+      <parent-select
+        .elementId=${this.targetId}
+        .isShow=${this.isShow}
+      ></parent-select>
+
+      ${section({
+        title: "Transform",
+        body: html`
+          ${this.row(
+            this.lc.t("setting.position"),
+            html`
+              <number-input
+                aria-event="location-x"
+                @onChange=${this.handleLocation}
+                value="0"
+                step="1"
+                sensitivity="1"
+              ></number-input>
+              <number-input
+                aria-event="location-y"
+                @onChange=${this.handleLocation}
+                value="0"
+                step="1"
+                sensitivity="1"
+              ></number-input>
+            `,
+            "position",
+          )}
+          ${this.row(
+            "Size",
+            html`
+              <number-input
+                aria-event="width"
+                @onChange=${this.handleSize}
+                value="10"
+                step="1"
+                sensitivity="1"
+              ></number-input>
+              <number-input
+                aria-event="height"
+                @onChange=${this.handleSize}
+                value="10"
+                step="1"
+                sensitivity="1"
+              ></number-input>
+            `,
+            "size",
+          )}
+          ${
+            // Next to Size, because the two are the pair most easily mistaken
+            // for one another and reading them together is what makes the
+            // difference legible: Size is the clip's own pixels, Scale
+            // magnifies whatever those are about the centre.
+            //
+            // Shown in percent, stored in tenths. The number input knows
+            // nothing of either; getScale and handleScale are the whole
+            // conversion, and both go through animation/propertyUnits.ts so
+            // this row and the curve editor's ruler cannot drift apart.
+            //
+            // No max, the way Rotation has none. The floor is zero because a
+            // negative factor mirrors rather than shrinks, which
+            // timeline/mirrorOps.ts owns.
+            this.row(
+              "Scale",
+              html`<number-input
+                aria-event="scale"
+                @onChange=${this.handleScale}
+                value="100"
+                min="0"
+                step="1"
+                sensitivity="0.5"
+              ></number-input>`,
+              "scale",
+            )
+          }
+          ${this.row(
+            this.lc.t("setting.opacity"),
+            html`<number-input
+              aria-event="opacity"
+              @onChange=${this.handleOpacity}
+              value="100"
+              min="0"
+              max="100"
+            ></number-input>`,
+            "opacity",
+          )}
+          ${this.row(
+            "Rotation",
+            html`<number-input
+              aria-event="rotation"
+              @onChange=${this.handleRotation}
+              value="0"
+              sensitivity="0.5"
+            ></number-input>`,
+            "rotation",
+          )}
+        `,
+      })}
+    `;
+  }
+
+  isExistElement(elementId) {
+    // Guarded now that `updated` calls this too: that runs on the first render,
+    // which can land before the parent has bound `timeline`. An empty id — the
+    // "nothing selected" sentinel — falls out on its own, since no clip is
+    // filed under it.
+    return this.timeline?.hasOwnProperty(elementId) === true;
+  }
+
+  updateValue() {
+    const xDom: any = this.querySelector(
+      "number-input[aria-event='location-x'",
+    );
+    const yDom: any = this.querySelector(
+      "number-input[aria-event='location-y'",
+    );
+    const opacityDom: any = this.querySelector(
+      "number-input[aria-event='opacity'",
+    );
+    const rotationDom: any = this.querySelector(
+      "number-input[aria-event='rotation'",
+    );
+    const width: any = this.querySelector("number-input[aria-event='width'");
+    const height: any = this.querySelector("number-input[aria-event='height'");
+    const scaleDom: any = this.querySelector("number-input[aria-event='scale'");
+
+    const position = this.getPosition();
+    const opacity = this.getOpacity();
+    const rotation = this.getRotation();
+
+    xDom.value = position.x;
+    yDom.value = position.y;
+    opacityDom.value = opacity.x;
+    rotationDom.value = rotation.x;
+    const size = this.getSize();
+    width.value = size.x;
+    height.value = size.y;
+    scaleDom.value = this.getScale().x;
+  }
+
+  /**
+   * The value a property shows right now, animated or not.
+   *
+   * These six methods used to carry their own copy of the nearest-neighbour
+   * scan, plus a dead `index`/`indexToMs`/`indexPoint` triple copied from the
+   * renderer's sampler, plus a `try`/`catch` swallowing whatever went wrong.
+   * The copy also read `ax || location.x`, so an animated value of exactly 0 —
+   * the left edge, fully transparent, no rotation — was falsy and silently
+   * showed the static value instead. `sampleTrack` uses `??`.
+   */
+  private track(animationType: string) {
+    return this.timeline?.[this.targetId]?.animation?.[animationType];
+  }
+
+  private isAnimated(animationType: string): boolean {
+    return this.track(animationType)?.isActivate === true;
+  }
+
+  getOpacity() {
+    const fallback = this.timeline[this.targetId].opacity;
+    if (!this.isAnimated("opacity")) {
+      return { x: fallback };
+    }
+    return {
+      x: sampleTrack(
+        this.track("opacity"),
+        this.timeline[this.targetId].startTime,
+        this.timelineCursor,
+        fallback,
+      ),
+    };
+  }
+
+  getRotation() {
+    const fallback = this.timeline[this.targetId].rotation;
+    if (!this.isAnimated("rotation")) {
+      return { x: fallback };
+    }
+    return {
+      x: sampleTrack(
+        this.track("rotation"),
+        this.timeline[this.targetId].startTime,
+        this.timelineCursor,
+        fallback,
+      ),
+    };
+  }
+
+  /**
+   * The magnification the box shows, in percent.
+   *
+   * The stored unit is tenths and the shown unit is not, so this is the one
+   * getter that converts. It converts *after* sampling, not before: the track
+   * and the static field are both in tenths, so mixing the two in display units
+   * would need the fallback converted too and would put the factor of ten in
+   * two places instead of one.
+   */
+  getScale() {
+    const element = this.timeline[this.targetId];
+    const fallback = scaleTenthsOf(element);
+    const tenths = this.isAnimated("scale")
+      ? sampleTrack(
+          this.track("scale"),
+          element.startTime,
+          this.timelineCursor,
+          fallback,
+        )
+      : fallback;
+    return { x: toDisplay("scale", tenths) };
+  }
+
+  getPosition() {
+    const location = this.timeline[this.targetId].location ?? { x: 0, y: 0 };
+    if (!this.isAnimated("position")) {
+      return { x: location.x, y: location.y };
+    }
+    return sampleTrackXY(
+      this.track("position"),
+      this.timeline[this.targetId].startTime,
+      this.timelineCursor,
+      location.x,
+      location.y,
+    );
+  }
+
+  getSize() {
+    const element = this.timeline[this.targetId];
+    if (!this.isAnimated("size")) {
+      return { x: element.width, y: element.height };
+    }
+    // The number in the box is the number on the canvas. Showing the static
+    // field while a track drives the picture is how the panel ends up
+    // disagreeing with the preview, and then a scrub of the spinner writes a
+    // keyframe carrying a value the user never saw.
+    return sampleTrackXY(
+      this.track("size"),
+      element.startTime,
+      this.timelineCursor,
+      element.width,
+      element.height,
+    );
+  }
+
+  /**
+   * Commit a value change from a number input as one undo step.
+   *
+   * The static field and, when the property is animated, the keyframe at the
+   * playhead move together, and the whole scrub of the spinner is one step.
+   * `number-input` fires `onChange` on every mousemove, so committing per event
+   * would evict the entire undo stack on a single drag; `GestureCommit`
+   * previews until the gesture settles and then records once.
+   *
+   * The four handlers below used to do neither — they assigned straight into
+   * the store snapshot and called `patchTimeline`, which records no history at
+   * all and, because history entries share their nested objects, rewrote the
+   * past as well.
+   *
+   * `ops` is the third way to write, for a field `setIn` cannot express. It
+   * runs last, after the statics, and it is how `scale` reaches the document:
+   * unscaled deletes the key rather than storing 10, which needs the element
+   * rebuilt rather than a path assigned. Routing it through the pure op also
+   * keeps the clamp and the decline-by-identity in one place rather than
+   * restating them here, the same argument `keyframeOps.withStaticValue` makes
+   * for the mask and the reveal.
+   */
+  private commitValue(
+    statics: Array<{ path: string[]; value: any }>,
+    keyframes: Array<{ animationType: AnimatableProperty; lane: 0 | 1; value: number }> = [],
+    ops: Array<(doc: TimelineDocument) => TimelineDocument> = [],
+  ) {
+    const elementId = this.targetId;
+    const element = this.timeline?.[elementId];
+    if (element == null) {
+      return;
+    }
+    const atMs = this.timelineCursor - element.startTime;
+    // `projectBakeHz()`, not the op's 60Hz default: a baked lane is a cache read by
+    // nearest sample, so one written coarser than the project's rate hands
+    // consecutive frames the same value and the curve steps. See
+    // `keyframes.ts#bakeRateFor`.
+    const bakeHz = projectBakeHz();
+
+    this.gesture.apply((doc) => {
+      let next = doc;
+
+      for (const { animationType, lane, value } of keyframes) {
+        if (next.elements[elementId]?.["animation"]?.[animationType]?.isActivate !== true) {
+          continue;
+        }
+        next = addKeyframe(
+          next,
+          elementId,
+          animationType,
+          lane === 1 ? "y" : "x",
+          atMs,
+          value,
+          undefined,
+          bakeHz,
+        );
+      }
+
+      for (const { path, value } of statics) {
+        const current = next.elements[elementId];
+        if (current == null) {
+          continue;
+        }
+        next = {
+          ...next,
+          elements: {
+            ...next.elements,
+            [elementId]: setIn(current, path, value),
+          },
+        };
+      }
+
+      for (const op of ops) {
+        next = op(next);
+      }
+
+      return next;
+    });
+  }
+
+  handleLocation() {
+    const xDom: any = this.querySelector(
+      "number-input[aria-event='location-x'",
+    );
+    const yDom: any = this.querySelector(
+      "number-input[aria-event='location-y'",
+    );
+
+    const x = parseFloat(parseFloat(xDom.value).toFixed(2));
+    const y = parseFloat(parseFloat(yDom.value).toFixed(2));
+    if (!Number.isFinite(x) || !Number.isFinite(y)) {
+      return;
+    }
+
+    this.commitValue(
+      [{ path: ["location"], value: { x, y } }],
+      [
+        { animationType: "position", lane: 0, value: x },
+        { animationType: "position", lane: 1, value: y },
+      ],
+    );
+  }
+
+  handleOpacity() {
+    const dom: any = this.querySelector("number-input[aria-event='opacity'");
+    // Two decimals, the way `handleLocation` and `handleSize` round — not
+    // `parseInt`. The spinner scrubs in tenths and the box shows two places,
+    // so truncating here stored a number the panel was not showing: a drag to
+    // 45.3 displayed 45.30 and wrote 45.
+    const opacity = parseFloat(parseFloat(dom.value).toFixed(2));
+    if (!Number.isFinite(opacity)) {
+      return;
+    }
+    this.commitValue(
+      [{ path: ["opacity"], value: opacity }],
+      [{ animationType: "opacity", lane: 0, value: opacity }],
+    );
+  }
+
+  handleScale() {
+    const dom: any = this.querySelector("number-input[aria-event='scale'");
+    // Rounded in the unit the user is looking at, then converted: the other
+    // order rounds tenths to two places and throws away the third decimal the
+    // percent box can show.
+    const percent = parseFloat(parseFloat(dom.value).toFixed(2));
+    if (!Number.isFinite(percent)) {
+      return;
+    }
+    const tenths = fromDisplay("scale", percent);
+    const elementId = this.targetId;
+    // No static entry: `scale` is written by the op, not by `setIn`. And no
+    // `withFittedTextHeights` either, unlike `handleSize`: a scale does not
+    // touch the box, so a text clip's wrapping width is unchanged and there is
+    // nothing to re-fit.
+    this.commitValue(
+      [],
+      [{ animationType: "scale", lane: 0, value: tenths }],
+      [(doc) => setClipScale(doc, elementId, tenths)],
+    );
+  }
+
+  handleRotation() {
+    const dom = this.querySelector(
+      "number-input[aria-event='rotation'",
+    ) as any;
+    const rotation = parseFloat(parseFloat(dom.value).toFixed(2));
+    if (!Number.isFinite(rotation)) {
+      return;
+    }
+    this.commitValue(
+      [{ path: ["rotation"], value: rotation }],
+      [{ animationType: "rotation", lane: 0, value: rotation }],
+    );
+  }
+
+  handleSize() {
+    const width: any = this.querySelector("number-input[aria-event='width'");
+    const height: any = this.querySelector("number-input[aria-event='height'");
+
+    // Rounded the way `handleLocation` rounds, and now for a second reason:
+    // with `size` animated these fields show a *sampled* value, and a baked
+    // sample is a float — committing `249.99999999999997` straight back would
+    // write that into the keyframe the user is standing on.
+    const w = parseFloat(parseFloat(width.value).toFixed(2));
+    const h = parseFloat(parseFloat(height.value).toFixed(2));
+    if (!Number.isFinite(w) || !Number.isFinite(h)) {
+      return;
+    }
+
+    // Both fields are written on every change — this handler cannot tell which
+    // one the user touched, so it compares against what is stored.
+    const widthChanged = this.timeline?.[this.targetId]?.width !== w;
+
+    // The static box and, when `size` is animated, the keyframe at the
+    // playhead, as one undo step — exactly what `handleLocation` does for
+    // `position`. `commitValue` writes the keyframes only where the track is
+    // active, so a clip nobody has animated takes the same path it always did.
+    this.commitValue(
+      [
+        { path: ["width"], value: w },
+        { path: ["height"], value: h },
+      ],
+      [
+        { animationType: "size", lane: 0, value: w },
+        { animationType: "size", lane: 1, value: h },
+      ],
+    );
+
+    // A text clip's width is its wrapping width, so changing it changes how
+    // many lines there are and the box has to be re-measured. A typed *height*
+    // is left exactly as typed: it holds until the next edit that moves the
+    // text, which is how an auto-sizing text box behaves everywhere else.
+    //
+    // `withFittedTextHeights` declines on its own for a clip whose height the
+    // size track owns, so there is no second condition here.
+    if (widthChanged) {
+      const elementId = this.targetId;
+      this.gesture.apply((doc) => withFittedTextHeights(doc, [elementId]));
+    }
+  }
+}

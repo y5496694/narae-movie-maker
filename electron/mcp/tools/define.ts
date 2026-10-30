@@ -1,0 +1,436 @@
+/**
+ * The scaffolding every tool module shares.
+ *
+ * Two constraints shape this file, and both are load-bearing.
+ *
+ * **`registerTool`'s generics must stay erased.** `McpServer.registerTool`
+ * infers the argument type of the handler from the zod shape, through the SDK's
+ * zod-3/zod-4 compatibility layer. That inference is pathological here: a
+ * *single* call costs about ten seconds of `tsc` and reports TS2589, and
+ * seventeen of them exhaust the compiler's heap outright. Measured, not guessed
+ * — erasing it takes the file from an out-of-memory crash to roughly a second.
+ *
+ * Nothing is lost at runtime: zod still validates every call, and the schema
+ * the agent sees is unchanged. What goes away is a compile-time echo of a
+ * guarantee that is enforced at the boundary anyway.
+ *
+ * The cast now lives in exactly one place instead of being a convention that
+ * every tool module has to remember. A module receives `Registrar` as a
+ * parameter type and *cannot* reintroduce the inference by accident.
+ *
+ * Two rules for anyone adding a tool module:
+ *
+ *  - Never annotate a handler parameter, and never let a `z.infer` reach a
+ *    handler signature.
+ *  - Avoid `z.discriminatedUnion` and deep `z.union` in tool shapes — that is
+ *    the other known TS2589 generator on this path. Prefer a flat object with
+ *    optional fields, and validate the combination in the handler.
+ */
+
+import { z } from "zod";
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+
+/** Tool results go back as compact JSON text: no indentation to pay for. */
+export function json(value: unknown) {
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(value) }],
+  };
+}
+
+export function failure(error: unknown) {
+  return {
+    isError: true,
+    content: [
+      {
+        type: "text" as const,
+        text: error instanceof Error ? error.message : String(error),
+      },
+    ],
+  };
+}
+
+/**
+ * Wrap a handler so a thrown error reaches the agent as text it can act on.
+ *
+ * Untyped on purpose — see the header. zod has already validated by the time a
+ * handler runs, so an inferred type would be describing a guarantee that is
+ * enforced elsewhere.
+ */
+export function tool(run: (args: any) => Promise<unknown> | unknown) {
+  return async (args: any) => {
+    try {
+      return json(await run(args));
+    } catch (error) {
+      return failure(error);
+    }
+  };
+}
+
+export const readOnly = { readOnlyHint: true, openWorldHint: false } as const;
+export const mutating = { readOnlyHint: false, openWorldHint: false } as const;
+export const destructive = {
+  readOnlyHint: false,
+  openWorldHint: false,
+  destructiveHint: true,
+} as const;
+
+export type ToolShape = Record<string, z.ZodTypeAny>;
+
+export type ToolConfig = {
+  title?: string;
+  description?: string;
+  inputSchema?: ToolShape;
+  annotations?: Record<string, boolean>;
+};
+
+export type Registrar = (
+  name: string,
+  config: ToolConfig,
+  handler: (args: any) => Promise<unknown>,
+) => void;
+
+/** The one place the generics are erased. */
+export function defineRegistrar(server: McpServer): Registrar {
+  return server.registerTool.bind(server) as unknown as Registrar;
+}
+
+// ------------------------------------------------------------ shared shapes
+
+/**
+ * A program written on the spot: an effect, a transition or a graphic that is
+ * not an installed preset.
+ *
+ * Flat rather than a discriminated union on `render.type`, per this file's
+ * header. The renderer validates the combination (`fx/inlineProgram.ts`), and
+ * says exactly which field is wrong, which a union's error would not.
+ */
+export const programField = z
+  .object({
+    kind: z.enum(["effect", "transition", "graphic"]),
+    name: z.string().min(1).max(80),
+    category: z.string().optional(),
+    render: z.object({
+      type: z.enum(["shader", "html"]),
+      fragment: z
+        .string()
+        .max(512 * 1024)
+        .optional()
+        .describe(
+          "shader: GLSL defining `vec4 effect(vec2 uv)`, `vec4 transition(vec2 uv)` or `vec4 graphic(vec2 uv)`. " +
+            "Declare a `uniform` for every parameter yourself.",
+        ),
+      passes: z
+        .array(
+          z.object({
+            fragment: z.string().max(512 * 1024),
+            constants: z.record(z.any()).optional(),
+          }),
+        )
+        .max(7)
+        .optional()
+        .describe("shader, effects only: steps run before `fragment`, which reads the last one as `source`."),
+      html: z.string().max(512 * 1024).optional().describe("html: a body fragment, no <html> or <body>."),
+      css: z.string().max(512 * 1024).optional(),
+      layout: z.enum(["reflow", "scale"]).optional(),
+      designSize: z
+        .object({
+          width: z.number().int().min(1).max(8192),
+          height: z.number().int().min(1).max(8192),
+        })
+        .optional(),
+      bleed: z.number().min(0).max(4096).optional(),
+      bindings: z.record(z.string()).optional(),
+    }),
+    params: z
+      .array(z.record(z.any()))
+      .max(32)
+      .optional()
+      .describe(
+        "Each { key, label, type, default, ... }: number (min, max, step), color (#rrggbb), bool, " +
+          "select (options), point ([x,y], min, max); text and font for html. Shader parameters also name " +
+          "their `uniform`.",
+      ),
+    assets: z
+      .record(z.string())
+      .optional()
+      .describe('File name to absolute path, e.g. {"photo.png": "/Users/me/photo.png"}. Used as asset:photo.png.'),
+  })
+  .describe("A program to carry on the clip instead of an installed preset. check_program first.");
+
+export const timeRange = z.object({
+  startMs: z.number().describe("Start of the range, in timeline milliseconds."),
+  endMs: z.number().describe("End of the range, exclusive."),
+});
+
+export const subtitleStyle = z
+  .object({
+    fontsize: z.number().optional(),
+    textcolor: z.string().optional().describe('Hex, e.g. "#ffffff".'),
+    align: z.enum(["left", "center", "right"]).optional(),
+    background: z.boolean().optional().describe("Draw a box behind the text."),
+    locationX: z.number().optional(),
+    locationY: z.number().optional(),
+    width: z.number().optional(),
+    height: z.number().optional(),
+  })
+  .optional()
+  .describe(
+    "Omit for a lower-third caption sized to the project's own resolution.",
+  );
+
+/**
+ * The one sentence the whole track surface depends on, written once.
+ *
+ * An agent that has not read it reaches for `update_clip` to bring a title
+ * forward and is refused, or reasons about a caption it cannot see without the
+ * fact that would explain it. It is repeated into several descriptions on
+ * purpose: a tool is read on its own, not alongside its siblings.
+ */
+export const Z_ORDER_NOTE =
+  "Tracks read top row first: index 0 is the front of the composite, the last row is the back. " +
+  "A clip's layer is its track — move_track changes it, update_clip cannot.";
+
+export const trackIdField = z
+  .string()
+  .describe("A track id from get_project_overview.");
+
+/**
+ * Every element type the timeline can hold, for filters and enums.
+ *
+ * `transition` and `effect` are in it. They were not, so `list_clips` could not
+ * even be asked for them — while returning them anyway, because nothing
+ * filtered them out. A filter that cannot name half of what it returns is worse
+ * than no filter.
+ */
+export const FILETYPES = [
+  "video",
+  "image",
+  "gif",
+  "shape",
+  "text",
+  "audio",
+  "group",
+  "transition",
+  "effect",
+  "template",
+  "graphic",
+] as const;
+
+/**
+ * How a clip can be composited with what is beneath it.
+ *
+ * A copy of `@types/timeline.ts`'s `BLEND_MODES`, for the same reason
+ * `ANIMATABLE` and `PRESETS` are copies: `.tsconfig` pins `rootDir` to
+ * `electron/`, so nothing here can import from `apps/app/src`.
+ * `tools.test.ts` asserts the two against each other, so drift is a failing
+ * test rather than a mode the schema advertises and the compositor ignores —
+ * which is the failure mode that matters here, because an unknown value
+ * assigned to `globalCompositeOperation` does not throw.
+ */
+export const BLEND_MODES = [
+  "source-over",
+  "darken",
+  "multiply",
+  "color-burn",
+  "lighten",
+  "screen",
+  "color-dodge",
+  "lighter",
+  "overlay",
+  "soft-light",
+  "hard-light",
+  "difference",
+  "exclusion",
+  "hue",
+  "saturation",
+  "color",
+  "luminosity",
+] as const;
+
+/**
+ * The properties that carry a keyframe track.
+ *
+ * Another copy, for the `rootDir` reason above, and `tools.test.ts` pins it
+ * against `@types/timeline.ts#AnimatableProperty` so drift is a failing test.
+ * That matters here in a way it does not for a preset name: `get_clip` reports
+ * whichever tracks a clip carries, so an enum narrower than the union would
+ * *advertise* a property in one tool's output and *reject* it in another's
+ * input — a surface an agent can only discover by being refused.
+ *
+ * The five `mask*` entries only exist on a clip that has a mask,
+ * `revealProgress` only on a text clip that has a reveal, `volumeDb` only on a
+ * clip that makes a sound, and `cornerRadius` only on an image or a video;
+ * `animatableProperties` is the gate, and the commands decline through it.
+ */
+export const ANIMATABLE = [
+  "position",
+  "opacity",
+  "scale",
+  "rotation",
+  "size",
+  "maskPosition",
+  "maskSize",
+  "maskRotation",
+  "maskFeather",
+  "maskRoundness",
+  "revealProgress",
+  "intensity",
+  "volumeDb",
+  "cornerRadius",
+] as const;
+
+/**
+ * The `property` argument of every animation tool.
+ *
+ * A union rather than the bare enum, because one family of tracks cannot be
+ * enumerated at all: an effect's preset parameters are named by a manifest on
+ * disk, so `fx:` plus a key is the only thing that can be written down here.
+ * `list_effect_presets` reports each parameter's `key`, `min` and `max`, which
+ * is where an agent learns the names.
+ *
+ * The enum branch survives into the emitted JSON schema, so the closed list is
+ * still advertised. `animatableProperties` is the real gate either way, and
+ * `commands/animation.ts#requireAnimatable` declines through it with a message
+ * naming what the clip actually offers.
+ *
+ * Shared so the four tools cannot drift, which is the same reason `ANIMATABLE`
+ * is one array rather than four literals.
+ */
+export const animatableProperty = z
+  .union([
+    z.enum(ANIMATABLE),
+    z
+      .string()
+      .regex(
+        /^fx:.+$/,
+        "An effect preset parameter: `fx:` followed by the parameter key from list_effect_presets.",
+      ),
+  ])
+  .describe(
+    "On an effect: `intensity` is 0-100, and `fx:<key>` is a preset parameter in whatever units its " +
+      "manifest declares. list_effect_presets reports each `key`, `min` and `max`. Only parameters it " +
+      "reports as `number` animate. On audio, and on video that still carries its sound, `volumeDb` " +
+      "is the level envelope in decibels, -60 to +12, where 0 is unmodified and -60 is silence. On " +
+      "an image or video, `cornerRadius` is the corner rounding in clip pixels, 0 square.",
+  );
+
+/** The mask shapes a clip can be cut to. A copy of `MASK_SHAPES`. */
+export const MASK_SHAPES = ["rectangle", "star", "heart", "pen"] as const;
+
+/**
+ * What one step of a text reveal counts.
+ *
+ * A copy of `@types/timeline.ts#REVEAL_UNITS`, for the reason every copy in
+ * this file exists: `electron/` cannot import that module. `tools.test.ts`
+ * pins the two together.
+ *
+ * There is no fourth unit and no "typewriter" among them. A typewriter is this
+ * list's `character` plus a keyframed progress, which is why `apply_typewriter`
+ * is a composite tool rather than a unit.
+ */
+export const REVEAL_UNITS = ["character", "word", "line"] as const;
+
+/**
+ * The properties a link may drive.
+ *
+ * A copy of `@types/timeline.ts`'s `LINKABLE_PROPERTIES`, for the reason every
+ * copy in this file exists: `electron/` cannot import that module.
+ * `tools.test.ts` pins the two together.
+ */
+export const LINKABLE = ["position", "opacity", "scale", "rotation"] as const;
+
+/**
+ * How a clip's border sits against the outline it traces.
+ *
+ * A copy of `@types/timeline.ts`'s `STROKE_ALIGNMENTS`, for the reason every
+ * copy in this file exists: `electron/` cannot import that module.
+ * `tools.test.ts` pins the two together.
+ */
+export const STROKE_ALIGNMENTS = ["inner", "center", "outer"] as const;
+
+/**
+ * The parametric shapes a shape clip can be generated from.
+ *
+ * A copy of `@types/timeline.ts`'s `SHAPE_GEOMETRY_KINDS`, for the reason every
+ * copy in this file exists: `electron/` cannot import that module. `tools.test.ts`
+ * pins the two together.
+ *
+ * There is no `"triangle"`: it is a `polygon` with three points, which is what
+ * makes "turn this triangle into a pentagon" one number rather than a change of
+ * kind. `add_shape` still takes the word, because that is what the create menu
+ * calls it and what every existing agent call says.
+ */
+export const SHAPE_GEOMETRY_KINDS = [
+  "rectangle",
+  "ellipse",
+  "polygon",
+  "star",
+] as const;
+
+/**
+ * The colour adjustment sliders, by stored name.
+ *
+ * A copy of `@types/timeline.ts#COLOR_ADJUSTMENT_KEYS` for the `rootDir`
+ * reason above; `tools.test.ts` asserts the two match. `set_color_adjustments`
+ * builds a *strict* schema from this list, so a key missing here is a slider
+ * an agent cannot move, and one extra is a key the editor would refuse.
+ */
+export const COLOR_ADJUSTMENTS = [
+  "temperature",
+  "tint",
+  "saturation",
+  "exposure",
+  "contrast",
+  "highlights",
+  "shadows",
+  "whites",
+  "blacks",
+  "brilliance",
+  "sharpen",
+  "clarity",
+  "particles",
+  "fade",
+  "vignette",
+] as const;
+
+/**
+ * The animation presets.
+ *
+ * A copy of `features/animation/presets.ts`'s table, and a copy on purpose:
+ * `.tsconfig` pins `rootDir` to `electron/` so nothing here can import from
+ * `apps/app/src` — the same reason `ANIMATABLE` is duplicated. `tools.test.ts`
+ * asserts the two lists against each other, so drift is a failing test rather
+ * than a preset the schema advertises and the renderer does not have.
+ */
+export const PRESETS = [
+  "fade_in",
+  "fade_out",
+  "zoom_in",
+  "zoom_out",
+  "punch_in",
+  "drift",
+  "overshoot_in",
+  "pop",
+  "slam",
+  "shake",
+  "rotate_settle",
+  "slide_in_up",
+  "slide_in_down",
+  "slide_in_left",
+  "slide_in_right",
+  "slide_out_up",
+  "slide_out_down",
+  "slide_out_left",
+  "slide_out_right",
+] as const;
+
+/** The named easing curves `add_keyframes` accepts. Copied, and pinned, as above. */
+export const EASINGS = [
+  "linear",
+  "ease_in",
+  "ease_out",
+  "ease_in_out",
+  "snap",
+  "overshoot",
+  "anticipate",
+] as const;

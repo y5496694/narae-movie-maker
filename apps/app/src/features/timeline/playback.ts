@@ -1,0 +1,620 @@
+/**
+ * What every media element should be doing right now.
+ *
+ * This is the layer that was missing. Playback decisions used to be scattered
+ * across three places that each knew only part of the picture:
+ *
+ *   - `loadedAssetStore` seeded every `<video>` once at play time from a
+ *     **snapshot** of the clip taken when the file loaded, so moving a clip
+ *     shifted its playback position by exactly the drag distance;
+ *   - `renderer/video.ts` decided audibility, but the compositor skips clips
+ *     outside their window, so its "mute me" branch never actually ran and a
+ *     clip that left the playhead kept sounding over whatever came next;
+ *   - `elementControl.showAudio` did its own arithmetic that ignored `trim`
+ *     and `speed` entirely, so a split audio clip replayed the deleted part.
+ *
+ * All three are the same question — *given the live clip and the playhead,
+ * where should this handle be, and should it be heard?* — so it is answered
+ * once, here, from the live element only. There is nowhere to put a snapshot.
+ *
+ * Pure and DOM-free: the only thing it knows about a media element is
+ * `MediaHandle`, which a plain object satisfies. That is what finally makes
+ * this layer testable under `environment: "node"`.
+ */
+
+import type { Timeline, TimelineElement } from "../../@types/timeline";
+import { isTimeInRange } from "../../utils/time";
+import { gainAt, isAudibleElement } from "./audio";
+import {
+  isDynamicElement,
+  sourceDurationOf,
+  sourceTimeAt,
+  spanOf,
+  speedOf,
+} from "./geometry";
+import { MAX_SPEED, MIN_SPEED, speedCurveOf } from "./speedCurve";
+import { sourceTimeAtFrame } from "./frames";
+import { isVisibleThroughTransition } from "./transitionWindow";
+import type { TimelineDocument } from "./tracks";
+
+/** Everything this layer touches on a `<video>` or `<audio>`. */
+export interface MediaHandle {
+  currentTime: number;
+  /**
+   * Whether a seek is still in flight.
+   *
+   * Optional because a plain object satisfies this interface in the suites, and
+   * absent reads as "not seeking" — which is what a test double that never
+   * seeks asynchronously actually is.
+   */
+  readonly seeking?: boolean;
+  /**
+   * Whether the handle has played to the end of its file.
+   *
+   * Optional for the reason `seeking` is: absent reads as "not ended".
+   */
+  readonly ended?: boolean;
+  muted: boolean;
+  /**
+   * Linear gain, 0..1 — the unit the DOM uses, **not** the element's
+   * `volumeDb`. Convert with `audio.ts#gainAt`, or `gainOf` where there is
+   * no cursor in hand.
+   */
+  volume: number;
+  playbackRate: number;
+  readonly paused: boolean;
+  play(): void;
+  pause(): void;
+}
+
+/**
+ * Where a handle's linear gain is written.
+ *
+ * A port rather than a direct assignment, and the reason is the ceiling. A
+ * level may now exceed unity, `HTMLMediaElement.volume` may not, and the extra
+ * is carried by a WebAudio `GainNode` that this module must not know about:
+ * `playback.ts` is pure and DOM-free, which is what makes it testable under
+ * `environment: "node"`, and a `new AudioContext()` reachable from here would
+ * end that.
+ *
+ * `writeVolume` below is the default and is exactly the old behaviour, capped
+ * at 1. The preview passes `features/asset/audioGraph.ts#gainSink` instead.
+ */
+export type GainSink = (handle: MediaHandle, gain: number) => void;
+
+/**
+ * The plain `handle.volume` write, capped at unity.
+ *
+ * The cap is not a rounding convenience: assigning 4 to `volume` throws in
+ * Chromium. Capping rather than throwing means a caller with no graph plays a
+ * boosted clip at unity, which is quieter than asked for and never silent.
+ * Never silent is the rule that outranks the boost.
+ */
+export function writeVolume(handle: MediaHandle, gain: number): void {
+  const capped = gain > 1 ? 1 : gain;
+  // Only write when the value actually changes: this runs on every animation
+  // frame for every loaded clip, and a media element treats each assignment as
+  // a real state change however redundant it is.
+  if (handle.volume !== capped) {
+    handle.volume = capped;
+  }
+}
+
+/**
+ * A handle that can say when a seek has finished.
+ *
+ * Assigning `currentTime` only *requests* a frame; the decoded picture arrives
+ * later, on `seeked`. Anything that paints straight after a seek paints the
+ * previous frame, so the painter needs this to come back for the real one.
+ */
+export interface SeekableHandle extends MediaHandle {
+  addEventListener(
+    type: "seeked",
+    listener: () => void,
+    options?: { once?: boolean },
+  ): void;
+}
+
+function isSeekable(handle: MediaHandle): handle is SeekableHandle {
+  return typeof (handle as SeekableHandle).addEventListener == "function";
+}
+
+/** A seek that was issued and whose frame has not arrived yet. */
+export type SeekRequest = {
+  elementId: string;
+  /** Where the handle was asked to go, in seconds into the source. */
+  sourceTimeSec: number;
+};
+
+/**
+ * Call `onLanded` once, after the handles just seeked have produced their
+ * frames.
+ *
+ * `alreadyAwaited` is the caller's memory of the target it last waited on per
+ * element, and it is what keeps this from spinning. A browser may land a seek a
+ * little off the requested time — `currentTime` is only guaranteed to be near a
+ * keyframe — and the paused tolerance is exactly zero, so the next reconcile
+ * re-issues the *same* seek. Repainting on each of those landings would loop at
+ * frame rate forever. Waiting only when the target has actually moved makes
+ * that unrepresentable.
+ *
+ * Handles that cannot report (no `addEventListener`, e.g. a plain test double)
+ * are not waited on: `onLanded` never fires for them, rather than firing early
+ * on a frame that is not there yet.
+ */
+export function whenSeeksLand(
+  handles: Record<string, MediaHandle>,
+  seeks: readonly SeekRequest[],
+  onLanded: () => void,
+  alreadyAwaited?: Map<string, number>,
+): void {
+  for (const seek of seeks) {
+    if (alreadyAwaited?.get(seek.elementId) === seek.sourceTimeSec) {
+      continue;
+    }
+
+    const handle = handles[seek.elementId];
+    if (handle == null || !isSeekable(handle)) {
+      continue;
+    }
+
+    alreadyAwaited?.set(seek.elementId, seek.sourceTimeSec);
+    handle.addEventListener("seeked", onLanded, { once: true });
+  }
+}
+
+export type PlaybackIntent = {
+  /** Where the handle should be, in seconds into the source file. */
+  sourceTimeSec: number;
+  muted: boolean;
+  /** Linear gain for the handle, 0..1 — not the element's `volumeDb`. */
+  volume: number;
+  playing: boolean;
+  rate: number;
+  /** Whether the playhead is inside this clip's window. */
+  inWindow: boolean;
+};
+
+/**
+ * How far a handle that is *already rolling* may sit from the playhead.
+ *
+ * Deliberately generous, and the reason matters. The timeline cursor runs on
+ * the wall clock while the media element runs on its own decode clock, and
+ * starting playback costs a few frames — so a healthy, perfectly smooth video
+ * settles a constant ~40ms behind. That is an offset, not drift: both clocks
+ * advance at the same rate, so it never grows.
+ *
+ * Treating it as drift is a trap. A one-frame tolerance made us seek roughly
+ * 23 times a second: each correction starved the decoder, which put the video
+ * further behind, which triggered another correction. The picture juddered
+ * precisely because we kept trying to fix it. What actually needs correcting
+ * is a real desync — a stall, a dropped chunk — and those are far bigger than
+ * a quarter second.
+ */
+export const PLAYING_DRIFT_TOLERANCE_SEC = 0.25;
+
+/**
+ * How exactly a handle is positioned when it is *not* already rolling.
+ *
+ * Scrubbing must move the frame immediately, and a clip being entered has to
+ * start on its first frame rather than wherever it was parked, so both are
+ * placed exactly.
+ *
+ * This stays **zero**, and the redundant-seek problem it used to cause is
+ * solved by remembering the request instead of by widening the window — see
+ * `applyIntent`'s `lastRequestedSec`. Widening it would have been the obvious
+ * fix and is the wrong one: the residual is up to one *source* frame, which is
+ * 8ms in a 120fps screen recording and 42ms in 24fps footage, so any constant
+ * big enough to work on the second is big enough to show the wrong frame on the
+ * first. This layer has no way to learn a source's frame rate.
+ */
+export const DRIFT_TOLERANCE_SEC = 0;
+
+/**
+ * Source window of a clip in seconds, for parking an out-of-window handle.
+ *
+ * `extended` widens it to the whole source file, and is set only while a
+ * transition is holding this clip on screen. Without that the clamp would
+ * defeat the entire feature: a cross-dissolve asks the outgoing clip for frames
+ * *past* `trim.endTime`, and pinning the seek back to the trim boundary would
+ * show a frozen out-point for the length of the transition — the exact failure
+ * the handle arithmetic exists to avoid.
+ *
+ * The full source is still a real bound. `maxTransitionMs` never grants a
+ * window that runs off the end of the file, so in a well-formed document this
+ * clamp does not bite; it is here because a document also arrives from `.ngt`
+ * and from IPC, where the media may since have been replaced by a shorter file.
+ */
+/**
+ * The source window a clip may be seeked into, in seconds.
+ *
+ * Exported so the **export's** seek can bound itself the same way the preview
+ * does. Without it the two disagree on one frame of every clip whose span is
+ * not a whole number of frames, which a speed ramp makes essentially every
+ * clip: the last output frame's centre falls past the clip's end, the preview
+ * stops at the out-point and the export reads on past it into footage the user
+ * trimmed away. One frame, and up to two source frames of it on a clip that
+ * ends at 4x.
+ *
+ * `extended` is the transition case, and it is why this cannot simply be folded
+ * into `sourceTimeAtFrame`: a clip held on screen by a transition is deliberately
+ * asked for frames outside its own window, and `maxTransitionMs` has already
+ * guaranteed they exist in the file.
+ */
+export function sourceBoundsSec(
+  element: TimelineElement,
+  extended: boolean,
+): [number, number] {
+  if (!isDynamicElement(element)) {
+    return [0, element.duration / 1000];
+  }
+  if (extended) {
+    return [0, sourceDurationOf(element) / 1000];
+  }
+  return [element.trim.startTime / 1000, element.trim.endTime / 1000];
+}
+
+/**
+ * What this clip's handle should be doing at `cursorMs`.
+ *
+ * Takes the **live** element — never a cached copy — which is the structural
+ * fix for the drift bug rather than a patch over it.
+ */
+export function intentFor(
+  element: TimelineElement,
+  cursorMs: number,
+  isPlaying: boolean,
+  /**
+   * The document, so a clip held on screen by a transition keeps rolling.
+   *
+   * Optional because every existing caller and every existing test passes
+   * three arguments, and a document with no transitions in it answers the same
+   * either way. `syncPlayback` always supplies it.
+   */
+  elements?: Timeline,
+  /**
+   * The project frame rate, so the source instant is the one the **export**
+   * would seek to for this frame.
+   *
+   * Optional only so the seventy existing test call sites compile unchanged;
+   * `syncPlayback` always supplies it and `loadedAssetStore.syncPlayback`
+   * requires it, which is the boundary a production caller has to come through.
+   * Absent means "do not frame-sample", which is what a test asking about
+   * windows or volume wants and what this function did before a speed ramp made
+   * the difference visible.
+   */
+  fps?: number,
+): PlaybackIntent {
+  const { start, end } = spanOf(element);
+  const ownWindow = isTimeInRange(cursorMs, start, end);
+  // Inside a transition the outgoing clip plays past its out-point and the
+  // incoming clip before its in-point. Both handles have to be rolling and
+  // positioned, or the blend mixes a frame that was never seeked.
+  const throughTransition =
+    !ownWindow &&
+    elements != null &&
+    isVisibleThroughTransition(cursorMs, elements, element);
+  const inWindow = ownWindow || throughTransition;
+
+  const [low, high] = sourceBoundsSec(element, throughTransition);
+
+  // The **centre** of the frame the cursor is in, not the cursor, whenever the
+  // rate is known. `frames.ts#sourceTimeAtFrame` is the same call the export's
+  // seek makes, and sharing it is the whole point: the two used to compute this
+  // separately and disagreed on 86 percent of a ramped clip's frames.
+  const exact = isDynamicElement(element)
+    ? (fps == null
+        ? sourceTimeAt(element, cursorMs)
+        : sourceTimeAtFrame(element, cursorMs, fps)) / 1000
+    : low;
+
+  // Outside its window a clip parks at whichever edge it is nearest: before it
+  // that is the trim-in point, so entering plays the right frame immediately
+  // instead of whatever the file happened to run on to. Clamping also removes
+  // the negative seek that browsers silently pinned to 0 — which left a clip
+  // wrong for the rest of the session.
+  const sourceTimeSec = Math.min(Math.max(exact, low), high);
+
+  return {
+    sourceTimeSec,
+    // Two ways to be silent, and they are not the same thing. Outside its
+    // window a clip is merely not being heard yet; a video whose audio has
+    // been detached must stay silent *inside* its window too, or the preview
+    // plays it twice — once from this handle and once from the audio clip that
+    // now owns the sound.
+    //
+    // `playing` deliberately does not follow. A silenced `<video>` still has
+    // to roll, because the picture comes off the same handle: muting it and
+    // pausing it would freeze the frame the moment its audio was detached.
+    muted: !inWindow || !isAudibleElement(element),
+    // Deliberately independent of `inWindow`, and orthogonal to `muted`.
+    // `muted` is positional (am I being heard yet) and flips as the playhead
+    // moves; the level is document state and changes only when the user edits
+    // it. Keeping them apart means crossing a clip boundary writes no volume
+    // at all, and it is why mute is not implemented as `volume = 0`: there
+    // would be nowhere to keep the level the user actually chose.
+    //
+    // `gainAt` rather than `gainOf`, so a level envelope is heard. It is still
+    // document state: what changes with the playhead is which part of the
+    // curve the document is being read at, not the curve. For a clip with no
+    // envelope the two functions are the same number, and `applyIntent`'s
+    // write-only-on-change guard means such a clip still writes `volume` once
+    // and then never again.
+    volume: gainAt(element, cursorMs),
+    playing: isPlaying && inWindow,
+    rate: playbackRateFor(element, cursorMs),
+    inWindow,
+  };
+}
+
+/**
+ * How long a stretch of timeline the handle's rate has to cover.
+ *
+ * One repaint, since `syncPlayback` runs on every one of them.
+ */
+export const RATE_LOOKAHEAD_MS = 1000 / 60;
+
+/**
+ * The rate to write on the media handle for the frame about to be drawn.
+ *
+ * `speedOf` verbatim for an unramped clip, so every existing exact-equality
+ * expectation compares the same number it always did.
+ *
+ * For a ramped one this is the **average** rate over the next repaint. The
+ * handle integrates whatever rate it is given, so the instantaneous value makes
+ * it accumulate a left Riemann sum of the curve while `sourceTimeAt` is the
+ * exact integral, and the two walk apart.
+ *
+ * Not to stop a re-seek. Measured by the suite, the instantaneous rule's worst
+ * drift is about 31ms and stays there: monotone, V-shaped, alternating at the
+ * minimum gap, and over 400 random ramps, on a ten-second clip and on a
+ * two-minute one. It saturates rather than accumulating, because the handle is
+ * re-aimed at the curve's own value on every repaint, and 31ms never comes near
+ * `PLAYING_DRIFT_TOLERANCE_SEC`.
+ *
+ * The reason is that 31ms is two frames at 60fps of sound running ahead of or
+ * behind the picture, and because it stays under the re-seek threshold it would
+ * never correct itself. The average over the step brings that to under half a
+ * millisecond for the same sweep, for one extra `sourceTimeAt` per clip per
+ * repaint.
+ *
+ * Rounded, because `applyIntent` writes the rate only when it changes and an
+ * unrounded average changes in the last bits on every repaint of a near-flat
+ * stretch. Clamped, because a lookahead crossing the clip's end reads the held
+ * rate and a float can land a hair outside.
+ */
+export function playbackRateFor(
+  element: TimelineElement,
+  cursorMs: number,
+): number {
+  if (!isDynamicElement(element) || speedCurveOf(element) == null) {
+    return speedOf(element);
+  }
+  const travelled =
+    sourceTimeAt(element, cursorMs + RATE_LOOKAHEAD_MS) -
+    sourceTimeAt(element, cursorMs);
+  const rate = travelled / RATE_LOOKAHEAD_MS;
+  if (!Number.isFinite(rate)) {
+    return speedOf(element);
+  }
+  return (
+    Math.round(Math.min(Math.max(rate, MIN_SPEED), MAX_SPEED) * 1000) / 1000
+  );
+}
+
+/**
+ * Bring one handle in line with an intent.
+ *
+ * Seeks are conditional: while playing, only when drift exceeds the tolerance,
+ * so normal playback is left alone; while paused, always, so scrubbing moves
+ * the frame immediately.
+ *
+ * Returns whether a seek was issued, so the caller can wait for the frame
+ * instead of painting the stale one that is still on the handle.
+ */
+export function applyIntent(
+  handle: MediaHandle,
+  intent: PlaybackIntent,
+  playingToleranceSec: number = PLAYING_DRIFT_TOLERANCE_SEC,
+  /**
+   * The source time this handle was last *asked* for, if the caller remembers.
+   *
+   * Not the same as `handle.currentTime`, and the difference is the whole point.
+   * A seek lands on a frame boundary, so a handle asked for 18.933s reports
+   * back the timestamp of the frame containing it — 18.925s in a 120fps source.
+   * Comparing the two then finds a residual of one source frame, forever, and
+   * with a tolerance of zero that re-issues the identical seek on every single
+   * repaint. Measured on a real project: twelve video clips, ten of them parked
+   * off the playhead, sixty repaints a second — some six hundred redundant
+   * seeks per second, each one flushing a decoder that then had to decode
+   * forward from a keyframe up to eight seconds back.
+   *
+   * Comparing the *request* instead is exact and needs no knowledge of the
+   * source's frame rate. Only consulted for a handle that is paused, since a
+   * rolling one moves on its own and the generous tolerance governs it.
+   */
+  lastRequestedSec?: number,
+  /**
+   * Where the gain goes. Defaults to the plain `handle.volume` write, so every
+   * existing caller and every suite behaves exactly as before.
+   */
+  gain: GainSink = writeVolume,
+): boolean {
+  // Only write when the value actually changes. This runs on every animation
+  // frame for every loaded clip, and a media element treats each assignment as
+  // a real state change however redundant it is.
+  if (handle.playbackRate !== intent.rate) {
+    handle.playbackRate = intent.rate;
+  }
+  if (handle.muted !== intent.muted) {
+    handle.muted = intent.muted;
+  }
+  // `gainAt` is deterministic and pre-rounded, so at steady state the sink
+  // compares two identical doubles and never writes, which is the point of
+  // rounding it. A clip with a live level envelope is the one case that does
+  // write every frame, and that is the envelope being played rather than churn.
+  gain(handle, intent.volume);
+
+  // A handle already rolling gets the generous window; one that is parked,
+  // scrubbing, or about to enter its clip is placed exactly.
+  // "Rolling" is about what this handle has been *asked* to do, not about
+  // whether it has managed it yet.
+  //
+  // It used to be `intent.playing && !handle.paused`, which reads correctly and
+  // behaves badly on footage the decoder cannot keep up with. Such a handle
+  // stays `paused` — `play()` on a starved element does not take — so it took
+  // the exact branch forever, and its target moves with the cursor, so it was
+  // re-placed as fast as seeks could land. All of its decode budget went on
+  // seeking and none on playing, which is self-sustaining: the picture it was
+  // being asked for kept moving away from the one it was decoding.
+  //
+  // `lastRequestedSec != null` is the record that this handle has been placed
+  // at least once since it was loaded, and placement while parked leaves it at
+  // the clip's trim-in point — which is exactly where entering the clip should
+  // start. So one exact placement, then leave it alone and let the generous
+  // tolerance govern, which is ffplay's rule too: do not correct small drift,
+  // because the correction costs more than the drift.
+  const placed = lastRequestedSec != null;
+  const rolling = intent.playing && (!handle.paused || placed);
+  const tolerance = rolling ? playingToleranceSec : DRIFT_TOLERANCE_SEC;
+
+  // A paused handle cannot have moved since we placed it, so asking again for
+  // the position we already asked for can only cost a decoder flush. The moment
+  // the target actually changes — a scrub, or the playhead entering the clip —
+  // this is false and the exact placement above applies as it always did.
+  const alreadyThere =
+    handle.paused &&
+    lastRequestedSec != null &&
+    lastRequestedSec === intent.sourceTimeSec;
+
+  // **Never interrupt a seek that has not landed.**
+  //
+  // This is the case `alreadyThere` cannot cover, and on heavy footage it was
+  // the worse of the two. A clip the playhead has just entered is `playing` in
+  // intent but still `paused` in fact, so it takes the exact tolerance — and
+  // its target moves with the cursor, so it is a *different* exact target on
+  // every repaint. Each one flushed the decoder that was still working on the
+  // last, which is a live feedback loop: the handle can never buffer, so it
+  // never un-pauses, so it never stops being seeked. Measured on 3600x2338
+  // 120fps footage, two handles sat at `readyState 1` — metadata and no frames
+  // — issuing sixty seeks a second each, indefinitely.
+  //
+  // `seeking` is the same fact `whenSeeksLand` waits for, read directly, and it
+  // needs no threshold to be tuned. A handle that genuinely cannot keep up
+  // simply stays here rather than being asked again.
+  const seekInFlight = handle.seeking === true;
+
+  let seeked = false;
+  if (
+    !alreadyThere &&
+    !seekInFlight &&
+    Math.abs(handle.currentTime - intent.sourceTimeSec) > tolerance
+  ) {
+    // Seek before starting playback, so a handle entering its window cannot
+    // emit a burst of audio from wherever it had run on to.
+    handle.currentTime = intent.sourceTimeSec;
+    seeked = true;
+  }
+
+  if (intent.playing) {
+    // **Never `play()` a handle that has run off the end of its file.** The
+    // spec makes that a seek to the start. A rolling handle runs up to two
+    // frames ahead of the playhead (it is placed at a frame's centre, the
+    // playhead is floored to the frame's start), so a clip whose out-point is
+    // the end of the file reaches `ended` with the playhead still inside it.
+    // The restart then put the footage's first frame on screen for one repaint
+    // at the end of the clip: in Chrome with the GPU, 8 of 40 playthroughs, and
+    // none once this guard was in.
+    //
+    // An ended handle is already showing its last frame, which is the right
+    // picture for what is left of the clip. A real seek back into it, above,
+    // clears `ended` the moment `currentTime` is assigned, so re-entry plays.
+    if (handle.paused && handle.ended !== true) {
+      // A real element answers with a promise, which rejects when a pause
+      // lands before playback has begun: stopping straight after pressing
+      // play. That pause is the outcome wanted, and nothing here awaits the
+      // start, so the rejection is absorbed rather than left unhandled.
+      const started: unknown = handle.play();
+      (started as Promise<void> | undefined)?.catch?.(() => {});
+    }
+  } else if (!handle.paused) {
+    handle.pause();
+  }
+
+  return seeked;
+}
+
+/**
+ * Bring every handle in line with the document.
+ *
+ * A handle whose element has gone — deleted, undone, project switched — is
+ * silenced rather than left running, since nothing else will ever visit it.
+ *
+ * Returns the seeks it issued. Those frames are not on the handles yet, so a
+ * caller that paints needs to come back once they land — see `whenSeeksLand`.
+ */
+export function syncPlayback(
+  doc: TimelineDocument,
+  cursorMs: number,
+  isPlaying: boolean,
+  handles: Record<string, MediaHandle>,
+  playingToleranceSec: number = PLAYING_DRIFT_TOLERANCE_SEC,
+  /**
+   * The caller's memory of the last seek asked of each handle.
+   *
+   * Optional so every existing caller and test compiles unchanged; the preview
+   * supplies one, and without it the behaviour is exactly what it was. Written
+   * here rather than by the caller so the record cannot drift from the seeks
+   * actually issued.
+   */
+  lastRequests?: Map<string, number>,
+  /**
+   * Where the gain goes, threaded straight through to `applyIntent`.
+   *
+   * Optional for the reason `lastRequests` is: every existing caller compiles
+   * unchanged and behaves as it did. The preview supplies the WebAudio-backed
+   * sink, which is the only thing that can play a clip above unity.
+   */
+  gain: GainSink = writeVolume,
+  /**
+   * The project frame rate, threaded to `intentFor` so the preview parks on the
+   * frame the export will deliver. See `frames.ts#sourceTimeAtFrame`.
+   */
+  fps?: number,
+): SeekRequest[] {
+  const seeks: SeekRequest[] = [];
+
+  for (const [elementId, handle] of Object.entries(handles)) {
+    const element = doc.elements[elementId];
+
+    if (element == null) {
+      lastRequests?.delete(elementId);
+      // Volume is deliberately left alone. Muted and paused is already
+      // completely silent, and this branch has no change guard — it writes
+      // every frame — so a volume assignment here would cost one pointless
+      // write per frame per orphan, forever. The level lives in the document
+      // anyway, so an undo that brings the element back re-derives it.
+      handle.muted = true;
+      if (!handle.paused) {
+        handle.pause();
+      }
+      continue;
+    }
+
+    const intent = intentFor(element, cursorMs, isPlaying, doc.elements, fps);
+    if (
+      applyIntent(
+        handle,
+        intent,
+        playingToleranceSec,
+        lastRequests?.get(elementId),
+        gain,
+      )
+    ) {
+      lastRequests?.set(elementId, intent.sourceTimeSec);
+      seeks.push({ elementId, sourceTimeSec: intent.sourceTimeSec });
+    }
+  }
+
+  return seeks;
+}

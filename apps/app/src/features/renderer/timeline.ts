@@ -1,0 +1,425 @@
+import {
+  isVisualTimelineElement,
+  type Timeline,
+  type VisualTimelineElement,
+} from "../../@types/timeline";
+import { isElementVisibleAtTime } from "../element/time";
+import { createMemo } from "../timeline/transform";
+import type { BackdropFxPort } from "./backdrop";
+import { renderElement } from "./element";
+import { effectTimeOf } from "./fx/effectTime";
+import { planFrame, type FramePlan } from "./fx/planFrame";
+import type { FxRuntime } from "./fx/runtime";
+import type { Surface } from "./surface";
+import type { ElementRenderFunction } from "./type";
+
+
+/** Filetypes already reported as having no renderer, so the console hears once. */
+const unrenderable = new Set<string>();
+
+/**
+ * The renderer for an element, or `null` when this table has none.
+ *
+ * `TimelineRenderers` makes a missing entry a compile error for every table the
+ * build typechecks, so this guards what it cannot see: a document written by a
+ * newer build with a filetype this one does not know, and a table compiled
+ * outside the app's program (the offscreen window's). Such a clip draws nothing
+ * and the rest of the frame draws, where calling `undefined` would have thrown
+ * on every frame and taken the whole picture with it.
+ */
+function rendererFor<T extends VisualTimelineElement>(
+  renderers: TimelineRenderers,
+  element: T,
+): ElementRenderFunction<T> | null {
+  const render = (renderers as Record<string, unknown>)[element.filetype];
+  if (typeof render === "function") {
+    return render as ElementRenderFunction<T>;
+  }
+  if (!unrenderable.has(element.filetype)) {
+    unrenderable.add(element.filetype);
+    console.warn(
+      `renderer: no renderer for "${element.filetype}" clips; they are skipped`,
+    );
+  }
+  return null;
+}
+export type TimelineRenderers = {
+  [K in VisualTimelineElement["filetype"]]: ElementRenderFunction<
+    Extract<VisualTimelineElement, { filetype: K }>
+  >;
+};
+
+type OutlineOption = {
+  controlOutlineEnabled: boolean;
+  activeElementId: string;
+};
+
+/**
+ * `Object.entries().sort()` per frame, keyed by document identity.
+ *
+ * Every edit returns a whole new `Timeline` object, so identity is a sound
+ * cache key: a document that is `===` to one already sorted cannot have had an
+ * element added, removed, or re-prioritised. `WeakMap` so a superseded
+ * document does not pin its entry.
+ */
+const sortedByPriority = new WeakMap<
+  Timeline,
+  [string, Timeline[string]][]
+>();
+
+function prioritySorted(timeline: Timeline): [string, Timeline[string]][] {
+  const cached = sortedByPriority.get(timeline);
+  if (cached != null) {
+    return cached;
+  }
+  const sorted = Object.entries(timeline).sort(
+    ([, a], [, b]) => a.priority - b.priority,
+  );
+  sortedByPriority.set(timeline, sorted);
+  return sorted;
+}
+
+/**
+ * The effects runtime of the composite in progress, for the template renderer.
+ *
+ * A template's contents are drawn by a nested `renderTimelineAtTime` from
+ * inside `renderElement`, which takes no runtime: the renderer table has one
+ * signature for every element. So the composite in progress names its runtime
+ * here for the length of the call, and `renderer/template.ts` hands the inner
+ * composite that runtime's child. A synchronous scope, safe for the reason
+ * `withVideoScope` is: every renderer is synchronous.
+ */
+let compositeFx: FxRuntime | null = null;
+
+export function activeCompositeFx(): FxRuntime | null {
+  return compositeFx;
+}
+
+export function renderTimelineAtTime(
+  ctx: CanvasRenderingContext2D,
+  timeline: Timeline,
+  timeInMs: number,
+  renderers: TimelineRenderers,
+  backgroundColor: string,
+  width: number,
+  height: number,
+  outlineOptions: OutlineOption = {
+    controlOutlineEnabled: false,
+    activeElementId: "",
+  },
+  callbackPerElementRender?: (
+    elementId: string,
+    element: VisualTimelineElement,
+  ) => void,
+  /**
+   * Effects and transitions, or `null` to skip them entirely.
+   *
+   * A trailing optional so every existing call site and every golden pixel
+   * suite compiles and behaves exactly as before. It is `null` in the node test
+   * environment, which has no WebGL, and in any caller that has not been wired
+   * up yet — and in both cases this function takes the path it always took.
+   */
+  fx?: FxRuntime | null,
+) {
+  const outer = compositeFx;
+  compositeFx = fx ?? null;
+  try {
+    compositeAtTime(
+      ctx,
+      timeline,
+      timeInMs,
+      renderers,
+      backgroundColor,
+      width,
+      height,
+      outlineOptions,
+      callbackPerElementRender,
+      fx,
+    );
+  } finally {
+    compositeFx = outer;
+  }
+}
+
+function compositeAtTime(
+  ctx: CanvasRenderingContext2D,
+  timeline: Timeline,
+  timeInMs: number,
+  renderers: TimelineRenderers,
+  backgroundColor: string,
+  width: number,
+  height: number,
+  outlineOptions: OutlineOption,
+  callbackPerElementRender:
+    | ((elementId: string, element: VisualTimelineElement) => void)
+    | undefined,
+  fx: FxRuntime | null | undefined,
+) {
+  const plan =
+    fx == null
+      ? null
+      : planFrame({
+          elements: timeline,
+          timeInMs,
+          fps: fx.fps,
+          modeOf: fx.modeOf,
+          backdropModeOf: fx.backdropModeOf,
+        });
+
+  // Nothing to composite: keep the original single-pass path, drawing straight
+  // into the caller's context. This is the branch every existing suite takes.
+  if (fx == null || plan == null || plan.empty) {
+    paint(
+      ctx,
+      timeline,
+      timeInMs,
+      renderers,
+      backgroundColor,
+      width,
+      height,
+      outlineOptions,
+      callbackPerElementRender,
+      null,
+      null,
+    );
+    return;
+  }
+
+  // A shader effect reads back what has been drawn, which only works at project
+  // resolution under an identity transform. The preview's context is neither,
+  // so the whole frame is composited into a scratch canvas and blitted once.
+  const scratch = plan.needsScratch ? fx.compositor.scratchCtx(width, height) : null;
+  const target = scratch ?? ctx;
+
+  paint(
+    target,
+    timeline,
+    timeInMs,
+    renderers,
+    backgroundColor,
+    width,
+    height,
+    outlineOptions,
+    callbackPerElementRender,
+    plan,
+    fx,
+  );
+
+  if (scratch != null) {
+    fx.compositor.flushScratch(ctx, width, height);
+  }
+}
+
+/**
+ * The port a shape's renderer runs its backdrop preset through, or `null`.
+ *
+ * `null` when nothing on this frame has a backdrop to run, which is every
+ * frame of every project that has never used one, so the common path builds
+ * no closure. A shape with a backdrop then fills solid.
+ *
+ * Declines a source that is not the project frame: `planFrame` asked for a
+ * scratch pass, so the frame beneath a backdrop is always project-sized here,
+ * and a mismatch means it is not (a scratch canvas that could not be made, for
+ * one). A preset's sizes are project pixels, so running it on any other grid
+ * would draw the wrong picture rather than none.
+ */
+function backdropPortFor(
+  plan: FramePlan | null,
+  fx: FxRuntime | null,
+  width: number,
+  height: number,
+): BackdropFxPort | null {
+  if (plan == null || fx == null || plan.backdrops.size === 0) {
+    return null;
+  }
+  return (elementId, source, land) => {
+    const active = plan.backdrops.get(elementId);
+    if (active == null) {
+      return false;
+    }
+    if (source.width !== width || source.height !== height) {
+      return false;
+    }
+    const preset = fx.presetOf(active.fx);
+    if (preset == null) {
+      return false;
+    }
+    return fx.compositor.filterBackdrop(
+      source as unknown as TexImageSource,
+      active,
+      preset,
+      active.mode === "lut" ? fx.lutFor(preset.id) : null,
+      width,
+      height,
+      land,
+    );
+  };
+}
+
+function paint(
+  ctx: CanvasRenderingContext2D,
+  timeline: Timeline,
+  timeInMs: number,
+  renderers: TimelineRenderers,
+  backgroundColor: string,
+  width: number,
+  height: number,
+  outlineOptions: OutlineOption,
+  callbackPerElementRender:
+    | ((elementId: string, element: VisualTimelineElement) => void)
+    | undefined,
+  plan: FramePlan | null,
+  fx: FxRuntime | null,
+): void {
+  ctx.fillStyle = backgroundColor;
+  ctx.fillRect(0, 0, width, height);
+
+  const prioritySortedTimeline = prioritySorted(timeline);
+
+  // One cache for the whole frame, discarded with it. The matrices it holds are
+  // resolved at `timeInMs`, so reusing it across frames would draw the previous
+  // one; within a frame it turns every sibling's chain walk into a lookup.
+  const memo = createMemo();
+  const backdropFx = backdropPortFor(plan, fx, width, height);
+  const context = { elements: timeline, memo, backdropFx };
+
+  /**
+   * The same context, marked as drawing into a buffer holding one clip alone.
+   *
+   * Built once per frame rather than spread at each `drawOne` call, so the
+   * transform memo is shared with the main loop instead of being rebuilt.
+   *
+   * `outerBackdrop` is this frame's own canvas: when a transition draws its two
+   * clips, everything beneath it has already been painted here, and that is
+   * what a shape's backdrop preset inside the transition has to read.
+   */
+  const isolatedContext = {
+    ...context,
+    isolated: true,
+    outerBackdrop:
+      backdropFx == null ? null : (ctx.canvas as unknown as Surface["canvas"]),
+  };
+
+  /**
+   * Draw one element by itself into some other context.
+   *
+   * Handed to the compositor so a transition can render its two clips into
+   * separate buffers. It goes through the same `renderElement` as the main loop,
+   * which is what makes a clip's own transform, opacity, keyframes and group
+   * parenting apply inside a transition exactly as they do outside one.
+   *
+   * Blend is the one thing that does *not* carry across — see
+   * `ElementRenderContext.isolated`. The buffer it draws into is transparent and
+   * empty, so there is nothing under the clip to blend with.
+   */
+  const drawOne = (into: CanvasRenderingContext2D, elementId: string): void => {
+    const element = timeline[elementId];
+    if (element == null || !isVisualTimelineElement(element)) {
+      return;
+    }
+    const render = rendererFor(renderers, element);
+    if (render == null) {
+      return;
+    }
+    renderElement(
+      into,
+      elementId,
+      element,
+      timeInMs,
+      false,
+      render,
+      isolatedContext,
+    );
+  };
+
+  for (const [elementId, element] of prioritySortedTimeline) {
+    // A row with its eye off. First, ahead of the fx branch: a transition draws
+    // its two clips through `drawOne`, which checks nothing, so a hidden pair
+    // skipped any later would still reach the frame. The element stays in
+    // `context.elements` all the same, so a visible child of a group on a
+    // hidden row keeps its parent's transform, and a link reading a hidden
+    // clip keeps its source.
+    if (element.trackHidden === true) {
+      continue;
+    }
+
+    if (plan != null && fx != null) {
+      const transition = plan.transitions.get(elementId);
+      if (transition != null) {
+        const preset = fx.presetOf(transition.element);
+        if (preset != null) {
+          fx.compositor.drawTransition(
+            ctx,
+            transition,
+            preset,
+            width,
+            height,
+            drawOne,
+          );
+        }
+        continue;
+      }
+      // The other half of the pair, already drawn by the transition above.
+      if (plan.claimed.has(elementId)) {
+        continue;
+      }
+
+      const effect = plan.effects.get(elementId);
+      if (effect != null) {
+        const preset = fx.presetOf(effect.element);
+        if (preset != null) {
+          fx.compositor.applyEffect(
+            ctx,
+            effect,
+            preset,
+            width,
+            height,
+            effect.mode === "overlay"
+              ? fx.overlayFrameFor(elementId, effect.element, timeInMs)
+              : null,
+            effect.mode === "lut" ? fx.lutFor(effect.element.presetId) : null,
+            // Element-local and frame-snapped, so an animated effect runs the
+            // same in the preview as in the render. See `fx/effectTime.ts`.
+            effectTimeOf(effect.element, timeInMs, fx.fps),
+          );
+        }
+        continue;
+      }
+    }
+
+    // Audio has no picture, and a group draws nothing — it exists only to hold
+    // a transform for its children, which they collect through `parentId` in
+    // `context` rather than through anything that happens in this loop. An
+    // effect and a transition are excluded by the same guard: both are
+    // whole-frame operations handled above, not elements that paint themselves.
+    if (!isVisualTimelineElement(element)) {
+      continue;
+    }
+
+    // Deliberately the element's *own* span. A group's span does not gate its
+    // children: parenting here is spatial only, as it is in After Effects, and
+    // a caption parented to a title block must not vanish because the block's
+    // bar on the timeline is shorter than the caption's.
+    if (!isElementVisibleAtTime(timeInMs, timeline, element)) {
+      continue;
+    }
+
+    const render = rendererFor(renderers, element);
+    if (render == null) {
+      continue;
+    }
+
+    renderElement(
+      ctx,
+      elementId,
+      element,
+      timeInMs,
+      outlineOptions.controlOutlineEnabled &&
+        elementId === outlineOptions.activeElementId,
+      render,
+      context,
+    );
+
+    callbackPerElementRender?.(elementId, element);
+  }
+}

@@ -1,0 +1,547 @@
+/**
+ * The LUT panel's tile grid.
+ *
+ * Deliberately shaped like `fx/fxPresetBrowser.ts` (the same tile markup, the
+ * same `.asset` hover, the same `_browse.scss` search bar and category headings
+ * in enum order) because it sits one toggle away from it, inside the same "Fx"
+ * tab, and two grids that browse alike should look alike. What differs is what a
+ * click *does*, and that is the whole design of the feature:
+ *
+ * | gesture | result |
+ * |---|---|
+ * | click with clips selected | grade every one of them, in a single undo step |
+ * | click with nothing selected | an adjustment layer at the playhead |
+ * | drag onto a clip | grade that clip |
+ * | drag onto empty track space | an adjustment layer there |
+ *
+ * That is the Premiere and Final Cut arrangement: grade the shot you mean, or
+ * grade the stack. Both routes end at the same preset id, because a LUT preset
+ * is a LUT preset whether a clip or an effect element points at it.
+ *
+ * Strings here are English and stay English, following `ControlText` and
+ * `fxPresetBrowser`: preset names come from manifests and are not translatable,
+ * so a half-localised panel would read worse than a consistent one.
+ */
+
+import { LitElement, html } from "lit";
+import { customElement } from "lit/decorators.js";
+import { v4 as uuidv4 } from "uuid";
+
+import { selectionStore } from "../../states/selectionStore";
+import { useTimelineStore } from "../../states/timelineStore";
+import { LUT_PRESET_MIME } from "../asset/dropIntent";
+import { DEFAULT_EFFECT_MS } from "../element/effectElement";
+import {
+  loadPresets,
+  presetById,
+  presetsOfKind,
+  subscribePresets,
+  type FxPreset,
+} from "../fx/presetRegistry";
+import { LUT_CATEGORIES } from "../fx/presetTypes";
+import { addEffect } from "../timeline/effectOps";
+import { isGradable, setClipLutMany } from "../timeline/lutOps";
+import { lutOf } from "../renderer/lut";
+import { importLutFile, pickAndImportLut } from "./lutImport";
+import { lutFailures, lutFor, loadLut } from "./lutRegistry";
+import {
+  LUT_PREVIEW_H,
+  LUT_PREVIEW_W,
+  createLutPreviewProvider,
+} from "./lutPreviewProvider";
+import { cloudItemsOf, ensureCatalog, subscribeCloudListing } from "../cloud/cloudStore";
+import { cloudItemMatches, fxTileCategory, mergeFxTiles, type FxTile } from "../cloud/cloudMerge";
+import { createClickOrder, downloadThenApply } from "../cloud/cloudApply";
+import type { CloudItem } from "../cloud/cloudTypes";
+import "../cloud/cloudBadge";
+
+/**
+ * One provider for the panel.
+ *
+ * Module-level for the same reason `fxPresetBrowser`'s is: it holds a cache of
+ * eighty graded stills keyed by preset id, and remounting the panel should not
+ * throw that away.
+ */
+const previews = createLutPreviewProvider();
+
+/** Headings for the category enum. Absent falls back to the raw value. */
+const CATEGORY_LABELS: Record<string, string> = {
+  film: "Film",
+  cinematic: "Cinematic",
+  vintage: "Vintage",
+  mono: "Black & White",
+  warm: "Warm",
+  cool: "Cool",
+  vivid: "Vivid",
+  matte: "Matte",
+  "log-convert": "Log Conversion",
+  utility: "Utility",
+};
+
+function toast(message: string): void {
+  (document.querySelector("toast-box") as any)?.showToast({
+    message,
+    delay: "4000",
+  });
+}
+
+@customElement("lut-browser")
+export class LutBrowser extends LitElement {
+  private query = "";
+  private teardown: Array<() => void> = [];
+  private visibility: IntersectionObserver | null = null;
+  /** Which click is the latest, so a slow download cannot apply over a newer one. */
+  private clicks = createClickOrder();
+  /** Whether this grid has been on screen; the catalog is asked for only from then. */
+  private seen = false;
+
+  createRenderRoot() {
+    this.teardown.push(
+      selectionStore.subscribe(() => this.requestUpdate()),
+      useTimelineStore.subscribe(() => this.requestUpdate()),
+      previews.onReady(() => this.paintTiles()),
+      subscribePresets(() => this.requestUpdate()),
+      subscribeCloudListing(() => this.requestUpdate()),
+    );
+
+    // Or the timeline canvas's document-level mousedown clears the selection
+    // before a tile's click handler runs, and every tile would act on nothing.
+    this.setAttribute("data-keeps-selection", "");
+    return this;
+  }
+
+  connectedCallback() {
+    super.connectedCallback();
+    if (presetsOfKind("lut").length === 0) {
+      void loadPresets().then(() => this.requestUpdate());
+    }
+
+    /**
+     * Repaint when the tab is opened.
+     *
+     * Without this the panel is permanently blank, and the reason is worth
+     * stating because it is not obvious: the sidebar is a set of Bootstrap
+     * pills, so this component mounts and renders at *app startup*, inside a
+     * pane that is `display: none`. `updated()` fires then — with the tiles
+     * hidden, so painting and building the still are both correctly skipped —
+     * and Lit has no reason to run it again. Clicking the tab changes no
+     * property of this element, so nothing else would ever ask.
+     *
+     * An `IntersectionObserver` rather than Bootstrap's `shown.bs.tab`: it
+     * needs no reference to the tab machinery, and it covers the other case
+     * that has the same shape — a tile scrolled into view for the first time.
+     */
+    this.visibility = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          this.seen = true;
+          ensureCatalog("lut");
+          this.paintTiles();
+        }
+      },
+      { threshold: 0 },
+    );
+    this.visibility.observe(this);
+  }
+
+  disconnectedCallback() {
+    super.disconnectedCallback();
+    for (const off of this.teardown) {
+      off();
+    }
+    this.teardown = [];
+    this.visibility?.disconnect();
+    this.visibility = null;
+  }
+
+  updated() {
+    this.paintTiles();
+    if (this.seen && !this.isHidden()) {
+      ensureCatalog("lut");
+    }
+  }
+
+  private isHidden(): boolean {
+    return this.closest(".d-none") != null || this.offsetParent == null;
+  }
+
+  /** Preset ids whose table is being read. See `paintTiles`. */
+  private loading = new Set<string>();
+
+  private paintTiles(): void {
+    if (this.isHidden()) {
+      return;
+    }
+    for (const node of this.querySelectorAll("canvas[data-lut]")) {
+      const canvas = node as HTMLCanvasElement;
+      const presetId = canvas.dataset.lut;
+      if (presetId == null) {
+        continue;
+      }
+      const ctx = canvas.getContext("2d");
+      if (ctx == null) {
+        continue;
+      }
+      const frame = previews.get(presetId);
+      if (frame != null) {
+        ctx.putImageData(frame, 0, 0);
+        continue;
+      }
+
+      const lut = lutFor(presetId);
+      if (lut != null) {
+        // `request` grades the still and notifies, which repaints this tile.
+        previews.request(presetId, lut);
+        continue;
+      }
+
+      // Not read off disk yet. `lutFor` starts the read and answers `null`,
+      // which is right for the paint loop and not enough here: eighty tiles
+      // would each ask once, get nothing, and never be told the table had
+      // arrived — the panel would sit blank until something else happened to
+      // repaint it. So wait for it explicitly, once per preset.
+      if (!this.loading.has(presetId)) {
+        this.loading.add(presetId);
+        void loadLut(presetId)
+          .then((loaded) => {
+            if (loaded != null) {
+              previews.request(presetId, loaded);
+            }
+          })
+          .finally(() => {
+            this.loading.delete(presetId);
+          });
+      }
+    }
+  }
+
+  // ------------------------------------------------------------- applying
+
+  /** The clips in the selection that can actually take a grade. */
+  private gradableSelection(): string[] {
+    const document_ = useTimelineStore.getState();
+    return selectionStore
+      .getState()
+      .ids.filter((id) => isGradable(document_.timeline[id]));
+  }
+
+  private apply(preset: FxPreset): void {
+    const ids = this.gradableSelection();
+    if (ids.length > 0) {
+      // One call for N clips is one undo step. Declining by identity means
+      // re-clicking the LUT a clip already has costs nothing.
+      useTimelineStore
+        .getState()
+        .withCheckpoint((doc) => setClipLutMany(doc, ids, preset.id));
+      return;
+    }
+    this.addAdjustmentLayer(preset);
+  }
+
+  /**
+   * Grade everything beneath, rather than nothing at all.
+   *
+   * A tile that silently does nothing is the worst outcome. Falling back to an
+   * adjustment layer matches what the Fx panel already does with no selection,
+   * and it is the answer to "I want this look on the whole sequence" — which is
+   * as common a request as "on this shot".
+   */
+  private addAdjustmentLayer(preset: FxPreset): void {
+    const store = useTimelineStore.getState();
+    const id = uuidv4();
+    // The second id is for the effect *track* `addEffect` creates when there
+    // is none. It insists on being given one rather than minting its own so
+    // that the whole edit stays a pure function of the document.
+    const trackId = uuidv4();
+    store.withCheckpoint((doc) =>
+      addEffect(
+        doc,
+        id,
+        preset.id,
+        store.cursor,
+        DEFAULT_EFFECT_MS,
+        trackId,
+        {},
+      ),
+    );
+    selectionStore.getState().setIds([id]);
+    toast(`${preset.name} added as an adjustment layer.`);
+  }
+
+  private clear(): void {
+    const ids = this.gradableSelection();
+    if (ids.length === 0) {
+      toast("Select a clip to clear its LUT.");
+      return;
+    }
+    useTimelineStore
+      .getState()
+      .withCheckpoint((doc) => setClipLutMany(doc, ids, null));
+  }
+
+  /** A cloud LUT: download it, then what its local tile's click would do. */
+  private handleCloudClick(item: CloudItem): void {
+    const token = this.clicks.next();
+    void downloadThenApply(this.clicks, token, "lut", item.id, item.name, {
+      reload: () => loadPresets(),
+      apply: () => {
+        const preset = presetById(item.id);
+        if (preset == null) {
+          toast(`${item.name} was downloaded but could not be loaded.`);
+          return;
+        }
+        this.apply(preset);
+      },
+    });
+  }
+
+  private handleDragStart(event: DragEvent, preset: FxPreset): void {
+    event.dataTransfer?.setData(LUT_PRESET_MIME, preset.id);
+    if (event.dataTransfer != null) {
+      event.dataTransfer.effectAllowed = "copy";
+    }
+  }
+
+  // -------------------------------------------------------------- importing
+
+  private async handleImport(): Promise<void> {
+    const result = await pickAndImportLut();
+    if (result == null) {
+      return;
+    }
+    toast(
+      result.ok
+        ? `Imported ${result.name}.`
+        : `That LUT could not be read — ${result.message}`,
+    );
+    this.requestUpdate();
+  }
+
+  private async handleDrop(event: DragEvent): Promise<void> {
+    const files = event.dataTransfer?.files;
+    if (files == null || files.length === 0) {
+      return;
+    }
+    event.preventDefault();
+    for (const file of Array.from(files)) {
+      const result = await importLutFile(file);
+      toast(
+        result.ok
+          ? `Imported ${result.name}.`
+          : `${file.name} could not be read — ${result.message}`,
+      );
+    }
+    this.requestUpdate();
+  }
+
+  // ---------------------------------------------------------------- render
+
+  private matchesQuery(preset: FxPreset): boolean {
+    if (this.query === "") {
+      return true;
+    }
+    return [
+      preset.name,
+      preset.category,
+      CATEGORY_LABELS[preset.category] ?? "",
+      preset.author ?? "",
+    ]
+      .join(" ")
+      .toLowerCase()
+      .includes(this.query);
+  }
+
+  /**
+   * One tile, in the file browser's shape. `is-on` marks the LUT the whole
+   * selection already carries, as a ring and a check on the well
+   * (`_browse.scss`).
+   */
+  private tile(preset: FxPreset, current: string | null) {
+    const active = current === preset.id;
+    return html`
+      <div
+        class="asset asset-tile ${active ? "is-on" : ""}"
+        draggable="true"
+        title=${preset.name}
+        @click=${() => {
+          this.clicks.next();
+          this.apply(preset);
+        }}
+        @dragstart=${(e: DragEvent) => this.handleDragStart(e, preset)}
+      >
+        <div class="asset-thumb">
+          <canvas
+            class="asset-thumb-img"
+            data-lut=${preset.id}
+            width=${LUT_PREVIEW_W}
+            height=${LUT_PREVIEW_H}
+          ></canvas>
+          ${active
+            ? html`<span class="material-symbols-outlined asset-thumb-check"
+                >check</span
+              >`
+            : null}
+        </div>
+        <span class="asset-name">${preset.name}</span>
+      </div>
+    `;
+  }
+
+  /**
+   * A cloud LUT not yet downloaded: a still where a local tile grades the
+   * sample, and the cloud badge in the corner `is-on` does not use.
+   */
+  private cloudTile(item: CloudItem) {
+    return html`
+      <div
+        class="asset asset-tile"
+        draggable="false"
+        data-cloud=${item.id}
+        title=${item.name}
+        @click=${() => this.handleCloudClick(item)}
+      >
+        <div class="asset-thumb">
+          ${item.thumbnailUrl == null
+            ? ""
+            : html`<img
+                class="asset-thumb-img"
+                src=${item.thumbnailUrl}
+                alt=""
+                decoding="async"
+                draggable="false"
+              />`}
+          <cloud-badge class="asset-thumb-cloud" kind="lut" item-id=${item.id}></cloud-badge>
+        </div>
+        <span class="asset-name">${item.name}</span>
+      </div>
+    `;
+  }
+
+  private tileFor(tile: FxTile, current: string | null) {
+    return tile.type === "preset" ? this.tile(tile.preset, current) : this.cloudTile(tile.item);
+  }
+
+  render() {
+    const all = presetsOfKind("lut");
+    const catalog = cloudItemsOf("lut");
+    const selection = this.gradableSelection();
+    const document_ = useTimelineStore.getState().timeline;
+    // Only when the whole selection agrees: a mixed selection has no one
+    // current LUT, and highlighting the first clip's would be a lie.
+    const currentIds = new Set(
+      selection.map((id) => lutOf(document_[id])?.presetId ?? ""),
+    );
+    const current =
+      selection.length > 0 && currentIds.size === 1
+        ? [...currentIds][0] || null
+        : null;
+
+    // The category sections hold the built-ins and then, by name, the cloud
+    // LUTs, downloaded or not (`cloudMerge.ts`). An imported LUT keeps its
+    // own section at the top.
+    const graded = mergeFxTiles(
+      all.filter((preset) => preset.origin === "builtin" || preset.origin === "cloud"),
+      catalog,
+    ).filter((tile) =>
+      tile.type === "preset"
+        ? this.matchesQuery(tile.preset)
+        : cloudItemMatches(tile.item, this.query, CATEGORY_LABELS[tile.item.category ?? ""] ?? ""),
+    );
+    const user = all.filter((preset) => preset.origin === "user" && this.matchesQuery(preset));
+
+    const sections = LUT_CATEGORIES.map((category) => ({
+      label: CATEGORY_LABELS[category] ?? category,
+      tiles: graded.filter((tile) => fxTileCategory(tile) === category),
+    })).filter((section) => section.tiles.length > 0);
+
+    if (user.length > 0) {
+      sections.unshift({
+        label: "My LUTs",
+        tiles: user.map((preset): FxTile => ({ type: "preset", preset })),
+      });
+    }
+
+    const broken = lutFailures();
+
+    return html`
+      <div
+        @dragover=${(e: DragEvent) => e.preventDefault()}
+        @drop=${(e: DragEvent) => void this.handleDrop(e)}
+      >
+        <div class="browse-bar">
+          <label class="browse-field">
+            <span class="material-symbols-outlined browse-field-icon"
+              >search</span
+            >
+            <input
+              type="search"
+              class="browse-input"
+              spellcheck="false"
+              placeholder="Search LUTs"
+              @input=${(e: Event) => {
+                this.query = (e.target as HTMLInputElement).value
+                  .trim()
+                  .toLowerCase();
+                this.requestUpdate();
+              }}
+            />
+          </label>
+          <button
+            type="button"
+            class="browse-btn"
+            title="Import a .cube, .3dl or LUT image"
+            aria-label="Import a .cube, .3dl or LUT image"
+            @click=${() => void this.handleImport()}
+          >
+            <span class="material-symbols-outlined">upload</span>
+          </button>
+        </div>
+
+        ${broken.length > 0
+          ? html`<div class="browse-alert">
+              <span class="material-symbols-outlined">warning</span>
+              <span>
+                ${broken.length} LUT${broken.length === 1 ? "" : "s"} could not
+                be read: ${broken.map((f) => f.message).join("; ")}
+              </span>
+            </div>`
+          : null}
+        ${all.length === 0 && catalog.length === 0
+          ? html`<div class="browse-empty">
+              <div class="browse-empty-icon">
+                <span class="material-symbols-outlined">palette</span>
+              </div>
+              <div class="browse-empty-title">No LUTs installed</div>
+              <div class="browse-empty-text">
+                Import a .cube, .3dl or LUT image, or drop one here.
+              </div>
+            </div>`
+          : sections.length === 0
+            ? html`<div class="browse-empty">
+                <div class="browse-empty-icon">
+                  <span class="material-symbols-outlined">search_off</span>
+                </div>
+                <div class="browse-empty-title">No matches</div>
+                <div class="browse-empty-text">
+                  Try another name or category.
+                </div>
+              </div>`
+            : sections.map(
+                (section) => html`
+                  <section class="browse-section">
+                    <div class="browse-section-head">
+                      <span class="browse-section-title">${section.label}</span>
+                      <span class="browse-section-count">
+                        ${section.tiles.length}
+                      </span>
+                    </div>
+                    <div class="asset-grid browse-grid">
+                      ${section.tiles.map((tile) => this.tileFor(tile, current))}
+                    </div>
+                  </section>
+                `,
+              )}
+      </div>
+    `;
+  }
+}

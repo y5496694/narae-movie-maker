@@ -1,0 +1,37 @@
+{
+  "name": "narae-desktop-mcp-bridge",
+  "title": "나래 무비메이커 데스크톱 브리지",
+  "description": "이 로컬 전용 브리지는 실행 중인 나래 무비메이커 데스크톱 앱에 연결합니다.",
+  "version": "1.0.0",
+  "private": true,
+  "transport": {
+    "type": "stdio"
+  },
+  "launch": {
+    "command": "node",
+    "args": [
+      "bin/narae-desktop-mcp.mjs"
+    ]
+  },
+  "endpoint": "http://127.0.0.1:9827/mcp",
+  "environmentVariables": [
+    {
+      "name": "NARAE_MCP_TOKEN",
+      "description": "미지정 시 나래 무비메이커의 설정에서 읽습니다.",
+      "isRequired": false,
+      "isSecret": true
+    },
+    {
+      "name": "NARAE_MCP_URL",
+      "description": "나래 무비메이커 데스크톱 MCP 주소입니다.",
+      "isRequired": false,
+      "isSecret": false
+    }
+  ],
+  "upstream": {
+    "name": "CartCut",
+    "version": "0.6.1",
+    "repository": "https://github.com/cartesiancs/cartcut",
+    "license": "MIT"
+  }
+}

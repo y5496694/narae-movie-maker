@@ -1,0 +1,26 @@
+/node_modules
+/dist
+/bin/darwin-arm64
+/bin/darwin-x64
+/bin/win32-x64
+/main
+/temp
+/apps/app/dist
+.DS_Store
+/even-terminal-*.log
+/server/target
+# The cloud server's daily request logs (server/src/log.rs).
+/server/logs/
+.claude/settings.local.json
+
+# E2E: downloaded/derived media fixtures and per-run diagnostic artifacts.
+# Both are large and reproducible — `npm run test:e2e:fixtures` rebuilds the
+# first, and the second is only interesting while a failure is being chased.
+/tests/e2e/.fixtures
+/tests/e2e/.out
+dist-web/
+
+# The live cloud catalogue (server/content/<kind>s/<slug>/). It is served by
+# server/ and never shipped in this repository; it keeps its own git history.
+# Anchored, so server/tests/fixtures/content stays tracked for `cargo test`.
+/server/content/

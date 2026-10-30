@@ -1,0 +1,548 @@
+import type {
+  Timeline,
+  TimelineElement,
+  VisualTimelineElement,
+} from "../../@types/timeline";
+import { interpolate } from "../animation/interpolation";
+import {
+  inheritedOpacityOf,
+  localMatrixOf,
+  parentMatrixOf,
+  sampledBoxOf,
+  type TransformMemo,
+} from "../timeline/transform";
+import { blendOf, DEFAULT_BLEND, isBlendIsolating } from "./blend";
+import {
+  frameOutline,
+  isDecorated,
+  isFramed,
+  paintDecoration,
+} from "./decoration";
+import { cornerRadiusAt } from "../timeline/cornerOps";
+import { resolveLinks, type SampleOverrides } from "../animation/link";
+import { renderControlOutline } from "./controlOutline";
+import { adjustToneFor, applyFinish, finishRenderFor } from "./adjust/apply";
+import { applyLutGrade, lutGradeFor } from "./lut/apply";
+import { applyMask, clipToMask, destinationMatrix, maskRenderFor } from "./mask";
+import { applyMirror } from "./mirror";
+import { applyCrop } from "./crop";
+import {
+  backdropOf,
+  isolatedBackdropOf,
+  type Backdrop,
+  type BackdropFxPort,
+} from "./backdrop";
+import { layerFor, type Surface } from "./surface";
+import type { ElementRenderFunction } from "./type";
+
+/**
+ * What `renderElement` needs to resolve an element's parent chain.
+ *
+ * Optional throughout, and that is deliberate: an element with no `parentId`
+ * needs none of it, so every existing caller and every existing test keeps
+ * working untouched. Pass it and groups apply; omit it and the element is drawn
+ * in canvas space exactly as before.
+ *
+ * `memo` must not outlive the frame — the matrices it holds are resolved at one
+ * cursor. `renderTimelineAtTime` builds a fresh one per call.
+ */
+export type ElementRenderContext = {
+  elements: Timeline;
+  memo?: TransformMemo;
+  /**
+   * True while drawing into a buffer that holds this element alone.
+   *
+   * A transition renders each of its two clips into its own cleared,
+   * *transparent* canvas before mixing them in GL — see
+   * `fx/compositor.ts#renderClip`. There is nothing beneath a clip there, so a
+   * blend mode has nothing to blend with: `multiply` against transparent black
+   * would annihilate the clip and the dissolve would play into a hole.
+   *
+   * So blend is suspended for the length of the transition. That matches what
+   * every NLE does, and it follows from what a transition is — an operation on
+   * a *pair* of clips, not a property of one of them. The clip's own transform,
+   * opacity, keyframes and group parenting all still apply, because those are
+   * properties of the clip alone.
+   */
+  isolated?: boolean;
+  /**
+   * Runs a shape's backdrop preset. Built by the paint loop over the FX
+   * compositor; absent everywhere else, and a shape with a backdrop then fills
+   * solid. See `renderer/backdrop.ts`.
+   */
+  backdropFx?: BackdropFxPort | null;
+  /**
+   * The frame a transition's clip is drawn over, for `backdropFx` alone.
+   *
+   * Set only together with `isolated`. The clip's own buffer is cleared and
+   * transparent, but the frame beneath the transition is complete when the
+   * transition is reached, and that is what a backdrop has to read.
+   */
+  outerBackdrop?: Surface["canvas"] | null;
+};
+
+/**
+ * Move `ctx` into the element's local space: after this call the element's
+ * top-left corner is the origin, and its animated position, rotation and scale
+ * are baked into the transform.
+ *
+ * Split out of `renderElement` so the preview can draw selection chrome in a
+ * separate pass — the preview dims out-of-frame pixels, and the control handles
+ * must stay at full opacity so they can still be seen and grabbed.
+ *
+ * The arithmetic moved to `features/timeline/transform.ts#localMatrixOf`, and
+ * this is now a one-line application of it. The reason is not tidiness: while
+ * the placement rule lived here, as a sequence of ctx calls, nothing else could
+ * ask where an element was without reimplementing it — and `previewCanvas`
+ * duly did, by hand, for rotation only. Drawing and hit-testing can no longer
+ * disagree because they can no longer ask separately.
+ *
+ * Opacity is deliberately not applied here; it is not part of the transform.
+ */
+export function applyElementTransform(
+  ctx: CanvasRenderingContext2D,
+  element: TimelineElement,
+  timelineCursor: number,
+  links?: SampleOverrides | null,
+): void {
+  const m = localMatrixOf(element, timelineCursor, links);
+  ctx.transform(m.a, m.b, m.c, m.d, m.e, m.f);
+}
+
+/**
+ * Move `ctx` into the space the element's `location` is expressed in.
+ *
+ * For a root element that is canvas space and this does nothing. For a child it
+ * is the product of every ancestor group's transform — which is the entire
+ * mechanism by which moving a group moves what is inside it, with not one of
+ * the child's keyframes rewritten.
+ */
+export function applyParentTransform(
+  ctx: CanvasRenderingContext2D,
+  elementId: string,
+  timelineCursor: number,
+  context: ElementRenderContext,
+): void {
+  const m = parentMatrixOf(
+    context.elements,
+    elementId,
+    timelineCursor,
+    context.memo,
+  );
+  ctx.transform(m.a, m.b, m.c, m.d, m.e, m.f);
+}
+
+export function renderElement<T extends VisualTimelineElement>(
+  ctx: CanvasRenderingContext2D,
+  elementId: string,
+  element: T,
+  timelineCursor: number,
+  controlOutlineEnabled: boolean,
+  renderFunction: ElementRenderFunction<T>,
+  context?: ElementRenderContext,
+): void {
+  const blend = context?.isolated === true ? DEFAULT_BLEND : blendOf(element);
+
+  /**
+   * The clip's colour grade, or `null` when there is nothing to do.
+   *
+   * Deliberately **not** suspended by `isolated`, which is the one place this
+   * differs from `blend`. A blend mode describes how a clip meets what is
+   * beneath it, and inside a transition there is nothing beneath it — so it is
+   * suspended. A grade is a property of the clip itself, in the same family as
+   * its opacity, its transform and its keyframes, and a cross-dissolve between
+   * two graded shots has to dissolve the *graded* pictures. Suspending it here
+   * would make a clip jump colour for the length of every transition.
+   *
+   * Resolved before the fast-path decision below rather than inside the layer
+   * branch, because a clip whose LUT is not installed must keep the untouched
+   * code path instead of allocating a layer in order to do nothing to it.
+   */
+  const grade = lutGradeFor(element);
+
+  /**
+   * The clip's colour adjustments, as two halves resolved here beside the
+   * grade and for the same reason: an unadjusted clip — or one whose sliders
+   * are all at zero — must keep the untouched path rather than allocate a
+   * layer to do nothing to it.
+   *
+   * `tone` is a LUT baked from the colour and lightness sliders and goes
+   * through the same applier as `grade`, *before* it: correct the shot, then
+   * apply the look. `finish` is sharpen, clarity, fade, vignette and grain,
+   * after it. Neither is suspended by `isolated`; see `adjust/apply.ts`.
+   */
+  const tone = adjustToneFor(element);
+  const base = destinationMatrix(ctx);
+  const finish =
+    context == null
+      ? finishRenderFor(undefined, elementId, element, timelineCursor, base)
+      : finishRenderFor(
+          context.elements,
+          elementId,
+          element,
+          timelineCursor,
+          base,
+          context.memo,
+        );
+
+  /**
+   * The clip's mask, in device pixels, or `null` when it cuts nothing.
+   *
+   * Resolved here, beside the grade and for the same reason — a clip whose mask
+   * is inert must keep the untouched code path rather than allocate a layer in
+   * order to do nothing to it. `pen` with fewer than three nodes is the case
+   * that matters in practice: it is what the clip looks like between the first
+   * click of a pen stroke and the third, and it must not blink out of existence
+   * while the user is drawing.
+   *
+   * The base matrix is read from `ctx` *now*, before any layer exists, because
+   * the layer inherits this exact transform below and `drawDirect` composes the
+   * element's own on top of it. Taking it from `worldMatrixOf` instead would be
+   * right in every node suite — they all draw at identity — and wrong in the
+   * app at any zoom but 100% on any display but 1x.
+   *
+   * Like the grade and unlike the blend, deliberately **not** suspended by
+   * `isolated`: a masked clip stays masked through a transition, because a mask
+   * is a property of the clip rather than of how it meets what is under it.
+   */
+  const mask =
+    context == null
+      ? maskRenderFor(undefined, elementId, element, timelineCursor, base)
+      : maskRenderFor(
+          context.elements,
+          elementId,
+          element,
+          timelineCursor,
+          base,
+          context.memo,
+        );
+
+  /**
+   * The frame this clip is being drawn over, for a renderer that has to read it:
+   * a text clip's frosted background band, and a shape's backdrop preset.
+   *
+   * Captured **here**, from `ctx`, because a few lines down `ctx` may be a
+   * transparent layer and the frame is then unreachable. The layer shares the
+   * destination's pixel grid, so the same backdrop serves both paths with no
+   * mapping; `renderer/backdrop.ts` states that invariant and checks it.
+   *
+   * `null` inside a transition, and that is the same reasoning `blend` follows
+   * three lines above rather than a second rule: `fx/compositor.ts#renderClip`
+   * draws each half into a cleared, transparent buffer, so there is no backdrop
+   * there to blur — a frosted band would sample nothing and come out as a hole
+   * in the dissolve. The band's own colour still draws, so the clip does not
+   * change shape for the length of the transition; it simply stops being glass.
+   *
+   * A shape's backdrop preset is the one exception, and reads the frame the
+   * transition is drawn over instead (`isolatedBackdropOf`): a mosaic that
+   * stopped for a dissolve would show the face it is there to hide.
+   */
+  const backdrop: Backdrop | null =
+    context?.isolated === true
+      ? isolatedBackdropOf(context.backdropFx, context.outerBackdrop)
+      : backdropOf(ctx, context?.backdropFx);
+
+  // Deliberately *not* suspended inside a transition, for the reason the mask
+  // and the grade are not: a border is a property of the clip, and a card that
+  // lost its border for the length of a dissolve would read as a bug rather
+  // than as a compositing decision.
+  const decorated = isDecorated(element);
+
+  // The path every clip took before blend modes existed, and the one almost
+  // every clip still takes. Byte-for-byte what it was: no layer is allocated,
+  // no extra blit is issued, and `golden.test.ts`'s digests are the proof.
+  if (
+    !isBlendIsolating(blend) &&
+    grade == null &&
+    tone == null &&
+    finish == null &&
+    mask == null &&
+    // A border or a drop shadow makes the clip several overlapping draws, which
+    // is the one thing this path cannot be exact for — the same reason text has
+    // always needed isolation. An *undecorated* clip is unaffected, which is
+    // what keeps `golden.test.ts`'s digests where they are.
+    !decorated
+  ) {
+    drawDirect(
+      ctx,
+      elementId,
+      element,
+      timelineCursor,
+      controlOutlineEnabled,
+      renderFunction,
+      context,
+      backdrop,
+    );
+    return;
+  }
+
+  const layer = layerFor(ctx);
+
+  if (layer != null) {
+    // Isolation: the clip is drawn whole — every sub-draw its renderer makes,
+    // in order, against transparency — and then composited once. Anything less
+    // blends a text clip's outline against its own fill.
+    layer.ctx.setTransform(ctx.getTransform());
+    // Inherited from the caller rather than reset: `globalAlpha` is a *group*
+    // multiplier here, and the FX compositor draws through this function with
+    // one already set. Baking it into the layer and blitting at 1 is also what
+    // gives "layer opacity, then blend" — the order Photoshop uses — instead of
+    // opacity fighting the blend per sub-draw.
+    layer.ctx.globalAlpha = ctx.globalAlpha;
+
+    drawDirect(
+      layer.ctx,
+      elementId,
+      element,
+      timelineCursor,
+      false,
+      renderFunction,
+      context,
+      backdrop,
+    );
+
+    // The clip is finished, alone, at destination resolution and against
+    // transparency — which is exactly the input a colour grade wants. Before
+    // the blend, so the order is "grade the clip, then combine it with the
+    // scene", which is what every NLE does and the only order under which a
+    // `multiply` clip and a graded clip mean independent things.
+    //
+    // Group opacity has already been baked in above, and that is harmless:
+    // `getImageData` and `texImage2D` both hand over *straight* colour, so a
+    // clip at 50% is graded as the colour it is rather than as a darker one.
+    // The clip's own corrections come first — its colour and lightness
+    // sliders, baked into a table and run through the same applier as the
+    // LUT — so the LUT is a look applied to a corrected shot, not a
+    // correction fighting a look. Lumetri's Basic-then-Creative order.
+    if (tone != null) {
+      applyLutGrade(layer, tone);
+    }
+    if (grade != null) {
+      applyLutGrade(layer, grade);
+    }
+
+    // Sharpen, clarity, fade, vignette and grain, after the look: fade has
+    // to see the graded blacks to lift them, and grain sits on top of
+    // everything. Before the mask for the reason the grade is — the GPU
+    // applier blits its result back with `copy`.
+    if (finish != null) {
+      applyFinish(layer, finish);
+    }
+
+    // After the grade, and the order is unobservable rather than arbitrary: a
+    // LUT is a colour transform and says nothing about coverage, so grading
+    // pixels that are about to be erased and erasing pixels that have just been
+    // graded produce the same layer. It goes here because the GPU applier
+    // finishes by blitting its whole result back with `copy`, which would
+    // refill a region the mask had already cleared.
+    if (mask != null) {
+      applyMask(layer, mask);
+    }
+
+    ctx.save();
+    // Identity, because the layer is already in the destination's pixel space —
+    // it was drawn under the destination's own transform.
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = blend;
+    ctx.drawImage(layer.canvas, 0, 0);
+    ctx.restore();
+  } else {
+    // No surface to isolate onto — a host with no `document` and no factory
+    // installed. Set the mode and draw straight through: exact for the element
+    // types that issue a single `drawImage` or a single `fill`, and never a
+    // blank frame.
+    //
+    // Text has never been in that set, and a **decorated** shape, image or
+    // video is no longer either: a shadow pass, the picture and a stroke are
+    // three draws, so under a non-`source-over` blend each blends against the
+    // one before it. The picture still lands; only the compositing of the
+    // decoration against it is approximate, which is the same bargain text has
+    // always taken here.
+    //
+    // A grade is simply lost here rather than approximated. There is nowhere to
+    // read the clip's pixels back from without also reading the scene under it,
+    // and grading the scene would be far more wrong than not grading the clip.
+    //
+    // A mask, unlike a grade, survives: a clip region needs no surface to
+    // composite onto, so it can be installed straight onto the destination.
+    // What it cannot express is the feather (a region has no partial coverage)
+    // and `invert` (a region intersects and cannot subtract) — `clipToMask`
+    // states both and drops an inverted mask rather than applying it the wrong
+    // way round, which would hide exactly the half the user meant to keep.
+    ctx.save();
+    if (mask != null) {
+      clipToMask(ctx, mask);
+    }
+    ctx.globalCompositeOperation = blend;
+    drawDirect(
+      ctx,
+      elementId,
+      element,
+      timelineCursor,
+      false,
+      renderFunction,
+      context,
+      backdrop,
+    );
+    ctx.restore();
+  }
+
+  // Deliberately outside the blend. The selection outline is chrome, not
+  // picture: under `difference` a blended one would render as its own inverse
+  // and become invisible on exactly the clip the user just selected.
+  if (controlOutlineEnabled) {
+    ctx.save();
+    if (context != null) {
+      applyParentTransform(ctx, elementId, timelineCursor, context);
+    }
+    applyElementTransform(ctx, element, timelineCursor);
+    const box = sampledBoxOf(element, timelineCursor);
+    renderControlOutline(ctx, 0, 0, box.width, box.height);
+    ctx.restore();
+  }
+}
+
+/**
+ * Place the element and draw it, straight into `ctx`.
+ *
+ * This is `renderElement`'s original body, unchanged. It is a separate function
+ * only so that the blended path can aim it at a layer instead of at the frame.
+ */
+function drawDirect<T extends VisualTimelineElement>(
+  ctx: CanvasRenderingContext2D,
+  elementId: string,
+  element: T,
+  timelineCursor: number,
+  controlOutlineEnabled: boolean,
+  renderFunction: ElementRenderFunction<T>,
+  context?: ElementRenderContext,
+  backdrop?: Backdrop | null,
+): void {
+  ctx.save();
+
+  // The box being drawn, which is the stored one unless a `size` track says
+  // otherwise. Substituted into the element rather than passed alongside it,
+  // so every element renderer keeps reading `element.width`/`element.height`
+  // and none of them had to learn that the box can move — the same reason the
+  // transform is applied to the context rather than handed over as a matrix.
+  //
+  // Identity is preserved when nothing is animated: that is every frame of
+  // every project that has never used the property, and a renderer holding a
+  // per-element cache must go on seeing the same object.
+  const { width, height } = sampledBoxOf(element, timelineCursor);
+  const sized =
+    width === element.width && height === element.height
+      ? element
+      : ({ ...element, width, height } as T);
+
+  const { opacity, startTime } = element;
+  const canAnimate = "animation" in element;
+
+  // Every link on this clip, once. `context` is what carries the element map,
+  // and a clip drawn without one — the rasteriser, a lone renderer test — has
+  // nothing to resolve a link against, which reads as "no link" and is the
+  // right answer there: both draw one clip in isolation.
+  const links =
+    context == null ? null : resolveLinks(context.elements, elementId, timelineCursor);
+
+  if (context != null) {
+    applyParentTransform(ctx, elementId, timelineCursor, context);
+  }
+  applyElementTransform(ctx, element, timelineCursor, links);
+
+  // Opacity
+  let opacityScaledBy100 = opacity;
+  if (links?.opacity != null) {
+    // A driven opacity replaces the track as well as the field — a link *is*
+    // the value. `localSampleAt` says the same for the transform channels.
+    opacityScaledBy100 = links.opacity;
+  } else if (
+    canAnimate &&
+    "opacity" in element.animation &&
+    element.animation.opacity.isActivate
+  ) {
+    opacityScaledBy100 = interpolate(
+      opacity,
+      element.animation.opacity.ax,
+      startTime,
+      timelineCursor,
+    );
+  }
+  // Ancestor opacity multiplies in alongside the element's own. Unlike position,
+  // scale and rotation this is a *group* convention rather than an After
+  // Effects one — AE parenting deliberately does not pass opacity down — but
+  // fading a group ought to fade what is in it, or the name misleads.
+  //
+  // `globalAlpha *=` was already a multiplication, so the two compose without
+  // either side knowing about the other.
+  if (context != null) {
+    ctx.globalAlpha *= inheritedOpacityOf(
+      context.elements,
+      elementId,
+      timelineCursor,
+    );
+  }
+  ctx.globalAlpha *= opacityScaledBy100 / 100;
+
+  // An image's or a video's outline: its box, with its corners rounded. Traced
+  // here, in box space and before the mirror and the crop, because both put a
+  // transform on the context that an outline must not inherit. Under a crop's
+  // scale the box would land on the uncropped frame, its corners would turn
+  // elliptical, and the crop's own clip would cut the border and the shadow
+  // away. Before the mirror, so a flipped clip keeps its corners where they
+  // are on screen.
+  const framed = isFramed(sized);
+  const radius = framed ? cornerRadiusAt(element, timelineCursor) : 0;
+  const outline = framed ? frameOutline(width, height, radius) : null;
+
+  const drawPicture = () => {
+    // Saved around the picture alone, so the decoration and the selection
+    // outline are drawn in clean box space. The mirror never needed it, since
+    // a flip about the box centre leaves a symmetric outline where it was, but
+    // a crop installs a clip region and a scale, and an outline drawn under
+    // those would be cut off and magnified.
+    ctx.save();
+
+    // A clip region and one draw is still one draw, so a rounded clip stays on
+    // `renderElement`'s fast path and needs no layer. Nothing is installed for
+    // a square one, which is what keeps `golden.test.ts`'s digests in place.
+    if (outline != null && radius > 0) {
+      ctx.beginPath();
+      outline.trace(ctx);
+      ctx.clip();
+    }
+
+    // Both inside the box and after the transform, so the picture turns over
+    // and is reframed while the box does not move. See `mirror.ts` and
+    // `crop.ts`.
+    //
+    // The mirror goes first, which is not arbitrary: it makes the *kept*
+    // picture the thing that turns over. Reversed, flipping a cropped clip
+    // would also slide its framing.
+    applyMirror(ctx, sized, width, height);
+    applyCrop(ctx, sized, width, height);
+
+    renderFunction(ctx, elementId, sized, timelineCursor, backdrop);
+
+    ctx.restore();
+  };
+
+  // The silhouette is the box, so a shadow cast from the box is a shadow cast
+  // from the picture. A transparent PNG therefore casts a rectangular shadow,
+  // which is what a card wants and what every design tool's Drop Shadow on a
+  // frame does, and a chroma-keyed video's keyed-out region still casts: the
+  // shadow belongs to the clip, and one that changed shape frame by frame as
+  // the key moved would read as a bug.
+  if (outline != null) {
+    paintDecoration(ctx, sized, outline, drawPicture);
+  } else {
+    drawPicture();
+  }
+
+  if (controlOutlineEnabled) {
+    renderControlOutline(ctx, 0, 0, width, height);
+  }
+
+  ctx.restore();
+}

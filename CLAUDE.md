@@ -1,0 +1,893 @@
+# Cartcut
+
+An Electron video editor (`cartcut-app`, formerly "nugget"). Lit web components
+and vanilla zustand in the renderer, plain TypeScript in the main process,
+FFmpeg for export.
+
+This file is a map and a list of invariants. It is loaded into every session, so
+keep it short: record what a reader cannot get from the code in a minute, and
+nothing else. Design history, changelogs and "how we know it works" belong in
+commit messages and in the tests.
+
+## Writing rules
+
+**Never use an em-dash (`—`) or a middle dot (`·`).** Not in code comments, not
+in documentation, not in commit messages, not in UI strings, not here. Write
+what the dash was standing in for: a comma or brackets for an aside, a colon for
+a consequence, a semicolon or two sentences for two joined thoughts, `1 to 10`
+for a range, `a * b` for multiplication, a real list for a list. An en-dash
+(`–`) is fine in a numeric range and nowhere else; a hyphen is always fine.
+
+Two habits for the same reason: no "It's not X, it's Y" constructions, and no
+rhetorical flourish where a fact belongs. A comment earns its length by naming
+the specific failure the line below it prevents.
+
+## Build layout: read this first
+
+`electron/` is **source**; `main/` is its **compiled output**, and `package.json`
+points `"main"` at `main/main.js`. Edit `electron/`, never `main/`.
+
+**`electron/` may not import from `apps/app/src`.** `.tsconfig/tsconfig.json`
+pins `rootDir: ../electron`; one such import widens it, the build relocates from
+`main/` to `main/electron/`, and the app stops finding its entry point. This is
+why the MCP tools talk to the renderer over IPC instead of calling the editing
+functions directly, and why the recorder tray crosses the boundary as data.
+
+`apps/app` has no `package.json`; the root webpack config builds it. The folders
+under `apps/` and `packages/` that *do* have one are standalone Vite apps with
+their own lockfiles. This is not an npm workspace.
+
+`server/` is the **Rust cloud content server** (`cargo test` there), not
+`electron/server/`, the Express server the app runs for the self-hosted web
+build. It has its own `Cargo.lock`, and `package.json` excludes it from the asar.
+
+`plugins/cartcut-editing/` is **published to users**, through the marketplace
+declared at `.claude-plugin/marketplace.json`. Its skill is the one the app's
+users get; it is no longer under `.claude/`, so editing it changes what ships.
+The plugin has to stay a subdirectory: a plugin's root `package.json` is
+installed by Claude Code, and pointing a plugin at the repository root would
+make installing it build the whole Electron app. The two versions, in
+`plugin.json` and in the marketplace entry, have to agree; `claude plugin tag`
+checks that, `claude plugin validate <path> --strict` checks the rest.
+
+The same skill ships a **second way**, through `npx skills add
+cartesiancs/cartcut`, which finds it by parsing `marketplace.json` and following
+the plugin's `./`-prefixed `source`. That path and that prefix are load-bearing
+for a route no `claude plugin` command exercises, and that route installs the
+skill alone: it does not read `.mcp.json`, so its users connect the bridge with
+the ⚡ panel's `claude mcp add` line. `npx skills add cartesiancs/cartcut --list`
+is the check, and must report one skill.
+
+A third route needs no install: the bridge serves the same file as the MCP
+resource `skill://cartcut-editing/SKILL.md`, read from `app.asar` on every
+request, and its instructions tell the model to read it when the skill is not
+in its own list (`electron/mcp/skillResource.ts`). The skill's path is
+load-bearing here too, and `skillResource.test.ts` pins it.
+
+FFmpeg and ffprobe live in `./bin/<platform>-<arch>/` (`darwin-arm64`,
+`darwin-x64`, `win32-x64`); `electron/lib/ffmpeg.ts` picks by `process.arch`.
+The macOS binaries must be **native**: an x86_64 ffmpeg runs under Rosetta at
+roughly half speed and says nothing. `lipo -archs bin/darwin-arm64/ffmpeg`.
+
+## Commands
+
+```
+npm run dev      # tsc --watch (main) + webpack --watch (renderer)
+npm run start    # electron .   (run in a second terminal)
+npm run dev:hot  # dev + start:hot in one terminal: reload on every build
+npm test         # vitest run
+npx tsc --noEmit -p ./.tsconfig    # typecheck the main process
+npx webpack --mode=development     # build the renderer once
+npm run build:overlay              # the screen recorder's own Vite app
+npm run build:speech               # the native STT sidecar (Swift, macOS only)
+npm run build:input                # the native mouse monitor (Swift, macOS only)
+```
+
+**Hot reload is development-only and opt-in.** `start:hot`
+(`scripts/devElectron.mjs`) restarts Electron when `main/` changes and sets
+`CARTCUT_HOT_RELOAD=1`; `electron/lib/devReload.ts` then reloads the editor
+window on a new renderer bundle (or swaps `style.css` alone in place), but only
+when `isDev` is also true. A reload drops the document and the undo history, so
+`npm run start` and the e2e harness never get it.
+
+`npm run dev` does **not** build `apps/overlay-record`; build it yourself after
+touching it or the recorder windows load a stale bundle. It does build
+`native/cartcut-stt` and `native/cartcut-input` (a staleness check plus two
+`swiftc` calls each) and skips them loudly on Windows, or for the speech one
+without the macOS 26 SDK.
+
+## How editing works
+
+The most important convention in the codebase. Every edit is a **pure function
+`(TimelineDocument) => TimelineDocument`**, applied through
+`useTimelineStore.withCheckpoint(fn)`, which records one undo step.
+
+**A pure op that declines returns its input, by identity.** `withCheckpoint`
+reads that as "nothing happened" and records no step, which is what makes a
+split off the end of a clip or a drag into an occupied slot cost the user
+nothing. Preserve it in any new op, and give every new op a co-located suite
+that covers the decline path as well as the happy one.
+
+```
+apps/app/src/@types/timeline.ts          element shapes, FILETYPES, animatable properties
+apps/app/src/features/timeline/tracks.ts     TimelineDocument, tracks, z-order
+apps/app/src/features/timeline/geometry.ts   trim/duration/speed invariants
+apps/app/src/features/timeline/clipOps.ts    split, trim, move, delete, removeRanges
+apps/app/src/features/timeline/placement.ts  where a new element lands
+apps/app/src/states/timelineStore.ts         the store, undo history
+```
+
+Two things about time that are easy to get wrong:
+
+- `trim` is a window into the **source file**, in source ms.
+  `duration === trim.endTime - trim.startTime`.
+- The clip occupies `[startTime, startTime + duration/speed)` on the
+  **timeline**. Use `spanOf`/`spanLength` and `timelineTimeAt`/`sourceTimeAt`;
+  never open-code the arithmetic.
+
+`priority` is derived from track order, never authored. Layering is track order:
+index 0 is the top row and the front of the composite.
+
+### Several timelines: main and the templates it owns
+
+"Expand Template" forks a placed template into the project as a
+**composition** (`features/composition/`): a timeline of its own, edited in a
+tab in the row above the timeline with the same timeline UI, named from the
+clip as
+`templateId: "project:<id>"`. Code says composition; the UI says Template.
+Three rules keep the data flow from tangling:
+
+- **The store holds the timeline being edited, and only that one, in
+  `timeline`/`tracks`.** Every other timeline is in `parked`, which never holds
+  the active id (`states/timelineWorkspace.ts`). Nothing that reads the store
+  had to learn timelines exist. Anything that means **the project** (save,
+  Auto Save, the dirty digest, recovery's emptiness, the export) reads
+  `composition/projectSnapshot.ts`, never the store's live fields, and the
+  render options' `previewSize` is the frame being edited, with main's kept in
+  `mainFrame.ts` while a template shows.
+- **One undo history for the whole project.** An entry snapshots every
+  timeline by reference. An edit inside a composition re-fits the main clips
+  naming it (`reconcile.ts`: shrink always, grow only into free space) in the
+  same step; an undo keeps the tab unless the composition is gone. Switching is
+  never a step, but it first commits anything previewed and uncommitted.
+- **What follows a switch follows the switch, whatever caused it.** The store
+  swaps each timeline's playhead, zoom and scroll and stops playback inside the
+  switch's own `set` (`timelineStore.ts#viewSwap`: a write from inside its own
+  listener reaches later listeners with the older state last). Everything in
+  other stores (selection, frame size, preview pan, the playback loop) is
+  `switchEffects.ts`, one subscriber. Gestures holding a document are ended
+  first (`editor/gestureCancel.ts`) and check `switchEpoch`; work that awaits
+  commits with `withCheckpointOn(timelineId)`, the timeline it started in.
+
+A composition cannot hold a template; the placement paths refuse with a
+message rather than the store declining.
+
+## Conventions that repeat across every feature
+
+Learn these five once and most of the codebase stops needing explanation.
+
+**A new feature is an optional field, and `SCHEMA_VERSION` does not move.**
+Project load *refuses* on a version mismatch; it is a compatibility check, not a
+migrator. So absent means default, answered on the way in, and setting a field
+back to its default **deletes the key** rather than storing it. A project nobody
+has used the feature on saves byte-identically to one written before it existed.
+`blend`, `lut`, `adjust`, `mask`, `reveal`, `geometry`, `reversed`, `mirror`,
+`cornerRadius`, `replaceable`, a group's `rig` and the conditional keyframe
+tracks all follow this. **A new filetype is one exception**, because an older build would
+throw on it mid-paint rather than ignore it: the two writers stamp
+`tracks.ts#schemaVersionFor(elements)`, which is 3 only while a `graphic`
+exists, and the readers accept 2 to 4 (`isReadableSchemaVersion`). Delete the
+last graphic and the project saves as 2 again. **A project owning a template
+is the other** (4, `projectSchemaVersionFor`): an older build would ignore
+`compositions.json` and its next save would delete the user's edited
+template for good, so it is refused instead.
+
+**`normalizeX` guards reads, `coerceX` validates writes.** The first runs on
+every draw and must never throw; the second runs once, where a value is stored,
+and makes an unusable value unrepresentable from then on. `normalizeFps` /
+`coerceFps`, `blendOf` / `coerceBlend`, `maskOf` / `coerceMask`, `adjustOf` /
+`coerceAdjustPatch`.
+
+**Anything animatable is an ordinary keyframe track in `element.animation`.**
+Never a bespoke field, with exactly one exception. A **speed ramp**
+(`speedCurve`, keyed in absolute source ms) cannot be a track: keyframe times
+are clip-local *timeline* ms, so a speed keyframe's own position would depend on
+the curve it defines, and a track is read from a lane baked at
+`bakeRateFor(fps)`, so a frame-rate change would re-integrate the curve and move
+the clip. `features/timeline/speedCurve.ts` states it at length.
+Everything that rewrites keyframes walks
+`Object.keys(animation)` or `animatableProperties(element)`, so split, trim,
+move, paste and a frame-rate change carry any track for free. A field of its own
+means reimplementing `cloneAnimation`, `rebaseAnimation`, `sliceAnimation` and
+`rebakeElement`, and the one anybody forgets fails silently on one edit.
+Unconditional tracks are seeded in `emptyAnimation`. Conditional ones are
+either minted by `keyframeOps.trackOrEmpty` when the stopwatch is armed and
+deleted when the last curve goes (`volumeDb`, `intensity`, `fx:<key>`,
+`cornerRadius`), or seeded and removed by the op that owns them (the mask's
+five, `revealProgress`). `keyframes.ts#carriesTrack` is the table of which is
+which.
+
+**Pure ops never read a store.** `features/timeline/` and `features/animation/`
+take `fps` (or `bakeHz`) as an argument, which is what keeps them DOM-free and
+node-testable. Only UI components and the agent commands read
+`renderOptionStore`.
+
+**DOM logic goes behind a narrow port.** There is no DOM test environment here,
+so a rule kept inside a Lit class is a rule nothing can check. Bootstrap, IPC
+bridges and `requestAnimationFrame` are each reached through a plain-record port
+(`ModalLike`, `TranscribePort`, `FrameScheduler`, `GainSink`, `ProjectPathPort`)
+so the behaviour runs under `environment: "node"` against a fake.
+
+Two Lit specifics: **components render into the light DOM** (70 of 70 override
+`createRenderRoot` to return `this`), because the global stylesheet does not
+cross a shadow boundary. So arbitrary content arrives as a `TemplateResult`
+property, never through a `<slot>`. And a custom element with no styles is
+`display: inline`, where width and height do nothing; a host that must be
+measured needs `display: block` or it measures 0x0 with no error anywhere.
+
+## Rendering and export
+
+Everything visual is composited in the **renderer, on a 2D canvas**, by one
+function: `renderTimelineAtTime` -> `paint` -> `renderElement`. The preview, the
+in-app export, the offscreen export window, the agent's contact sheet and the
+e2e reference render all call it, so preview/export parity is structural rather
+than maintained.
+
+**FFmpeg does no video compositing on the v2 path.** `renderTimeline.ts` hands
+it finished frames as raw RGBA over a pipe and the video branch is
+`[0:v]null[vout]`, a pass-through of already-drawn frames. A new visual property
+is a change to `renderElement` and to nothing in `electron/render/`. Audio is
+the exception: the filter graph does real work there (`atempo`, the volume
+envelope expression, `adelay`, in that order).
+
+**A GIF export is the other exception, and has no audio branch at all.** Its
+video branch resamples, resizes and quantises to a palette
+(`exportSettings.ts#gifFilterGraph`): one palette for the whole clip while the
+frames it must hold fit `GIF_PALETTE_BUDGET_BYTES`, one per frame after, since
+the first holds every frame until the last. Its options (`gifFps`, `gifWidth`)
+exist only while the container is GIF, so other projects save as before.
+
+**A browser build exports with no FFmpeg at all** (`features/export/web/`):
+MP4 (H.264 + AAC) and WebM (VP9 + Opus) for now. The frame loop is
+`renderTimeline.ts` with two ports swapped (`frameSource.ts`): WebCodecs decodes
+through Mediabunny, one forward-walking cursor per clip
+(`asset/webMedia/frameCursor.ts`), at the addresses `asset/frameAddress.ts`
+gives the `<video>` seek too, and each canvas is encoded as it stands. The sound
+is the desktop graph rebuilt in TypeScript (`web/audio/mixer.ts`), checked
+against the bundled ffmpeg running the desktop chain (`mixer.parity.test.ts`).
+Two things bite. An H.264 CRF becomes a bitrate, because a quantizer sends
+Chrome to its software encoder, about 9x slower. And an AAC encoder's priming
+(2112 samples on macOS) is measured per export (`codecSupport.ts`) and trimmed
+by an edit list, or the sound plays 44ms late. WebCodecs needs a secure
+context: a self-hosted build over plain HTTP anywhere but localhost cannot
+export.
+
+The order inside `renderElement`'s isolation layer:
+
+```
+drawDirect → tone (baked LUT) → clip LUT → finish → mask → blend
+```
+
+Things that bite:
+
+- **A blended clip is drawn in isolation**, onto a scratch layer from the
+  injected factory in `renderer/surface.ts`, because `renderText` issues up to
+  five overlapping draws per line that would otherwise blend against each other.
+  Blend is suspended inside a transition (`ctx` marked `isolated`); the mask and
+  the grade are not, because they are properties of the clip.
+- **Device space is not project space.** A mask, a vignette and any other
+  geometry resolved against the canvas must go through
+  `renderer/mask.ts#elementDeviceMatrix`, not `worldMatrixOf`: the preview's
+  context carries zoom and DPR on top of the project transform, so the wrong one
+  is exact in every node suite (all at identity) and misplaced in the app.
+- **An image's or a video's outline is traced in `element.ts#drawDirect`,
+  before the mirror and the crop**: its border, shadow and `cornerRadius`. A
+  per-type renderer runs under the crop's scale and clip, so an outline traced
+  there lands on the uncropped frame and the crop's clip cuts it away.
+- **A GIF frame is a patch, not a picture.** An encoder stores the rectangle
+  that changed and a disposal for it (58 of 59 frames in a Noto emoji), so
+  `renderer/gif.ts` builds each clip's picture on a stage of its own through
+  `gif/gifCompose.ts`, forward one patch per frame, and holds each frame for
+  its own delay (`gif/gifTiming.ts`). `gif.test.ts` checks every frame
+  against ffmpeg's own decoder.
+- **`timeline/transform.ts#sampledBoxOf` is the only way to ask how big a clip
+  is** at a cursor. Renderer, mask, selection outline, grips, hit test and resize
+  origin all go through it; one left reading `element.width` puts the picture in
+  one place and the pointer's idea of it in another.
+- **An export owns its decoders.** `features/asset/videoScope.ts` holds a named
+  handle set and `withVideoScope` makes it answer `getElementVideo` for one
+  composite, so editing during a render cannot tear a handle out from under the
+  frame loop. This is only safe because every renderer is synchronous; the moment
+  one gains an `await` the scope leaks into whatever runs next. No fallback to
+  the shared map inside a scope. **So does a contact sheet**, decoding only the
+  clips its instants show (`sheetAssets.ts`): it awaits a graphic's paint
+  between its seek and its draw, and on the shared handles every preview
+  repaint in that gap put the video back at the playhead.
+- **A shape's backdrop is an effect landed inside its outline**
+  (`backdropFx`): the compositor runs the preset over the frame beneath and
+  hands the picture to `renderShape` through a port on the render context
+  (`renderer/backdrop.ts`), so the shape's mask, opacity and blend apply to it.
+  Any frame holding one takes the scratch pass, because preset sizes are
+  project pixels. It **fails closed**: a backdrop that cannot land (no WebGL,
+  preset missing or of the wrong kind) draws the fill solid whatever
+  `fillOpacity` says, so a face mosaic never fails
+  see-through. Inside a transition it reads `outerBackdrop`, the frame the
+  transition is drawn over.
+- **A hidden track reaches the renderer as a derived `trackHidden` on each of
+  its clips**, written by `tracks.ts#derivePriorities` exactly as `priority`
+  is, because no render path below the store sees `tracks`. The paint loop,
+  `planFrame`, the preview hit test and the export's decoder set skip it; the
+  element stays in the map so parents and links still resolve. Nothing on the
+  audio path reads it, which is the design: the eye hides picture, never sound.
+- **A graphic is prepared before the composite, never inside it.** An HTML
+  graphic is laid out by Chromium (html-in-canvas, enabled on the editor window
+  only) and reaches the canvas only after a paint, so the sequence is plan
+  (`graphic/planGraphics.ts`, pure), prepare (`prepare.ts` over the
+  `HtmlRasterPort`, one queue) and then the synchronous composite draws the
+  raster. An export and the contact sheet await a prepare per frame into a
+  `withGraphicScope` of their own, the `withVideoScope` rule for rasters; the
+  preview fires and forgets and draws the latest raster per clip
+  (`previewSession.ts`, which also prepares the clips about to appear while
+  playing). **A host belongs to one caller**: a raster is the mount's own
+  canvas, so a second caller on the preview's host redraws what the preview
+  shows while its key still says current. Anything keyed per clip uses
+  `graphicInstanceIds`, which includes a template's graphics as `outerId::key`.
+  **No paint, no raster**: a window behind another one with throttling on
+  paints nothing, so an export, a contact sheet and a filmstrip hold it
+  painting (`paintHold.ts`, counted; main hands back the window's own
+  setting), and a prepare whose paint never came files nothing. A contact
+  sheet holds the queue one frame at a time, and every wait on a video seek
+  ends (`asset/seekWait.ts`): an edit that releases a handle mid-seek fires no
+  `seeked`, and a sheet that never answered kept the preview from preparing a
+  graphic for the rest of the session.
+  The HTML is sanitised into a node tree (parse5) and the CSS filtered (postcss)
+  on write *and* on read, and the host builds DOM from the tree, never from a
+  string. `features/graphic/` holds all of it; `htmlHost.ts` is the only file
+  that calls the canvas API, because its shape has changed once already.
+  **Both opt-ins are set on every mount**: Electron's Chromium 152 draws only
+  with `layoutsubtree`, and Chrome 157, which turns the API on by default, draws
+  only with `content="drawable"` plus `drawable` on the child (measured; the
+  old name throws there). **In a browser, support is a drawn pixel**
+  (`htmlSupport`), awaited before any prepare; Safari and Firefox answer no,
+  draw no graphics and say so once (`graphicSupportNotice.ts`, and a warning
+  before a browser export). A graphic's own pictures load through
+  `fileUrl.ts#installGraphicAssetUrlResolver` in a browser build, the
+  `installFontUrlResolver` rule for faces.
+- **`export/snapshot.ts` copies the element map and each element, one level
+  deep and no further.** The document is immutable by convention, so `animation`
+  (36,000 baked samples per lane) is safe to share and a deep clone would not be.
+
+## The project file, and Auto Save
+
+A `.ngt` is a zip of five JSON entries, read and written entirely in the renderer
+by `functions/project.ts`: `project.json`, `timeline.json`, `tracks.json`,
+`renderOptions.json`, `assetPaths.json`. Optional entries ride beside them
+and are absent when empty: `extensions.json` (see Extensions),
+`timelineView.json`, the height of every resized timeline row and the timeline
+notes (`noteStore`, same rules), over every timeline's rows, and
+`compositions.json`, the templates main names, each with its own asset paths
+(`project/compositionsFile.ts`; the schema exception above). Row heights are view state
+(`timeline/trackHeights.ts`): keyed by track id in `trackHeightStore`, never in
+`TimelineDocument`, so they are saved and make the project dirty but are never
+undone, and the caption lock does not stop a resize. Anything asking where a row
+is goes through `layout.ts#rowStack`.
+
+> **The in-memory `TimelineDocument` is always absolute.** A relative path
+> exists only inside the archive.
+
+Media is referenced by absolute path in `timeline.json` *and*, for anything
+inside the project's own folder, by a relative one in `assetPaths.json`. That is
+what makes a project folder portable; the absolute path is the fallback for a
+`.ngt` moved away from its media, so relinking is a preference and never a
+replacement. Conversion happens at the two file boundaries and nowhere else.
+
+`features/project/assetPaths.ts` has **no imports at all**, and path flavour is
+an explicit `"posix" | "win32"` parameter: `node:path` only answers for the host
+platform, which is the wrong one half the time, and both branches have to be
+covered on one CI host. Two facts it exists to survive: `localpath` is **not
+percent-encoded** despite usually being a `file://` URL (`functions/path.ts#encode`
+escapes `#` and nothing else), and **on Windows the URL is malformed**
+(`file://C:\Users\me\a.mp4`, drive letter where a host goes). Anything writing
+one must reproduce it, because `mergeOps` compares these strings to decide two
+clips share a source.
+
+Auto Save lands every timeline change in a per-project cache within seconds. A
+`.ngt` is written **only** by ⌘S, and a successful ⌘S drops that project's cache,
+so an empty "File ▸ Auto Save ▸" means nothing anywhere is unsaved. Recovery is
+explicit: the File menu is the only way in, and it refuses rather than
+overwrites.
+
+```
+apps/app/src/features/project/projectDirty.ts    the one owner of "is it dirty"
+apps/app/src/features/project/projectDigest.ts   the fingerprint
+apps/app/src/features/project/autosaveSession.ts the state machine, over ports
+apps/app/src/features/project/recoverAutosave.ts the guard and the load
+electron/lib/autosaveCache.ts                    the directory, plain fs
+```
+
+Five rules carry it:
+
+- **The anchor is path arithmetic, never an identity.** An autosave's
+  `assetPaths.json` is built against the project's SSOT path, not where the
+  autosave sits, or `relativizeInside` emits nothing. **It is never adopted as
+  the project's path**: recovery leaves `#projectFile` empty so ⌘S opens Save As
+  and the original is never touched. `recoverAutosave` holds a `ProjectPathPort`
+  it never calls and that throws if called, to keep that a node assertion.
+- **One recovery point per project, not a history.** Write the `.part`, rename
+  it into place, *then* unlink the superseded one, so there is no instant with no
+  recovery point. The filename carries the time, fixed-width and UTC, so a
+  lexicographic sort is chronological and the menu opens no zips.
+- **Two timers, and they are not the same timer.** 5s idle debounce re-armed by
+  every change; 60s ceiling armed on `idle → armed` and **never re-armed**, or a
+  ten-minute drag is never written at all. Armed implies a ceiling is pending, so
+  `ensureCeiling` is idempotent and the deferral paths call it too.
+- **Failure never clears dirt.** A write that rejects or answers `{ ok: false }`
+  leaves the session armed and backs off 5/15/45/60s. An autosave is not a save:
+  nothing on that path touches `projectDirty`'s baseline, and an *unestablished*
+  baseline reads as dirty, so the quit guard still fires.
+- **Main owns the directory.** `autosave:write` takes bytes and main mints the
+  filename; `autosave:dropRings` takes a key `isValidAutosaveKey` must accept.
+  There is no call shape in which the renderer names a path to delete.
+
+Use `ipcFilesystem.writeFileEnsured`, never `writeFile`: the older one calls the
+callback form of `fs.writeFile` and returns before it runs, so a failure is
+indistinguishable from success, and it does not create parent directories.
+
+## Where the features live
+
+One line each. The code and its co-located suite are the documentation; this is
+the index.
+
+```
+features/timeline/     clipOps, geometry, placement, mergeOps, frames, rippleMap
+features/animation/    keyframes (bake), keyframeOps (mint/arm), presets (19 moves)
+features/renderer/     element, video, image, text, shape, template, mask, blend,
+                       fx/ (compositor, planFrame), lut/, adjust/
+features/project/      the .ngt, autosave, asset paths
+features/export/       exportSession, phases, snapshot, the ETA singleton; web/,
+                       the browser export (its decoders in asset/webMedia/)
+features/agent/        commit, context, serialize, commands/, what MCP forwards to
+features/caption/      the auto-caption panel's every decision, and the session
+                       that owns the timeline while it is open
+features/window/       docked panels beside a host's content, one tabbed frame per
+                       side, splitter, pure layout
+features/mask/         one mask per clip: templates, bezier geometry, the pen session
+features/shape/        parametric outlines, over mask/geometry.ts unchanged; the
+                       backdrop (an Fx preset run inside the outline)
+features/lut/          .cube reading, tetrahedral sampling, atlas, 80 built-ins
+features/adjust/       15 sliders: tone bakes into a LUT, effects run a finish pass
+features/template/     a whole edit standing in for one clip (.cttpl)
+features/composition/  a template expanded into the project: fork, reconcile,
+                       switch effects, tabs, the project snapshot
+features/graphic/      layers drawn by a program: HTML typography (sanitise, split,
+                       contract, host, prepare) and the clock that survives a split;
+                       presets in assets/presets/graphics, contract in the skill's
+                       references/html-typography.md
+features/record/       the recorder's pure logic and its auto-zoom: zoomPlan (when),
+                       zoomCamera (how), recordFit (where); windows in apps/overlay-record
+features/reverse/      reversed media files, made by electron/lib/reversePipeline.ts
+features/track/        Auto Track: frame source, tracker, the path per project frame
+                       (toDisplayedPath), the null; Stabilize (stabilizeOp) and the
+                       two panel edits (trackEdits); the rig model is timeline/rig.ts
+features/prompter/     the teleprompter window: a script, then a scroll paced in
+                       lines per second by a session over ports
+features/note/         timeline notes: a pin drawn by the canvas, a card in the DOM,
+                       pinned to a time and a track, outside the document and undo
+features/speed/        the ramp's graph editor; the curve is timeline/speedCurve.ts
+features/update/       the update card; main's half is electron/lib/updateSession.ts
+features/cloud/        cloud content: store, merge rule, badge, the asset view, and the
+                       paged GIF section the asset panel shows by default; main's
+                       half is electron/lib/cloud/, the server is server/
+features/gif/          a GIF's frames: decode, per-frame timing, disposal compositing
+features/settings/     the settings dialog behind the gear beside Export: sections
+                       down the left (General's language, cloud, storage); labels
+                       only. Storage's disk work is main's, electron/lib/storage/
+features/mediaInfo/    Show Info: labels and layout here; the ffprobe call and its
+                       parse are main's, electron/lib/mediaInfo*.ts
+features/motion/       a damped spring as a CSS linear(): the tour, the tile hover,
+                       the asset browser's cloud switch; cascade (tiles in by
+                       screen position)
+features/tutorial/     the coachmarks after the tour: seven steps judged from
+                       snapshots, a pure runner over ports; targets are data-tutorial
+features/editor/       actions, menuCommands, shortcuts, frameRate
+features/extension/    the extension host's editor half: bridge, dispatch, batches
+features/mobile/       the web build on a phone: touch to mouse bridge, the phone
+                       layout (CSS over the desktop columns), its tool row and sheets
+electron/extension/    the extension host, its protocol, the webview sandbox
+electron/mcp/          the MCP server, the tools, the bridge to the renderer
+electron/render/       ffmpegArgs, the frame pipe, the audio envelope expression
+electron/lib/          ffmpeg, menus, autosave cache, recorder, speech, templates,
+                       the updater
+```
+
+The handful of facts inside those that are worth stating up front:
+
+- **The frame rate is a project setting on `renderOptionStore`**, whole integers
+  1 to 240, not in `TimelineDocument` and not in `ExportSettings`. NTSC rates are
+  rational and admitting them means carrying a rational through `frames.ts` and
+  the exporter. `features/editor/frameRate.ts#setProjectFps` is the only writer
+  and sequences the three consequences (re-clamp zoom, re-snap playhead, re-bake
+  animation). **Clips do not move**: a rate change is a change of grid, not a
+  re-cut. **The grid does not apply to audio** (`frames.ts#isFrameLocked`), on
+  drag only, and one gesture is one delta so a picture clip in the selection
+  keeps the grid on for everything.
+- **A speed ramp is a curve in source time, and `speed` is derived from it.**
+  While `speedCurve` is present, `element.speed` holds
+  `duration / curveSpanLength(curve, trim)`, so `spanLength` is still
+  `duration / speed` and every collision, ripple, placement and layout call site
+  is untouched. The curve and the scalar agree **exactly at both clip edges**
+  and differ only inside, which is what makes a call site nobody generalised
+  show a slightly wrong frame mid-clip rather than a wrong length. Anything
+  writing `trim` on a ramped clip has to re-derive the scalar:
+  `clipEdit.ts#withTrim` covers trim and split, and `mergeOps`, `reverseOps` and
+  `audio.ts`'s detached twin each call `withDerivedSpeed` themselves. FFmpeg
+  cannot ramp audio (measured: stepping `atempo` through `asendcmd` loses 21ms
+  to 161ms over ten seconds, and loses more the finer the steps), so
+  `electron/render/renderedAudio.ts` retimes a ramped clip's sound with our own
+  WSOLA before the spawn and hands FFmpeg a 1x input.
+- **`size` and `scale` are different things.** `scale` is uniform, in tenths,
+  about the centre, and never touches the box. `size` replaces the clip's own
+  `width`/`height` in pixels on the way to the renderer, so a keyframed property
+  behaves exactly like the static field it keyframes.
+- **A group element *is* After Effects' null object.** There is no
+  `filetype: "null"` and adding one would break two rules keyed on the string
+  `"group"`: `hierarchy.ts#parentOf` admits only a group as a parent, and
+  `isVisualTimelineElement` excludes only a group from the paint loop. `setParent`
+  rewrites the child's numbers once, at the instant of parenting; after that the
+  matrix is composed at draw time and the child's curves are never written again.
+- **A template stores a reference, not a copy** (`templateId` + `fills`),
+  resolved at draw time from `templateRegistry`, exactly as `lut.presetId`
+  resolves; a `project:` id resolves to a composition in the store. A template
+  that is not installed draws nothing and reports nothing. Composed keys are
+  namespaced `outerId::innerKey` or two copies share one decoder, and every
+  reference between them moves too (`timeline/elementRefs.ts`). Its effects,
+  transitions and backdrops draw through the compositor's child
+  (`FxCompositor#child`). `expandTemplates` is for the asset layer and the
+  export's audio, never the picture, and cuts the contents at the clip's bar.
+  An export and a contact sheet resolve templates from what they captured at
+  the start (`withTemplateResolver`), the `withVideoScope` rule.
+- **A missing preset, LUT or template renders as a pass-through**, silently.
+  That is the contract; do not make one of them throw.
+- **Called a LUT, never a "filter".** `VideoElementType.filter` already owns that
+  word for the chroma key and the blurs. Likewise **pen** means the mask tool; the
+  create menu's click-to-append tool is "Polygon".
+- **`speechBin.ts` decides availability in JS before anything is spawned.** The
+  STT sidecar is a process, not a N-API module, built at a macOS 12 deployment
+  target so its macOS 26 Speech symbols stay weak imports and it can report
+  `requires_macos_26` instead of failing at `exec`. Word timings live on the runs
+  of the `AttributedString`, not on `Result.range`.
+- **The auto-caption panel edits the live timeline, and Apply is the only thing
+  that keeps it.** From the moment a transcript lands, the document in the store
+  is a *projection* of a held baseline and whatever the panel says
+  (`captionProjection.ts`), rebuilt from that baseline on every change and
+  written through `previewDocument`, so no intermediate state records an undo
+  step. The silences are swept at once but **not cut**: they are listed between
+  the lines as empty space (`captionList.ts`) and only the footer's silence
+  button removes them (`silenceButton.ts#SILENCE_CUT_ON_START`), so by default
+  the panel adds captions to the timeline as it stands. The captions land one at a time
+  from 0ms forwards (`captionReveal.ts`), and editing a caption's text reaches
+  its clip on the next frame. `applyCaptionCommit` stays as the *definition* of
+  the finished edit, and the sequence is tested against arriving where it does.
+  - **The silence toggle is not an undo.** `removeRanges` has no inverse; both
+    states are built from the same baseline, which is what makes the round trip
+    exact down to the element ids.
+  - **Ids are minted once and keyed**, a caption's by its line's id and a cut's
+    by the cut's index. A running pool would rename every piece on every frame
+    of the reveal, and `loadedAssetStore` caches decoders by element id.
+  - **Several clips are one session.** The picker
+    (`apps/automatic-caption/src/clipPicker.ts`, its own dark overlay, since
+    the vendored Bootstrap 5.0.2 has no dark modal) hands over an ordered list.
+    Every line carries its clip's `sourceKey`, and `clips.ts` trims each
+    transcript to its clip's window. Cuts are tracked **per track** but made
+    with each clip's own list on that clip's own pieces: a range merged across
+    two clips is clamped to one piece and half of it silently stays. Split ids
+    are keyed by clip, then by index within the clip, so an edit in one clip
+    never renames another's pieces.
+  - **`timelineLockStore` is ephemeral, deliberately.** A `locked?: true` on
+    `TimelineTrack` would persist, undo and save for free, and would also
+    survive a crash as a lock with no holder and no way to release it. Five
+    gates refuse while it is held (`actions.ts#commit`, `agent/commit.ts`, the
+    timeline canvas, the preview canvas, `GestureCommit.apply`); the playhead,
+    playback and the selection are left alone.
+  - **A handler passed into another component's template binds `this` to that
+    component.** `Control` builds the panel's template and `<app-window>`
+    renders it, so Lit's listener host is the window. All four of the panel's
+    handlers are arrow properties for that reason, and `changeCursorType` was
+    silently dead as a method.
+- **The window system's clamp precedence is `host > window min > content min`.**
+  A rect outside the host is invisible rather than small, and invisible in a way
+  no `getBoundingClientRect` check can see, because the column carries
+  `overflow: hidden`.
+- **Stabilize moves the picture, never the footage's numbers.** The rig is a
+  root zoom group (pivot on the target, scale = the zoom) holding a camera
+  group whose position is `K - null`, value for value and on the null's own
+  time base, holding the footage and its nulls. Their `parentId` is written
+  directly, because `setParent` rewrites numbers through a float round trip
+  even for an identity, so taking the rig apart is dropping `parentId` and
+  exact. Deleting or ungrouping either group does that; both are
+  duration-locked; `setParent`, `createGroup` and the parent picker decline
+  rig members; the preview does not hand them to the pointer. A track is
+  measured without the camera (`rig.ts#preRigElements`) and per project
+  frame at the source frame on show (`toDisplayedPath`). Where a frame centre
+  lands exactly on a source frame's start (60fps footage at 30, 24 at 60 on
+  every fifth frame) the decoder shows the earlier frame two times in three and
+  the later the third, measured end to end in `stabilize.spec.ts`; the path
+  predicts the earlier.
+- **A recording's zoom is keyframes, never pixels.** The composite pass draws the
+  capture 1:1; `features/record/` plans a camera from the cursor and click tracks
+  and writes it to the clip's `size` and `position`, so it stays editable and
+  costs no second encode. Five things carry it. **A click always earns a zoom**,
+  which is what `zoomPlan.ts#packSegments` exists for: a dwell is an inference and
+  may be dropped when there is too much to zoom at, a press is the user saying
+  "this". Two clusters that cannot both have a move shorten, then merge, and never
+  drop; the budget only ever spends dwells; and a move whose activity runs to the
+  last frame is clamped into the take rather than refused. Auto Zoom is therefore
+  `off`/`on` and not a strength: depth is already decided per move by how
+  localized the thing that earned it was. The **fit is not optional**:
+  `buildVideo` hands over a clip at its native pixel size at (0,0), so a
+  3024-wide capture arrives a quarter visible against the top left corner whether
+  or not anything zooms, and `recordFit.ts` is what places it. Zoom is measured in
+  **cover units**, where 1 means the picture exactly fills the frame, which makes
+  the whole mapping two lines with no special case for the resting pose. **At
+  `z = 1` the only legal aim is the centre**, so every ease carries an instant at
+  that crossing with the aim still centred, and past it covering is free by
+  convexity because `size` and `position` interpolate linearly together. And the
+  clamp belongs to the *project frame's* aspect, not the capture's: getting that
+  wrong is exact in every node suite whose fixtures share one aspect and shows as
+  background at the edge of a zoom in the app. Finally, the plan is laid out
+  against the **clip's** span and never the recording's: main's media clock and
+  the muxed container disagree by a few hundred milliseconds, and planning against
+  the longer put the release past the end, where it was filtered out and the take
+  finished still fully zoomed.
+- **`native/cartcut-input` reports what the mouse did, never where.** A click's
+  position is the pointer's position, and `recordSession.ts#capturePointNow`
+  already maps a screen point into capture pixels exactly; reproducing that from
+  Cocoa's bottom-left coordinate space would be right on one monitor and wrong on
+  three. It logs no keycodes and never will. Apple gates global monitors on
+  accessibility trust **for key events**, which is why clicks ship and typing does
+  not; the sidecar reports its `trusted` flag and main logs it, because that claim
+  is only really tested when the app spawns it.
+- **The screen recorder encodes on a fixed-rate clock**, not as frames arrive,
+  so frame `n` *is* at `n / fps` and the bytes need no container: a bare Annex-B
+  stream that ffmpeg copies with `-r` and `-c:v copy`. The overlay window is
+  `setContentProtection(true)` so the compositor leaves it out of the capture.
+- **A menu accelerator fires whatever the page does with the same keystroke**,
+  and a renderer `preventDefault` does not cancel it. For a combination the
+  renderer already binds, the item carries the accelerator but declines to send
+  it (`rendererOwnsKey`, tested against `event.triggeredByAccelerator`), or one
+  ⌘Z is two undo steps. Space, the arrows and Delete are not registered at all:
+  an accelerator is global to the window and would fire while someone types.
+
+## Extensions
+
+`electron/extension/` runs a **VS Code shaped extension host**: one
+`utilityProcess` forked by main, shared by every extension, with no DOM, no
+store and no `electronAPI`. That process boundary is the whole protection. A
+crashed extension costs the user that extension; the timeline, the undo
+history and the unsaved project are somewhere else.
+
+Two ports, and they are not the same port. **Port R** runs host to editor
+renderer *directly*, carrying every edit, read and event, so a wedged host
+cannot block the process that owns the menu and the windows. **Port M** runs
+host to main and carries only what main alone can do: dialogs, the keychain,
+the menu, MCP tool registration. `electron/extension/protocol.ts` and `rpc.ts`
+are compiled into all three processes, and the renderer reaches them through
+the single facade `features/extension/shared.ts`.
+
+```
+electron/extension/     host, hostMain, api, rpc, protocol, manifest,
+                        permissions, scheme, webviewGuard, viewBridge, services
+apps/app/src/features/extension/   bridge, dispatch, transaction, contributions,
+                        events, keybindings, views, elementData, projectData
+packages/extension-api/ the published `cartcut` .d.ts and its README
+tests/fixtures/extensions/hello/   the fixture that exercises every seam
+```
+
+Six rules carry it:
+
+- **The editing API *is* the agent command table.** `commands.execute` goes to
+  `features/agent/registry.ts`, so an extension's edit is the same code path a
+  Claude Code tool call takes: one `commit`, one undo step, lock-respecting,
+  whitelisted by `writable.ts` going in and `serialize.ts` coming out. There is
+  no second edit path and nothing hands over the document.
+- **`commit` is the only thing that records a step.** A batch opens a collector
+  (`features/extension/transaction.ts`), `commit` folds into it, and
+  `currentDoc` returns the working document so step N sees step N-1. A batch is
+  **synchronous and closes in one tick**: an `await` would let an unrelated
+  edit land inside somebody else's undo step, so an async command is refused.
+  The three commands that used to pair `ensureUndoBaseline` with
+  `withCheckpoint` by hand now call `commit.ts#checkpoint`.
+- **Renderer extension points are data, never code.** FX presets, templates
+  and animation presets go through the existing validators with `origin:
+  "extension"`. The compositor is synchronous and "Nothing executes" still
+  holds. `PresetName` stays a closed union: a contributed animation preset is
+  a `PresetShape` under `ext:<extId>:<name>` and runs through
+  `applyPresetShape`, the same function the nineteen built-ins reach, so
+  `presetNames()` is unchanged and `tools.test.ts`'s pinned list stays green.
+  **Fonts and themes are not contributable**: `@font-face` rules are never
+  removed and `fontFaces.ts`'s `registered` set has no unregister, so a
+  contributed font could not be unloaded; and there is no token layer to theme,
+  six CSS custom properties exist in the whole stylesheet and five are
+  geometry. Both need their own groundwork first.
+- **Custom UI is a `<webview>`, forced into shape by main.**
+  `will-attach-webview` sets `sandbox`, `contextIsolation`, our preload and a
+  `persist:ext:<id>` partition, and refuses any `src` that is not
+  `cartcut-ext://<an enabled extension>/`. Two things bite: `protocol.handle`
+  registers on **one session**, so the handler is installed on each guest
+  partition too or a panel's own pages never load; and `did-attach-webview`
+  fires **before** the guest navigates, so `guest.getURL()` is empty there and a
+  navigation guard keyed on it blocks the panel's first load.
+- **Port pairs carry a generation, and the counter never resets.** The fork and
+  the page load are not ordered against each other, so two pairs really are in
+  flight on a first launch and both ends must converge on the highest. Resetting
+  the counter for a new host leaves the renderer ignoring every port the
+  replacement sends.
+- **Permissions are disclosure and API gating, not a sandbox.** A
+  `utilityProcess` has Node and it cannot be taken away; `node:vm` is not a
+  boundary and is not used. Main gates Port M against *its own* validated
+  manifest rather than anything the host reports.
+
+An extension can **stop an export**. `onWillExport` runs after the destination
+is chosen and before any phase is entered, so a veto costs nothing; it is
+bounded and fails open, because an export a broken extension could make
+impossible is worse than one that ignored a warning. `onDidExport` fires from
+`event.ts`'s `PROCESSING_FINISH` and nowhere else: `exportSession`'s
+`finalizing` is not the end, FFmpeg is still muxing there.
+
+Extension data is an optional top-level `ext` key on an element, keyed by
+extension id, plus a sixth `.ngt` entry `extensions.json`. Both follow the
+optional-field rule, so `SCHEMA_VERSION` does not move and a project nobody has
+run an extension on saves byte-identically.
+
+`features/extension/imports.test.ts` pins the wall in both directions: which
+files may reach into the subsystem, and what the subsystem may reach.
+
+## The Claude Code bridge
+
+`electron/mcp/` runs a Streamable HTTP MCP server on `127.0.0.1:9826/mcp`,
+bearer-token authenticated, started with the app. Its tools validate with zod and
+forward to `apps/app/src/features/agent/`, which runs the real commands against
+the store, so an AI edit takes the same code path and the same undo step as the
+user's mouse. Every mutating command goes through `commit(fn, declineReason)`.
+
+Four constraints:
+
+- **`tools.ts` must stay a barrel**, not `tools/index.ts`. Both resolve for
+  `import … from "./tools"` and nothing cleans `main/`, so a stale
+  `main/mcp/tools.js` would shadow the directory and ship an old tool list.
+- **`registerTool`'s generics must stay erased**, through the hand-written
+  `Registrar`. Inferring handler arguments from the zod shapes costs about 10s
+  per tool and exhausts the compiler's heap. Do not "clean it up".
+- **Tool output is capped** (Claude Code warns at 10k tokens, truncates at 25k).
+  Never return a raw element; add fields to `serialize.ts`'s whitelist
+  deliberately.
+- **Hand copies are pinned by `tools/tools.test.ts`**, including `FILETYPES`,
+  `ANIMATABLE` and the preset lists against their `@types/timeline.ts` originals.
+  Adding a tool is a one-line diff a reviewer sees.
+
+Connect with the command under the ⚡ icon at the bottom right of the app, or set
+`CARTCUT_MCP_TOKEN` and use the committed `.mcp.json`.
+
+`packages/mcp-bridge/` is the **stdio route to the same server**:
+`@cartesiancs/cartcut-mcp` on npm, listed in the official MCP Registry as
+`io.github.cartesiancs/cartcut`. A relay, not a second server, so nothing about the tools is taught to it. It
+reads the token from electron-store's `config.json` under `userData`, which is
+why a top-level `productName` or a new root `name` would break it;
+`manifest.test.mjs` pins that, the port and the token key. Plain `.mjs` with no
+dependencies, so `npx` starts it without an install and the tested files are the
+shipped ones. A release is `npm publish` then `mcp-publisher publish`, in that
+order: the registry checks the published package's `mcpName`. The version
+appears three times across `package.json` and `server.json`, and a registry
+version can never be republished.
+
+## Cloud content
+
+Free effects, transitions, graphics, LUTs, templates and media come from
+`server/` and are **downloaded before use**. A downloaded item is an ordinary
+installed folder: `preset:list` and `template:list` scan `userData/cloud/` as a
+fourth root with origin `"cloud"`, so the validator, the registries and the
+renderer have no cloud path of their own. Four rules carry it:
+
+- **Main is the gate and owns every URL and path.** `cloudSession.ts` answers
+  without a request when `cloud_api_enabled` is `false` (absent means off in a
+  development build, on in a packaged one) or `net.isOnline()` says no; the
+  renderer names an item by kind and id only. The switch goes through
+  `cloud:setEnabled`, never `store:set`, so main can abort.
+  The server is Settings' `cloud_api_url`, else `CARTCUT_CLOUD_URL`, else
+  `config.json`'s `cloudApiUrl`, in every build; changing it drops the catalogs.
+- **Cloud is always last.** Scanned last, so first-wins never lets it shadow a
+  local preset; ranked last by `originRank`, so `presetsOfKind("transition")[0]`
+  stays a built-in. Within a section, downloaded and undownloaded cloud items
+  sort together by name (`cloudMerge.ts`), so a tile does not move on install.
+- **Staging is outside every scanned root**, because the preset scanner reads
+  any folder holding a `manifest.json`.
+- **A "not installed" answer must be forgettable.** `lutRegistry`,
+  `templateRegistry` and both preview providers cache failures for good; the
+  one that means "no such id" is tagged and dropped when the registry changes,
+  or a project opened before its download draws nothing until a restart.
+
+The server serves only files its startup scan indexed, looked up by
+`(kind, id, path)`, never by joining the request onto the content folder.
+
+**GIFs are the one kind never listed whole, and a GIF is one file.** Its name
+is its tags split on `_` (`server/src/gifs.rs`), its id a hash of that name,
+and nothing sits beside it: adding one is copying a `.gif` into
+`server/content/gifs/` and sending the server SIGHUP. `/v1/catalog/gif` is a
+404; the GIF section (under the user's own files in the asset panel, no
+cloud button needed, and nothing asked until it first scrolls into reach)
+reads `/v1/gifs` a page at a time (`q`, `cursor`, and a
+`rev` that changes with the catalogue, on which a scroll starts over), and a
+download looks its item up by id (`/v1/gifs/item/{id}`), never in a cached
+list. `scripts/cloud/gifs/` writes the bundled set this way: Noto Animated
+Emoji (CC BY 4.0), Fluent Emoji (MIT) and Meteocons (MIT), credited under the
+grid and in `gifs/CREDITS.md`.
+
+`server/content/` is the live catalogue and is **never in this repository**:
+`.gitignore` drops `/server/content/` (anchored, so `server/tests/fixtures/
+content` stays tracked) and the folder keeps its own git history. Nothing
+validates it before a user downloads it, so check it with
+`npx jiti scripts/cloud/checkContent.ts --strict --plan --require-thumbnails`
+(the validator, the catalog parser, a GLSL ES 1.00 lint, one name and one
+pipeline per item against every built-in) and
+`npx jiti tests/e2e/cloud/renderThumbnails.ts` (compiles and judges each item
+in a hidden instance and writes its `thumbnail.webp`).
+
+## Testing
+
+Vitest, suites co-located with sources. `features/timeline/` and
+`features/animation/` are deliberately DOM-free and run under
+`environment: "node"`; the renderer suites draw onto a real Skia canvas via
+`@napi-rs/canvas` and assert on pixels.
+
+Two habits worth copying. **Check against something that shares no code with the
+subject**: the LUT and audio-envelope suites run the bundled ffmpeg and compare
+it to our own sampler, which is the only way to catch a grade or a fade that is
+plausibly wrong rather than broken. And **prove the harness measures something**:
+hand the two sides different inputs and require them to disagree.
+
+`@napi-rs/canvas` applies the current transform to `putImageData`, which the spec
+says to ignore and Chromium does ignore. Both CPU appliers write back under an
+explicit identity; anything new that reads a layer back must do the same.
+
+```
+npm run test:e2e:fixtures   # download and derive the media, once
+npm run test:e2e:smoke      # ~1 min at 360p30, for iterating
+npm run test:e2e            # 5 min at 1080p60, 18,000 frames
+npm run test:e2e:check      # typecheck the suite on its own
+```
+
+`tests/fixtures/extensions/hello/` is the extension fixture. Load it with
+Extensions ▸ Load unpacked; its `crash` and `hang` commands are there to be run,
+because surviving them is the claim the whole subsystem makes.
+
+`tests/e2e/` launches the real app, builds a project holding every element type,
+clicks the real Render button and checks the delivered file frame by frame. It
+lives outside the vitest include patterns and outside the root `tsconfig.json`
+(which has no `include`, so `tests` must be excluded explicitly or the harness
+lands in the bundle's type program and breaks webpack). Start with
+`tests/e2e/README.md`, and `tests/e2e/FINDINGS.md` for what it currently reports,
+including a one-frame-in-three seek defect that makes it fail against `main`.
+
+## Known rough edges
+
+- Undo history stores post-edit snapshots only and nothing checkpoints on load,
+  so the first edit after opening a project is not undoable. The agent works
+  around it in `features/agent/checkpoint.ts`; the app does not.
+- **`fluent-ffmpeg` cannot read this ffmpeg's capabilities.** The bundled binary
+  is ffmpeg 9, whose `-formats` output puts two spaces between the flag column
+  and the name; the 2.1.2 parser expects one. Its capability list comes back
+  empty and every `.format(...)` is rejected against a binary whose own
+  `-muxers` lists it. Spawn ffmpeg directly for anything new. The wrapper
+  survives only in `render/renderMain.ts`, the legacy `RENDER` ipc path that
+  nothing calls.
+- Video filters (`chromakey`, `blur`, `radialblur`) go through WebGL rather than
+  the 2D context, and are the one part of the picture path not confirmed end to
+  end. Renderer-side compositing *is* confirmed to reach the delivered file
+  (`blend.spec.ts`, `lut.spec.ts`), so the `[0:v]null` branch is a pass-through
+  of filtered frames and not a discard, but check `chromakey` yourself before
+  relying on it.
+- The playback loop reads the wall clock and drives the cursor from
+  `requestAnimationFrame`; only the value is quantized
+  (`timeline/playbackClock.ts`). It does not drop or pace frames.
+- Cross-component calls are frequently `document.querySelector("element-…")`
+  followed by direct property access.

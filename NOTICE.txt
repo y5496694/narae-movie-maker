@@ -1,0 +1,13 @@
+Narae Movie Maker / 나래 무비메이커
+
+Derived from CartCut v0.6.1
+Upstream source: https://github.com/cartesiancs/cartcut
+Copyright (c) 2025 cartesiancs
+
+The original MIT license is preserved in LICENSE.
+All upstream editing, rendering, preset and extension source features are retained.
+This derived build adds the Narae identity and an independently launched CLI engine.
+Third-party dependency licenses remain with their respective packages and assets.
+
+Narae Movie Maker project creator: @y5496694
+Narae additions Copyright (c) 2026 y5496694. Distributed under the same MIT license.

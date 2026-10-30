@@ -1,0 +1,93 @@
+{
+  "total": 11151,
+  "passed": 11116,
+  "failed": 27,
+  "skipped": 8,
+  "files": 544,
+  "failedFiles": 11,
+  "success": false,
+  "classification": "All 27 assertion failures are the same remaining baseline Windows/platform assumptions, hashes, symlink privilege and font/raster expectations. Media probe fixture setup separately rejects unsupported display_rotation on bundled FFmpeg5.1.2.",
+  "failures": [
+    {
+      "file": "electron/lib/mediaInfoProbe.test.ts",
+      "tests": []
+    },
+    {
+      "file": "electron/mcp/localpath.test.ts",
+      "tests": [
+        "toFsPath strips the file:// scheme a clip's localpath carries",
+        "toFsPath decodes percent-encoding, so a name with spaces resolves",
+        "toFsPath accepts the scheme in any case",
+        "toFsPath hands back a url it cannot convert, rather than throwing",
+        "toFsPath resolves an explicit localhost host"
+      ]
+    },
+    {
+      "file": "electron/render/ffmpegArgs.test.ts",
+      "tests": [
+        "localFilePath decodes a file:// URL back to a path",
+        "localFilePath undoes percent-encoding, which is why `fs` cannot take the URL",
+        "localFilePath hands back anything it cannot parse, so the caller calls it missing",
+        "missingInputs says nothing when every audible clip has its file",
+        "missingInputs names the file that is gone, as a path `fs` would accept",
+        "missingInputs lists each missing file once, however many clips use it"
+      ]
+    },
+    {
+      "file": "apps/app/src/vendorSync.test.ts",
+      "tests": [
+        "apps/app/vendor 'apps/app/vendor/bootstrap.min.css' matches 'node_modules/bootstrap/dist/css/boots…'",
+        "apps/app/vendor 'apps/app/vendor/bootstrap.bundle.min.…' matches 'node_modules/bootstrap/dist/js/bootst…'",
+        "apps/app/vendor 'apps/app/vendor/devent-designsystem.c…' is unmodified"
+      ]
+    },
+    {
+      "file": "electron/lib/storage/tempFiles.test.ts",
+      "tests": [
+        "removeSweeps removes a link without following it"
+      ]
+    },
+    {
+      "file": "apps/app/src/features/element/textFit.test.ts",
+      "tests": [
+        "fittedHeightWith counts lines the wrap added, not just the ones the author typed"
+      ]
+    },
+    {
+      "file": "apps/app/src/features/lut/lutCatalogue.test.ts",
+      "tests": [
+        "the files match their recipes regenerate byte for byte"
+      ]
+    },
+    {
+      "file": "apps/app/src/features/renderer/golden.test.ts",
+      "tests": [
+        "golden frames composites a stable frame at each sampled timecode",
+        "golden frames — blended composites a stable frame at each sampled timecode",
+        "golden frames — adjusted composites a stable frame at each sampled timecode",
+        "golden frames, scaled composites a stable frame at each sampled timecode",
+        "golden frames, rounded composites a stable frame at each sampled timecode",
+        "golden frames, with a shape recipe composites a stable frame at each sampled timecode"
+      ]
+    },
+    {
+      "file": "apps/app/src/features/renderer/measureText.test.ts",
+      "tests": [
+        "measureTextDetail scales the cap height with the em, so dividing once is enough"
+      ]
+    },
+    {
+      "file": "apps/app/src/features/renderer/text.test.ts",
+      "tests": [
+        "renderText effects spreads a glow on every side of the glyphs"
+      ]
+    },
+    {
+      "file": "apps/app/src/features/renderer/textRuns.test.ts",
+      "tests": [
+        "a coloured run paints only its own characters",
+        "a run with an outline widens the ink where the clip's own outline is off"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,391 @@
+import { describe, it, expect } from "vitest";
+import {
+  clipDetail,
+  clipRow,
+  documentDuration,
+  paginate,
+  TEXT_PREVIEW_CHARS,
+  trackRow,
+} from "./serialize";
+import {
+  SCHEMA_VERSION,
+  createTrack,
+  normalizeDocument,
+  setTrackHidden,
+  type TimelineDocument,
+} from "../timeline/tracks";
+import {
+  audioElement,
+  groupElement,
+  imageElement,
+  shapeElement,
+  textElement,
+  videoElement,
+} from "../renderer/testing";
+import { addKeyframe, setTrackActive } from "../animation/keyframeOps";
+import { MAX_BAKED_SAMPLES } from "../animation/keyframes";
+
+/**
+ * The property that matters most: nothing enormous can reach the agent.
+ *
+ * Claude Code truncates tool output at 25,000 tokens, and a single animated
+ * element carries up to `MAX_BAKED_SAMPLES` (36,000) numbers per lane. If a
+ * field is ever added to `TimelineElement` that the whitelist does not know
+ * about, these tests are what notice.
+ */
+function collectNumbersDeep(value: unknown, out: number[] = []): number[] {
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectNumbersDeep(item, out);
+    }
+  } else if (value != null && typeof value === "object") {
+    for (const item of Object.values(value)) {
+      collectNumbersDeep(item, out);
+    }
+  } else if (typeof value === "number") {
+    out.push(value);
+  }
+  return out;
+}
+
+function jsonOf(value: unknown): string {
+  return JSON.stringify(value);
+}
+
+function doc(elements: Record<string, any>): TimelineDocument {
+  return normalizeDocument({
+    schemaVersion: SCHEMA_VERSION,
+    tracks: [createTrack("v1", "video", 0)],
+    elements,
+  });
+}
+
+/** An element with a real, baked opacity curve — not the inactive stub. */
+function withBakedCurve() {
+  let d = doc({
+    a: imageElement({ trackId: "v1", startTime: 0, duration: 4000 }),
+  });
+  d = setTrackActive(d, "a", "opacity", true);
+  d = addKeyframe(d, "a", "opacity", "x", 0, 0);
+  d = addKeyframe(d, "a", "opacity", "x", 3000, 100);
+  return d;
+}
+
+describe("clipRow", () => {
+  it("uses the map key as the id, not element.key", () => {
+    // `key` is only set by the preview and asset layers; the elements addText
+    // and addImage create do not have one, and the map key is what every op
+    // takes. A row carrying `element.key` would name a clip that no tool can
+    // address.
+    const element = imageElement({ trackId: "v1", key: "stale-or-absent" });
+    expect(clipRow("real-id", element).id).toBe("real-id");
+  });
+
+  it("reports a level only when it is not the default", () => {
+    // Same rule as `speed`: a list of a hundred clips stays compact under the
+    // tool-output cap, while a project someone has mixed is visible at a glance.
+    expect(clipRow("a", audioElement({ trackId: "v1" })).volumeDb).toBeUndefined();
+    expect(clipRow("a", audioElement({ trackId: "v1", volumeDb: -6 })).volumeDb).toBe(-6);
+  });
+
+  it("reports the timeline span, not the source duration, for a sped-up clip", () => {
+    const element = videoElement({
+      trackId: "v1",
+      startTime: 1000,
+      duration: 4000,
+      trim: { startTime: 0, endTime: 4000 },
+      sourceDuration: 4000,
+      speed: 2,
+    });
+
+    const row = clipRow("a", element);
+    // 4000ms of source at 2x occupies 2000ms of timeline.
+    expect(row.dur).toBe(2000);
+    expect(row.start).toBe(1000);
+    expect(row.end).toBe(3000);
+    expect(row.speed).toBe(2);
+  });
+
+  it("truncates long text rather than echoing a monologue", () => {
+    const element = textElement({ trackId: "v1", text: "a".repeat(500) });
+    const row = clipRow("a", element) as any;
+    expect(row.text.length).toBeLessThanOrEqual(TEXT_PREVIEW_CHARS + 1);
+  });
+
+  it("names which properties are animated without shipping the curves", () => {
+    const d = withBakedCurve();
+    const row = clipRow("a", d.elements.a) as any;
+    expect(row.animated).toEqual(["opacity"]);
+    expect(jsonOf(row)).not.toContain('"ax"');
+  });
+
+  it("never carries a blob URL", () => {
+    const element = imageElement({
+      trackId: "v1",
+      blob: "blob:file:///aaaa-bbbb-cccc",
+    });
+    expect(jsonOf(clipRow("a", element))).not.toContain("blob:");
+  });
+
+  it("never carries a shape's point list", () => {
+    // Not a substring check: `"type":"shape"` legitimately contains the word.
+    const element = shapeElement({ trackId: "v1" });
+    const row = clipRow("a", element) as any;
+    expect(row.shape).toBeUndefined();
+    expect(row.option).toBeUndefined();
+  });
+
+  describe("masks", () => {
+    const masked = (over: any = {}) =>
+      imageElement({
+        trackId: "v1",
+        mask: {
+          shape: "rectangle",
+          location: { x: 25, y: 50 },
+          size: { width: 50, height: 100 },
+          rotation: 0,
+          feather: 4,
+          roundness: 0,
+          ...over,
+        },
+      } as any);
+
+    it("names the shape, and only when there is a mask", () => {
+      expect((clipRow("a", masked()) as any).mask).toBe("rectangle");
+      expect(
+        (clipRow("a", imageElement({ trackId: "v1" })) as any).mask,
+      ).toBeUndefined();
+    });
+
+    // Same rule as the shape's point list, and the same reason: unbounded
+    // authored data an agent cannot act on, since `set_mask` deliberately
+    // cannot supply one.
+    it("never carries a drawn path", () => {
+      const element = masked({
+        shape: "pen",
+        path: [{ p: [0, 0] }, { p: [1, 0] }, { p: [0, 1] }],
+      });
+      const row = clipRow("a", element) as any;
+      expect(jsonOf(row)).not.toContain('"path"');
+      const detail = clipDetail("a", element) as any;
+      expect(jsonOf(detail)).not.toContain('"path"');
+      // Its length is the one fact about it that changes what to do: under
+      // three nodes and the mask renders as no mask at all.
+      expect(detail.mask.pathNodeCount).toBe(3);
+    });
+
+    it("reports the placement in the detail view", () => {
+      const detail = clipDetail("a", masked()) as any;
+      expect(detail.mask).toMatchObject({
+        shape: "rectangle",
+        x: 25,
+        y: 50,
+        width: 50,
+        height: 100,
+        feather: 4,
+        invert: false,
+      });
+    });
+
+    // The distinction an agent cannot make from an absent field: "unmasked"
+    // against "this kind of clip has no mask" — the same one `blend` and `lut`
+    // draw a few lines above it.
+    it("says null for an unmasked clip and nothing at all for audio", () => {
+      expect(
+        (clipDetail("a", imageElement({ trackId: "v1" })) as any).mask,
+      ).toBeNull();
+      expect(
+        "mask" in (clipDetail("a", audioElement({ trackId: "v1" })) as any),
+      ).toBe(false);
+    });
+  });
+});
+
+describe("clipDetail", () => {
+  it("summarises keyframes instead of emitting baked samples", () => {
+    const d = withBakedCurve();
+
+    // Sanity: the element really does hold a baked array worth guarding.
+    const baked = (d.elements.a as any).animation.opacity.ax;
+    expect(baked.length).toBeGreaterThan(50);
+
+    const detail = clipDetail("a", d.elements.a) as any;
+    const opacity = detail.animation.find((t: any) => t.property === "opacity");
+
+    expect(opacity.active).toBe(true);
+    expect(opacity.lanes.x.count).toBe(2);
+    expect(opacity.lanes.x.times).toEqual([0, 3000]);
+
+    // The whole point: the detail view is a rounding error next to the data.
+    expect(collectNumbersDeep(detail).length).toBeLessThan(100);
+    expect(collectNumbersDeep(detail).length).toBeLessThan(MAX_BAKED_SAMPLES);
+  });
+
+  it("reports the effective level even when the field is absent", () => {
+    // Through the resolver, not the raw field: a clip from a project written
+    // before the feature has no `volumeDb`, and reporting nothing would leave
+    // an agent unable to tell "unity" from "not applicable".
+    const audio = clipDetail("a", audioElement({ trackId: "v1" })) as any;
+    expect(audio.volumeDb).toBe(0);
+
+    const video = clipDetail(
+      "a",
+      videoElement({ trackId: "v1", isExistAudio: true }),
+    ) as any;
+    expect(video.volumeDb).toBe(0);
+  });
+
+  it("reports an authored level", () => {
+    const detail = clipDetail(
+      "a",
+      audioElement({ trackId: "v1", volumeDb: -6 }),
+    ) as any;
+    expect(detail.volumeDb).toBe(-6);
+  });
+
+  it("gives text clips their full text back", () => {
+    const element = textElement({ trackId: "v1", text: "b".repeat(500) });
+    const detail = clipDetail("a", element) as any;
+    expect(detail.text).toHaveLength(500);
+  });
+
+  it("stays small even for a heavily animated clip", () => {
+    let d = doc({
+      a: videoElement({ trackId: "v1", startTime: 0, duration: 60_000 }),
+    });
+    d = setTrackActive(d, "a", "position", true);
+    for (let t = 0; t < 60_000; t += 500) {
+      d = addKeyframe(d, "a", "position", "x", t, t / 100);
+      d = addKeyframe(d, "a", "position", "y", t, t / 100);
+    }
+
+    const size = jsonOf(clipDetail("a", d.elements.a)).length;
+    // 120 keyframes across two lanes, plus the fixed fields — kilobytes, not
+    // the megabytes the baked arrays would be.
+    expect(size).toBeLessThan(4000);
+  });
+});
+
+describe("trackRow", () => {
+  // A shown row reads exactly as it did before rows could be hidden; a hidden
+  // one says so, because its clips are missing from the contact sheet.
+  it("says hidden only for a hidden row", () => {
+    const doc = normalizeDocument({
+      schemaVersion: SCHEMA_VERSION,
+      tracks: [createTrack("v0", "video", 0), createTrack("v1", "video", 1)],
+      elements: {},
+    });
+    const hidden = setTrackHidden(doc, "v0", true);
+
+    expect(trackRow(doc.tracks[0], 0)).toEqual({
+      id: "v0",
+      name: doc.tracks[0].name,
+      kind: "video",
+      index: 0,
+      clips: 0,
+    });
+    expect(trackRow(hidden.tracks[0], 0)).toMatchObject({ hidden: true });
+    expect("hidden" in trackRow(hidden.tracks[1], 0)).toBe(false);
+  });
+});
+
+describe("documentDuration", () => {
+  it("is the furthest clip end", () => {
+    const d = doc({
+      a: imageElement({ trackId: "v1", startTime: 0, duration: 1000 }),
+      b: imageElement({ trackId: "v1", startTime: 4000, duration: 2500 }),
+    });
+    expect(documentDuration(d)).toBe(6500);
+  });
+
+  it("is zero for an empty project", () => {
+    expect(documentDuration(doc({}))).toBe(0);
+  });
+});
+
+describe("paginate", () => {
+  const items = Array.from({ length: 10 }, (_, i) => i);
+
+  it("flags a short page as truncated so the caller knows to ask again", () => {
+    const page = paginate(items, 0, 4);
+    expect(page.items).toEqual([0, 1, 2, 3]);
+    expect(page.total).toBe(10);
+    expect(page.truncated).toBe(true);
+  });
+
+  it("does not flag the last page", () => {
+    expect(paginate(items, 8, 4).truncated).toBe(false);
+    expect(paginate(items, 0, 10).truncated).toBe(false);
+  });
+
+  it("survives an offset past the end", () => {
+    const page = paginate(items, 99, 4);
+    expect(page.items).toEqual([]);
+    expect(page.total).toBe(10);
+    expect(page.truncated).toBe(false);
+  });
+});
+
+/**
+ * Blend on the two projections.
+ *
+ * `clipRow` reports it only when it is set, the same rule `speed` and
+ * `volumeDb` follow — a list where every clip announces "source-over" is noise
+ * against the 25,000-token cap. `clipDetail` always reports it for a clip that
+ * can carry one, so an agent reading a detail view can tell "stacks normally"
+ * from "this kind of clip has no blend mode".
+ */
+describe("blend", () => {
+  it("is absent from a row when the clip stacks normally", () => {
+    const d = doc({ a: videoElement({ trackId: "v1" }) });
+    expect(clipRow("a", d.elements.a)).not.toHaveProperty("blend");
+  });
+
+  it("appears on a row when the clip carries one", () => {
+    const d = doc({ a: videoElement({ trackId: "v1", blend: "multiply" }) });
+    expect(clipRow("a", d.elements.a)).toMatchObject({ blend: "multiply" });
+  });
+
+  it("is reported on a detail view whatever its value", () => {
+    const d = doc({
+      plain: videoElement({ trackId: "v1" }),
+      blended: imageElement({ trackId: "v1", blend: "screen" }),
+    });
+    expect(clipDetail("plain", d.elements.plain)).toMatchObject({
+      blend: "source-over",
+    });
+    expect(clipDetail("blended", d.elements.blended)).toMatchObject({
+      blend: "screen",
+    });
+  });
+
+  it("is absent from a detail view for a clip that paints no layer", () => {
+    const d = doc({ s: audioElement({ trackId: "v1" }) });
+    expect(clipDetail("s", d.elements.s)).not.toHaveProperty("blend");
+  });
+
+  it("survives a clip whose stored mode this build does not know", () => {
+    // A project written by a newer build. The whitelist must report the mode the
+    // compositor will actually use, not echo a value it is going to ignore.
+    const d = doc({
+      a: videoElement({ trackId: "v1", blend: "vivid-light" as never }),
+    });
+    expect(clipRow("a", d.elements.a)).not.toHaveProperty("blend");
+    expect(clipDetail("a", d.elements.a)).toMatchObject({
+      blend: "source-over",
+    });
+  });
+});
+
+describe("a stabilize rig's groups", () => {
+  it("carry their role in a row and a detail, and a plain group carries none", () => {
+    const zoom = groupElement({ name: "Stabilize", rig: "stabilize-zoom" } as any);
+    const camera = groupElement({ name: "Camera", rig: "stabilize-camera" } as any);
+    const plain = groupElement({ name: "Null" } as any);
+
+    expect(clipRow("z", zoom).rig).toBe("stabilize-zoom");
+    expect(clipDetail("c", camera).rig).toBe("stabilize-camera");
+    expect("rig" in clipRow("p", plain)).toBe(false);
+    expect("rig" in clipDetail("p", plain)).toBe(false);
+  });
+});

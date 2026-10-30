@@ -1,0 +1,976 @@
+@import "style/element";
+@import "style/resizeControl";
+@import "style/asset";
+@import "style/option";
+@import "style/renderDone";
+@import "style/browse";
+@import "style/controlSetting";
+@import "style/extension";
+@import "style/toolbar";
+@import "style/timeline";
+@import "style/keyframe";
+@import "style/dropdown";
+@import "style/onboarding";
+@import "style/tutorial";
+@import "style/update";
+@import "style/settings";
+@import "style/window";
+@import "style/tts";
+@import "style/prompter";
+@import "style/note";
+@import "style/autoTrack";
+@import "style/mobile";
+@import "var";
+
+// The two webfonts the UI needs, both served from disk. Nothing here reaches
+// the network: the app has to work with the machine offline, and an icon font
+// that fails to arrive does not degrade — every glyph renders as the literal
+// ligature text, so the toolbar reads `play_arrow  content_cut  delete`.
+//
+// `$material-symbols-font-path` has to be a specifier css-loader can resolve
+// from *this* file. Sass inlines an imported partial without rebasing its
+// `url()`s, so the package's own `'./'` default would resolve against
+// apps/app/src/sass/ and 404. The mixin appends the class name to it, giving
+// `material-symbols/material-symbols-outlined.woff2` — a bare module request,
+// which css-loader resolves and webpack emits into apps/app/dist/ as a hashed
+// asset. That copy is the one that matters: the top-level `assets/` tree is an
+// electron-builder `extraResources` entry and is therefore *excluded* from the
+// asar, so nothing inside the package can reach it by a relative URL.
+//
+// This lands before `.material-symbols-outlined`'s `font-variation-settings`
+// override below, which is deliberate — neither this package nor the Google
+// stylesheet it replaces sets the axes, so that rule stays the only source of
+// FILL/wght/GRAD/opsz and the icons render exactly as they did.
+$material-symbols-font-path: "material-symbols/";
+@import "material-symbols/outlined";
+
+// "Noto Sans KR" is *not* declared here. It is a variable face in
+// apps/app/vendor/noto-sans-kr.css, linked from the HTML alongside Bootstrap,
+// because the frozen DeVent stylesheet asks for it too and both have to be
+// looking at the same font.
+//
+// It needs the real variable cut, not an alias onto the Medium OTF further down
+// this file. The UI uses three weights — 400 on `b` and `.btn`, 500 on
+// `.font-weight-md`, 700 on `.font-weight-lg` and `.text-title` — and one
+// static face standing in for all three renders 400 visibly heavier and wider,
+// which pushes every button label out and resizes the pill around it.
+
+::-webkit-scrollbar {
+  width: 5px;
+  height: 10px;
+}
+
+/* Track */
+::-webkit-scrollbar-track {
+  background: transparent;
+  border-radius: 10px;
+}
+
+/* Handle */
+::-webkit-scrollbar-thumb {
+  background: rgba(136, 136, 136, 0.296);
+  border-radius: 10px;
+}
+
+// A vertical thumb is drawn only while its list is moving, a class
+// `features/ui/scrollActivity.ts` puts on and takes off, or under the pointer,
+// so a hidden bar can still be found and dragged. The space stays reserved, so
+// nothing reflows when it appears. Horizontal thumbs are always drawn.
+//
+// The fade lives on the scrolled element, not on the thumb: Chromium never
+// transitions a scrollbar pseudo-element, but it restyles the thumb whenever
+// its element's style changes, including on every frame of an animation.
+// `scrollActivity.ts` animates `--scrollbar-alpha` with the Web Animations API
+// and `.is-scrolling` holds the value once a fade ends. Not inherited, so a fade
+// restyles one element and none of its contents; the thumb asks for it by name.
+@property --scrollbar-alpha {
+  syntax: "<number>";
+  inherits: false;
+  initial-value: 0;
+}
+
+.is-scrolling {
+  --scrollbar-alpha: 1;
+}
+
+::-webkit-scrollbar-thumb:vertical {
+  --scrollbar-alpha: inherit;
+  background: rgba(136, 136, 136, calc(0.296 * var(--scrollbar-alpha)));
+}
+
+/* Handle on hover */
+::-webkit-scrollbar-thumb:hover,
+::-webkit-scrollbar-thumb:vertical:hover,
+::-webkit-scrollbar-thumb:vertical:active {
+  background: rgba(85, 85, 85, 0.456);
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+html,
+body {
+  -ms-user-select: none;
+  -moz-user-select: -moz-none;
+  -khtml-user-select: none;
+  -webkit-user-select: none;
+  user-select: none;
+  overflow-y: hidden;
+  overscroll-behavior-x: none;
+  background-color: #181a1c;
+  overflow: hidden;
+}
+
+input[type="file"]::file-selector-button {
+  background-color: #16181b;
+  color: #ffffff;
+}
+
+element-control-asset > input[type="text" i] {
+  padding: 0px;
+}
+
+input[type="range"]::-webkit-slider-runnable-track {
+  width: 100%;
+  height: 5px;
+  cursor: pointer;
+  box-shadow: 0px 0px 0px #000000;
+  background: #212529;
+  border-radius: 1px;
+  border: 0px solid #000000;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  &:hover {
+    background: #5a6067;
+    border: none;
+    outline: none;
+    box-shadow: none;
+  }
+  &:active {
+    border: #5a6067;
+    box-shadow: none;
+  }
+  &:focus {
+    border: none;
+    outline: none;
+    box-shadow: none;
+  }
+  outline: none;
+
+  height: 0.8rem;
+  width: 2.2rem;
+  border-radius: 15px;
+  background: #5a6067;
+  cursor: pointer;
+}
+
+element-timeline-scroll > input[type="range"]::-webkit-slider-runnable-track {
+  width: 100%;
+  height: 14px;
+  cursor: pointer;
+  box-shadow: 0px 0px 0px #000000;
+  background: none;
+  border-radius: 1px;
+  border: 0px solid #000000;
+}
+
+element-timeline-scroll > input[type="range"]::-webkit-slider-thumb {
+  appearance: none;
+  $timeline-scroll-thumb-bg: #2c3035;
+  &:hover {
+    background: $timeline-scroll-thumb-bg;
+    border: none;
+    outline: none;
+    box-shadow: none;
+  }
+  &:active {
+    border: $timeline-scroll-thumb-bg;
+    box-shadow: none;
+  }
+  &:focus {
+    border: none;
+    outline: none;
+    box-shadow: none;
+  }
+
+  outline: none;
+  height: 0.8rem;
+  width: 5.2rem;
+  border-radius: 15px;
+  //background: $timeline-scroll-thumb-bg;
+
+  background-color: $blur-background-color;
+  -webkit-backdrop-filter: $blur-backdrop-filter;
+  backdrop-filter: $blur-backdrop-filter;
+
+  cursor: pointer;
+}
+
+element-timeline-scroll {
+  appearance: none;
+
+  input {
+    appearance: none;
+    background: inherit;
+    outline: none;
+  }
+
+  background-color: transparent;
+}
+
+// Timeline zoom slider. Sized like the zoom control in a conventional NLE:
+// a hairline track with a small round head, not the wide pill the other
+// sliders use. `--range-fill` is kept in sync with the value by
+// elementTimelineRange.ts so the travelled part of the track reads as filled.
+element-timeline-range {
+  input[type="range"] {
+    appearance: none;
+    width: 100px;
+    max-width: 100%;
+    height: 0.75rem;
+    background: transparent;
+    outline: none;
+
+    &::-webkit-slider-runnable-track {
+      height: 3px;
+      border-radius: 999px;
+      border: none;
+      box-shadow: none;
+      background: linear-gradient(
+        to right,
+        #6c757d 0 var(--range-fill, 50%),
+        #2c3035 var(--range-fill, 50%) 100%
+      );
+    }
+
+    &::-webkit-slider-thumb {
+      appearance: none;
+      height: 0.65rem;
+      width: 0.65rem;
+      // Centres the head on the 3px track.
+      margin-top: calc((3px - 0.65rem) / 2);
+      border: none;
+      border-radius: 50%;
+      background: #cdd2d8;
+      box-shadow: none;
+      transition: background 0.12s ease;
+
+      &:hover {
+        background: #ffffff;
+      }
+
+      &:active {
+        background: #ffffff;
+        box-shadow: 0 0 0 3px rgba(205, 210, 216, 0.18);
+      }
+    }
+  }
+}
+
+// The keyframe editor's vertical-zoom slider: the zoom slider above, stood on
+// end, because it scales the axis it sits beside and a horizontal control for
+// a vertical scale reads backwards.
+//
+// `writing-mode: vertical-lr` with `direction: rtl` is what turns it, not
+// `appearance: slider-vertical` — that is non-standard, deprecated since
+// Chromium 121 and removed since 135, so it would go horizontal again on an
+// Electron bump with nothing failing to say so. `direction: rtl` is the half
+// that puts the larger value at the top, which is the only way up can mean
+// more.
+//
+// The track's thin dimension is therefore `width`, and the head is centred on
+// it with `margin-left` rather than `margin-top`: `width`/`height`/`margin-*`
+// stay physical whatever the writing mode, so both swap axes with the control.
+keyframe-editor {
+  .keyframe-editor-options {
+    height: 100%;
+    overflow: hidden;
+  }
+
+  input[type="range"]#verticalRange {
+    appearance: none;
+    writing-mode: vertical-lr;
+    direction: rtl;
+    width: 0.75rem;
+    // Fills what the buttons above it leave, so the scale is as long as the
+    // panel allows and a short timeline clips nothing.
+    flex: 1 1 auto;
+    min-height: 0;
+    margin: 0 0 0 0.25rem;
+    padding: 0;
+    background: transparent;
+    outline: none;
+
+    &::-webkit-slider-runnable-track {
+      width: 3px;
+      border-radius: 999px;
+      border: none;
+      box-shadow: none;
+      background: linear-gradient(
+        to top,
+        #6c757d 0 var(--range-fill, 50%),
+        #2c3035 var(--range-fill, 50%) 100%
+      );
+    }
+
+    &::-webkit-slider-thumb {
+      appearance: none;
+      height: 0.65rem;
+      width: 0.65rem;
+      // Centres the head on the 3px track.
+      margin-left: calc((3px - 0.65rem) / 2);
+      border: none;
+      border-radius: 50%;
+      background: #cdd2d8;
+      box-shadow: none;
+      transition: background 0.12s ease;
+
+      &:hover {
+        background: #ffffff;
+      }
+
+      &:active {
+        background: #ffffff;
+        box-shadow: 0 0 0 3px rgba(205, 210, 216, 0.18);
+      }
+    }
+  }
+}
+
+.top-bar {
+  height: 34px;
+  background-color: #0f1012;
+  border-bottom: 0.05rem #3a3f44 solid;
+  -webkit-app-region: drag;
+  display: flex;
+  color: #6c757d;
+  font-size: 12px;
+  font-weight: 700;
+  // The button hugs the right; the title is centred on the *window* by the
+  // absolute rule below rather than by the flex line. Flex cannot do both at
+  // once — `space-between` puts the title at the left edge, and centring the
+  // line would push the button inwards by the title's width.
+  position: relative;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 0.5rem;
+
+  // The OS draws the window buttons on top of this strip, and it draws them on
+  // opposite sides on the two platforms — macOS puts the traffic lights at the
+  // left (`trafficLightPosition { x: 10, y: 10 }`), Windows and Linux put
+  // `titleBarOverlay` at the right. Both in `electron/lib/window.ts`. One
+  // symmetric padding would hide the export button on one platform and clip it
+  // under the window controls on the other, and only on the machine you are
+  // not developing on.
+  &.top-bar-mac {
+    padding-left: 78px;
+    padding-right: 10px;
+  }
+
+  &.top-bar-pc {
+    padding-left: 10px;
+    padding-right: 146px;
+  }
+
+  // Centred on the window, not on the space left over between the insets.
+  // Taken out of the flex line for exactly that reason: the two paddings are
+  // deliberately asymmetric, so anything centred *within* them sits off-centre
+  // by half their difference — 34px on macOS, 68px on Windows.
+  //
+  // It stays a drag handle, and it may not swallow clicks meant for the button
+  // it is now allowed to overlap.
+  b {
+    position: absolute;
+    left: 50%;
+    transform: translateX(-50%);
+    -webkit-app-region: drag;
+    pointer-events: none;
+  }
+}
+
+.toast-container {
+  z-index: 9000;
+}
+
+.container-footer {
+  background-color: #16181b;
+}
+
+.border-inner-light {
+  box-shadow: 0 0 0 3px #ffffff70 inset;
+}
+
+.material-symbols-outlined {
+  font-variation-settings: "FILL" 1, "wght" 400, "GRAD" 0, "opsz" 48;
+}
+
+.btn-sm {
+  padding: 0.4rem 0.8rem 0.4rem 0.8rem !important;
+}
+
+.btn-xs {
+  padding: 0.25rem 0.5rem !important;
+  font-size: 11px;
+  height: fit-content;
+}
+
+.btn-xs2 {
+  padding: 0rem 0rem !important;
+  font-size: 11px;
+  height: fit-content;
+}
+
+.btn-default {
+  background-color: $button-background-color;
+}
+
+.btn-active {
+  background-color: #3a3946;
+}
+
+.bg-default {
+  background-color: $button-background-color;
+}
+
+// A `<select>`, drawn as the `<input>` beside it.
+//
+// `devent-designsystem.css` takes `.form-control` off Bootstrap's skin: no
+// border, a 10px radius and no focus ring. It says nothing about
+// `.form-select`, so every select in the app kept Bootstrap's 1px border, its
+// 4px radius, its focus ring and a fill two shades lighter than the field
+// above it. This is the select half of that sheet.
+//
+// The element selector is deliberate: it catches a `<select>` whatever classes
+// it is given. The markup used to decide a select's fill and height panel by
+// panel, with `bg-dark`, `bg-default` and `form-select-sm` in whatever
+// combination was copied first, and those are gone from all eighteen of them.
+// Do not put a `bg-*` utility back on one: Bootstrap's utilities are
+// `!important` and would take the fill out of this file's hands.
+//
+// Height needs no rule. A borderless select is already `.form-control`'s 36px,
+// since the padding and the font are the same numbers and the 2px it loses is
+// the border. Every select here is a labelled full-width row rather than a
+// cell in a dense grid, so the field it lines up with is the full-size input.
+select,
+select.form-select {
+  background-color: $button-background-color;
+  border: none;
+  border-radius: 10px;
+  box-shadow: none;
+
+  // Bootstrap's chevron is drawn in #343a40 for a white field, which on this
+  // one is nearly the fill. The same path, in the colour the labels use.
+  background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3e%3cpath fill='none' stroke='%23adb5bd' stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='M2 5l6 6 6-6'/%3e%3c/svg%3e");
+}
+
+// Focus. Bootstrap's `.form-select:focus` carries a four-pixel blue ring, and
+// its `(0,2,0)` outranks the rule above, so `box-shadow: none` there does not
+// reach it. The input has no ring at all, `devent-designsystem.css` having
+// taken `.form-control`'s away with an `!important`, so this is the same
+// decision spelled at a specificity that wins.
+select.form-select:focus {
+  box-shadow: none;
+}
+
+// Bootstrap greys a disabled select to #e9ecef, a light chip on a dark panel.
+// `.form-control:disabled` below is what an input does instead, and this is
+// the same two lines: the field stays put and the text dims.
+select.form-select:disabled {
+  background-color: $button-background-color;
+  color: #ffffffc0;
+}
+
+// A labelled switch, as a full-width row with the control at its end.
+//
+// Two things Bootstrap gets wrong here, and both are about where it expects to
+// be used. Its `.form-switch` is built for a form on a light page: the track is
+// `#fff` with a `rgba(0, 0, 0, .25)` knob, which on these panels is a white pill
+// with a thumb nobody can see. And it floats the input to the left of its label,
+// which is right in a list of checkboxes and wrong in this column, where every
+// other row is a name on the left and its control on the right.
+//
+// The checked colours are left alone: `#0d6efd` is already the accent
+// `.btn-nav.active` uses, and the focus ring works as it is on a dark panel.
+//
+// Keep `form-check form-switch` on the element as well as this class: the pill
+// shape, the sliding knob and its transition are all inherited from them, and
+// this only undoes the layout and repaints the off state.
+.form-switch-row {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  // Undoes `.form-check` and `.form-switch`, which reserve this for the input
+  // they are about to pull left into it.
+  padding-left: 0;
+
+  .form-check-input {
+    // Undoes `.form-check-input`'s float and `.form-switch`'s negative margin,
+    // so the switch is an ordinary flex item and lands at the end of the row.
+    float: none;
+    flex: 0 0 auto;
+    margin-top: 0;
+    margin-left: 0;
+    cursor: pointer;
+  }
+
+  // **The off state only.** Painting the track on the bare `.form-check-input`
+  // was the first try and it silently took the *on* state with it: this
+  // stylesheet loads after `bootstrap.min.css`, and
+  // `.form-switch-row .form-check-input` and `.form-check-input:checked` carry
+  // the same specificity, so the later one wins and the switch stayed dark when
+  // it was on. Narrowing it also keeps the accent in one place, since Bootstrap
+  // already checks to the `#0d6efd` that `.btn-nav.active` uses.
+  .form-check-input:not(:checked) {
+    background-color: $button-background-color;
+    border-color: $background-border-color;
+    // A light knob. The default is near-black, invisible against the track
+    // above, and reads as a switch with nothing in it.
+    background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='-4 -4 8 8'%3e%3ccircle r='3' fill='rgba%28255, 255, 255, 0.55%29'/%3e%3c/svg%3e");
+  }
+
+  .form-check-label {
+    margin-bottom: 0;
+    cursor: pointer;
+    // The label is the row, so it takes the slack and the switch stays pinned
+    // to the right edge however long the text is in the current locale.
+    flex: 1 1 auto;
+  }
+}
+
+.form-control:disabled,
+.form-control[readonly] {
+  background-color: $button-background-color;
+  color: #ffffffc0;
+}
+
+.form-control:focus {
+  background-color: $button-background-color;
+}
+
+// A number field you can drag.
+//
+// The cursor is the whole affordance — nothing else on the field says so — and
+// it flips to a caret once the field has focus, which is the moment a click
+// stops meaning "grab this" and starts meaning "type here".
+.scrub-number {
+  cursor: ew-resize;
+}
+
+.scrub-number:focus {
+  cursor: text;
+}
+
+// Chromium's spin buttons occupy the right ~16px of a number input, and a
+// mousedown there is a spinner click rather than the start of a drag. The
+// affordance and the control cannot share the same pixels.
+.scrub-number::-webkit-inner-spin-button,
+.scrub-number::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+// While a scrub is running. The `cursor` half only ever shows on the fallback
+// path — with the pointer lock granted the cursor is hidden outright — but
+// `user-select` matters either way, or the drag paints a selection across every
+// label it crosses. `!important` and the descendant selector are both needed:
+// `.btn-nav` and friends set a cursor of their own, so inheritance alone loses.
+body.is-scrubbing,
+body.is-scrubbing * {
+  cursor: ew-resize !important;
+  user-select: none !important;
+}
+
+// The same, for a timeline row being resized from its header's bottom edge
+// (`elementTimelineLeftOption.ts`). The pointer leaves the 8px edge on the
+// first pixel of the drag and crosses the canvas, which sets a cursor of its
+// own on everything it hovers.
+body.is-resizing-track,
+body.is-resizing-track * {
+  cursor: row-resize !important;
+  user-select: none !important;
+}
+
+.form-transparent {
+  background-color: transparent;
+  outline: 0;
+  border: none;
+  color: #ffffff;
+  font-size: 20px;
+  margin: 0px;
+}
+
+.form-transparent:focus {
+  background-color: transparent;
+
+  outline: 0;
+  border-color: #d5d5d5 !important;
+  box-shadow: 0 0 5px #d5d5d5 !important;
+}
+
+// The rail's idle tabs take the asset and option panels' greys, from
+// `style/_option.scss` (imported above): muted at rest, lighter under the
+// pointer. The active tab keeps the accent.
+.btn-nav {
+  background-color: transparent;
+  outline: none;
+  border: none;
+  padding: 0.4rem 0.4rem;
+  color: $opt-label;
+  transition: color 140ms ease-out;
+}
+
+// `:not(.active)` because this and `.btn-nav.active` are both (0,2,0), and
+// the later one would turn the active tab grey under the pointer.
+.btn-nav:hover:not(.active) {
+  color: $opt-text;
+}
+
+.btn-nav.active {
+  color: #0d6efd;
+}
+
+.bg-darklight {
+  background-color: #3a3f44;
+}
+.bg-darker {
+  background-color: $background-color;
+}
+.font-title {
+  font-family: "Noto Sans KR", sans-serif;
+  word-break: keep-all;
+}
+
+.font-weight-lg {
+  font-family: "Noto Sans KR", sans-serif;
+  word-break: keep-all;
+  font-weight: 700 !important;
+}
+.font-weight-md {
+  font-family: "Noto Sans KR", sans-serif;
+  word-break: keep-all;
+  font-weight: 500 !important;
+}
+
+.text-title {
+  font-family: "Noto Sans KR", sans-serif;
+  word-break: keep-all;
+  font-weight: 700 !important;
+}
+
+@font-face {
+  font-family: "notosanskr";
+  src: url(../../../../assets/fonts/notosanskr-medium.otf);
+}
+
+.text-ellipsis {
+  width: 100%;
+  margin-top: 0.5rem;
+  padding: 0.1rem 0.5rem 0.1rem 0.5rem;
+  text-overflow: ellipsis;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.form-range {
+  margin: 0;
+}
+
+// The inspector's slider used to be `.option-range` here. It is
+// `.opt-slider` in `style/_option.scss` now, with the rest of the panel's
+// look, and nothing in the app asks for the old class.
+
+.offcanvas-header {
+  padding: 0.2rem 0.2rem;
+}
+
+.card-title {
+  font-family: "Noto Sans KR", sans-serif;
+}
+
+.offcanvas {
+  background-color: #121214dc;
+  -webkit-backdrop-filter: saturate(100%) blur(36px);
+  backdrop-filter: saturate(100%) blur(36px);
+}
+
+// Between pane content and everything that floats over it. The strip overhangs
+// the next pane by 0.2rem, so it has to paint above that pane's content, which
+// tops out at 300 (the timeline header, `.split-bottom-bar`), or a scrolled
+// list covers it and the column stops resizing. And it has to paint below the
+// timeline's status bar (999), Bootstrap dropdowns (1000) and offcanvas
+// (1050), the cards at 1080, the context menus at 6000, the hover preview at
+// 7000 and the modals at 8000, or it lays an invisible col-resize strip across
+// every menu that crosses it and takes the click meant for the row.
+.split-col-bar {
+  position: absolute;
+  top: 50%;
+  right: -0.2rem;
+  transform: translateY(-50%);
+  width: 0.5rem;
+  height: 80%;
+  background-color: #868f9900;
+  cursor: col-resize;
+  z-index: 400;
+}
+
+.split-bottom-bar {
+  position: absolute;
+  top: 0px;
+  transform: translateY(-50%);
+  height: 1rem;
+  background-color: #868f9900;
+  cursor: col-resize;
+  z-index: 300;
+}
+
+.split-top {
+  padding-top: 0.5rem;
+}
+
+#sidebar {
+  border-right: 0.05rem $background-border-color solid;
+  background-color: $background-color !important;
+}
+
+#split_bottom {
+  border-top: 0.05rem $background-border-color solid;
+}
+
+.tab-content {
+  border-right: 0.05rem $background-border-color solid;
+}
+
+.cursor-default {
+  cursor: default;
+}
+
+.cursor-row-resize {
+  cursor: row-resize;
+}
+
+.form-textarea {
+  border: none !important;
+}
+
+.preview {
+  // Matches CANVAS_BG in previewCanvas.ts so there is no flash of a different
+  // grey before the first paint. The frame's own background comes from the
+  // project's render options.
+  background-color: #101112;
+  display: block;
+}
+
+preview-canvas {
+  position: absolute;
+  inset: 0;
+}
+
+.control {
+  position: absolute;
+  display: block;
+  cursor: pointer;
+
+  width: 100%;
+  height: 100%;
+}
+
+.control-inner {
+  position: relative;
+  cursor: pointer;
+  width: 100%;
+  height: 100%;
+}
+
+.video {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: clip;
+}
+
+/*
+ * The playback preview: everything above the timeline stops answering the
+ * mouse.
+ *
+ * Set on `document.body` from `App.ts`, not on the preview column, because the
+ * mode has to reach the panel and option columns too — they stay visible, and a
+ * visible column that silently ignores clicks is better than one that vanishes
+ * and takes the layout with it.
+ *
+ * `timeline-ui` is a *sibling* of `control-ui` in `App.ts`, so no rule here
+ * touches it: scrubbing, play/pause and the toolbar all keep working, which is
+ * the point. Keyboard is untouched throughout — Space is bound at `window`.
+ */
+body.playback-preview control-ui,
+body.playback-preview chat-sidebar {
+  pointer-events: none;
+}
+
+/*
+ * The one exception, and it is the exit.
+ *
+ * The toggle that leaves this mode lives inside `control-ui`, so without this
+ * the mode would be unleavable by mouse — the failure the screen recorder's
+ * drawing mode shipped with and had to grow three exits to fix. One exit is
+ * enough only if nothing can take it away.
+ */
+body.playback-preview preview-bottom-bar {
+  pointer-events: auto;
+}
+
+.line {
+  position: relative;
+  overflow-x: hidden !important;
+  padding: 0px;
+}
+
+.accordion-body {
+  color: #ffffff;
+  padding: 0.6rem 0.4rem;
+  min-height: 80vh;
+}
+
+.accordion-button {
+  background-color: #212529 !important;
+  color: #ffffff !important;
+  padding: 0.7rem 0.5rem 0.7rem 0.5rem;
+  border-color: transparent;
+}
+
+.accordion-button:not(.collapsed)::after {
+  background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='%23ffffff'%3e%3cpath fill-rule='evenodd' d='M1.646 4.646a.5.5 0 0 1 .708 0L8 10.293l5.646-5.647a.5.5 0 0 1 .708.708l-6 6a.5.5 0 0 1-.708 0l-6-6a.5.5 0 0 1 0-.708z'/%3e%3c/svg%3e");
+  box-shadow: none;
+  border-color: transparent;
+}
+
+.accordion-button::after {
+  background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='%23ffffff'%3e%3cpath fill-rule='evenodd' d='M1.646 4.646a.5.5 0 0 1 .708 0L8 10.293l5.646-5.647a.5.5 0 0 1 .708.708l-6 6a.5.5 0 0 1-.708 0l-6-6a.5.5 0 0 1 0-.708z'/%3e%3c/svg%3e");
+}
+
+.accordion-button:focus {
+  background-color: #212529;
+  border-color: transparent !important;
+  box-shadow: none;
+}
+
+.accordion-item {
+  background-color: transparent;
+}
+
+.overflow-y-scroll {
+  overflow-y: scroll;
+}
+.overflow-y-hidden {
+  overflow-y: hidden;
+}
+
+.overflow-x-hidden {
+  overflow-x: hidden;
+}
+
+.overflow-x-scroll {
+  overflow-x: scroll;
+}
+
+.icon-lg {
+  font-size: 3rem;
+  color: #ffffff;
+}
+
+.icon-md {
+  font-size: 1.7rem;
+  color: #ffffff;
+}
+
+.icon-sm {
+  font-size: 1.3rem;
+  color: #ffffff;
+}
+
+.icon-xsm {
+  font-size: 1rem;
+  color: #ffffff;
+}
+
+.icon-xs {
+  font-size: x-small;
+  color: #ffffff;
+}
+
+.icon-white {
+  color: #ffffff;
+}
+
+.modal {
+  z-index: 8000;
+}
+
+.option-window {
+  border-left: 0.05rem #3a3f44 solid;
+}
+
+.btn-xxs {
+  padding: 0.2rem 0.4rem 0.2rem 0.4rem !important;
+  height: fit-content;
+}
+
+// No scrollbar on the icon rail. `overflow-y: scroll` reserves the 5px gutter
+// from `::-webkit-scrollbar` even while the thumb is faded out, which leaves
+// the buttons 34px of a 40px column. A 24px icon plus 0.4rem of padding either
+// side overflows that, so `text-align: center` gives up and every icon starts
+// at the left, 1.1px left of the column's middle. It still scrolls by wheel and
+// trackpad when the tabs outgrow the window.
+.sidebar-nav {
+  flex-wrap: nowrap !important;
+  overflow-y: scroll;
+  scrollbar-width: none;
+}
+
+.modal-dark {
+  background-color: #111315;
+  border: 1px solid #1f2225;
+  border-radius: 10px;
+}
+
+.modal-backdrop.show {
+  opacity: 0.61;
+}
+
+.modal-body-dark {
+  padding: 1.175rem 0.9rem;
+}
+
+.modal-footer-dark {
+  border-top: 1px solid #292c30;
+}
+
+.btn-nowarp {
+  white-space: nowrap;
+}
+
+// The keyframe diamond's empty state.
+//
+// `.material-symbols-outlined` above pins `FILL 1` for the whole app, so every
+// icon is solid. Material Symbols is a variable font, so asking for `FILL 0`
+// here gives the outline of the same glyph — which is how every NLE says "no
+// keyframe on this frame". Every axis has to be restated: `font-variation-settings`
+// replaces the whole list rather than merging one axis into it.
+.keyframe-hollow {
+  font-variation-settings: "FILL" 0, "wght" 400, "GRAD" 0, "opsz" 48;
+}
+
+// The three buttons read as one control, so they sit together.
+//
+// `.btn-xxs` carries 0.4rem of horizontal padding, which puts 0.8rem between
+// any two adjacent buttons — fine for buttons that mean separate things, too
+// loose for a navigator whose arrows belong to the diamond between them.
+// Scoped here rather than changed on `.btn-xxs`, which the mask shape row and
+// the tab bar also use at their own spacing.
+.keyframe-nav .btn {
+  padding-left: 0.1rem !important;
+  padding-right: 0.1rem !important;
+}

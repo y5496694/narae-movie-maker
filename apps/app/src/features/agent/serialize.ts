@@ -1,0 +1,875 @@
+/**
+ * Projections of the timeline that are safe to hand an agent.
+ *
+ * Claude Code truncates MCP tool output at 25,000 tokens and warns at 10,000.
+ * A `TimelineElement` cannot be sent as-is and stay under that: `animation`
+ * carries baked sample arrays of up to `MAX_BAKED_SAMPLES` (36,000) *per lane*,
+ * `blob` is an object URL of no use to anything outside this renderer, and a
+ * shape's `shape` field is an unbounded point list. One animated clip is enough
+ * to blow the budget on its own.
+ *
+ * So every field here is opted **in**. A whitelist fails closed: a field added
+ * to `TimelineElement` later is absent from the agent's view until someone
+ * decides it belongs, which is the right default. A blacklist would fail open
+ * and quietly start leaking whatever gets added next — `serialize.test.ts`
+ * pins that property rather than trusting the reviewer to notice.
+ */
+
+import type {
+  TimelineElement,
+  AnimatableProperty,
+} from "../../@types/timeline";
+import { canAnimate, animatableProperties } from "../../@types/timeline";
+import { isAudibleElement, volumeDbOf } from "../timeline/audio";
+import {
+  isDynamicElement,
+  spanEnd,
+  spanLength,
+  spanStart,
+  sourceDurationOf,
+  speedOf,
+} from "../timeline/geometry";
+import { speedCurveOf } from "../timeline/speedCurve";
+import { describeFilter } from "../renderer/filter/params";
+import { blendOf, DEFAULT_BLEND } from "../renderer/blend";
+import { DEFAULT_LUT_INTENSITY, lutOf } from "../renderer/lut";
+import { adjustOf } from "../renderer/adjust";
+import { isAdjustable } from "../timeline/adjustOps";
+import { isBlendable } from "../timeline/blendOps";
+import { isMirrorable, mirrorOf } from "../timeline/mirrorOps";
+import { cropOf, isCropped, isCroppable } from "../timeline/cropOps";
+import {
+  cornerRadiusOf,
+  cornerRadiusOffOf,
+  isRoundable,
+} from "../timeline/cornerOps";
+import { isReversed } from "../timeline/reverseOps";
+import { isGradable } from "../timeline/lutOps";
+import { maskOf } from "../mask/maskShape";
+import { shapeGeometryOf } from "../shape/shapeGeometry";
+import { backdropFxOf, fillOpacityOf, OPAQUE_FILL } from "../shape/backdropFx";
+import { backdropModeOf } from "../fx/backdropPreset";
+import { resolvePreset } from "../fx/resolvePreset";
+import { revealOf } from "../text/reveal";
+import { isRevealable } from "../timeline/textRevealOps";
+import { isMaskable } from "../timeline/maskOps";
+import {
+  isTrackHidden,
+  type TimelineDocument,
+  type TimelineTrack,
+} from "../timeline/tracks";
+import { runsOf } from "../text/runs";
+import { linkOf } from "../animation/link";
+import { linkedPropertiesOf } from "../timeline/linkOps";
+import { resolveTextStyle } from "../text/style";
+
+/** Longest text echoed back in a list row. Full text comes from `get_clip`. */
+export const TEXT_PREVIEW_CHARS = 80;
+
+/**
+ * Most keyframe times `get_clip` will list for one lane.
+ *
+ * This used to be unbounded, and was safe only by accident: the sole producer
+ * was a mouse gesture, so a lane held a handful of points. `add_keyframes` can
+ * author one per frame, and a three-minute clip at 60fps is 10,800 of them —
+ * enough to blow the 25k-token cap through a single `get_clip`. `count` stays
+ * exact so the truncation is visible rather than silent, and `get_keyframes`
+ * pages properly when the curve itself is what matters.
+ */
+export const MAX_KEYFRAME_TIMES = 100;
+
+/**
+ * Most runs `get_clip` will list.
+ *
+ * The list used to be withheld entirely, on the grounds that runs are
+ * unbounded authored data like a shape's point list. That was true and still
+ * left the agent unable to *read back* the styling it had just written, so a
+ * range edit could only ever be made blind. A run is four small scalars and a
+ * clip with more than this many distinct stretches is a list rather than a
+ * fact, so the cap buys the read back without threatening the output cap.
+ */
+export const MAX_TEXT_RUNS = 20;
+
+/**
+ * Most group children `get_clip` will name.
+ *
+ * A group's membership is worth reporting — it is otherwise only discoverable
+ * by scanning every clip's `parentId` — but a group over a hundred clips is a
+ * list, not a fact.
+ */
+export const MAX_GROUP_CHILDREN = 50;
+
+/** Times are integer milliseconds everywhere in the agent surface. */
+function ms(value: number): number {
+  return Math.round(value);
+}
+
+function basename(filepath: string | undefined): string {
+  if (!filepath) {
+    return "";
+  }
+  const parts = filepath.split(/[\\/]/);
+  return parts[parts.length - 1] || filepath;
+}
+
+function truncate(text: string, limit: number): string {
+  if (typeof text !== "string") {
+    return "";
+  }
+  return text.length <= limit ? text : `${text.slice(0, limit)}…`;
+}
+
+export type ClipRow = Record<string, unknown> & {
+  id: string;
+  type: string;
+  start: number;
+  dur: number;
+  end: number;
+};
+
+/**
+ * An inline program as one short line of facts, never its source.
+ *
+ * A program can hold a megabyte of GLSL or HTML, and a `list_clips` page of
+ * twenty such clips would blow the output cap many times over. `get_program`
+ * pages through the source when an agent actually wants it.
+ */
+export function programRow(
+  program: unknown,
+): { hash: string; name?: string; renderType?: string; bytes: number } | null {
+  if (program == null || typeof program !== "object") {
+    return null;
+  }
+  const p = program as {
+    hash?: unknown;
+    manifest?: { name?: unknown; render?: { type?: unknown } };
+    sources?: Record<string, unknown>;
+  };
+  let bytes = 0;
+  for (const text of Object.values(p.sources ?? {})) {
+    bytes += typeof text === "string" ? text.length : 0;
+  }
+  return {
+    hash: typeof p.hash === "string" ? p.hash : "",
+    ...(typeof p.manifest?.name === "string" ? { name: p.manifest.name } : {}),
+    ...(typeof p.manifest?.render?.type === "string"
+      ? { renderType: p.manifest.render.type }
+      : {}),
+    bytes,
+  };
+}
+
+/**
+ * A shape's backdrop: what runs, at what strength, and whether it can.
+ *
+ * `draws: false` is the one thing an agent cannot see in a contact sheet's
+ * thumbnails until it looks closely: the preset is not installed here, or is
+ * not one a backdrop can carry, and the shape is being filled solid instead.
+ * A program is reported by `programRow`, never by its source.
+ */
+export function backdropRow(element: unknown): {
+  presetId: string;
+  intensity: number;
+  params: Record<string, unknown>;
+  draws: boolean;
+  program?: ReturnType<typeof programRow>;
+} | null {
+  const fx = backdropFxOf(element);
+  if (fx == null) {
+    return null;
+  }
+  return {
+    presetId: fx.presetId,
+    intensity: fx.intensity,
+    params: fx.params,
+    draws: backdropModeOf(resolvePreset(fx)) != null,
+    ...(fx.program == null ? {} : { program: programRow(fx.program) }),
+  };
+}
+
+/**
+ * One clip as a compact row.
+ *
+ * `id` is passed in rather than read from `element.key`, and that is not
+ * defensiveness: `key` is only populated by the preview and asset layers, so
+ * the elements `addText` and `addImage` create carry no `key` at all. The
+ * `Timeline` map key is the id every op takes, so it is the one an agent must
+ * be given.
+ *
+ * `dur` is the span on the *timeline*, not `element.duration` — the two differ
+ * whenever `speed !== 1`, and the timeline figure is the one an agent reasoning
+ * about "what is on screen at 4s" needs. `sourceDur`/`trim` carry the source
+ * side for the cases that genuinely need it.
+ */
+export function clipRow(
+  id: string,
+  element: TimelineElement,
+  trackName?: string,
+): ClipRow {
+  const row: ClipRow = {
+    id,
+    type: element.filetype,
+    start: ms(element.startTime),
+    dur: ms(spanLength(element)),
+    end: ms(spanEnd(element)),
+  };
+
+  if (trackName != null) {
+    row.track = trackName;
+  }
+  row.trackId = element.trackId;
+
+  // Only when set. Group membership is otherwise invisible in a list, which
+  // makes `set_clip_parent` and `ungroup` guesswork.
+  if (element.parentId != null) {
+    row.parentId = element.parentId;
+  }
+
+  if (isDynamicElement(element)) {
+    row.src = basename(element.localpath);
+    row.trim = {
+      start: ms(element.trim?.startTime ?? 0),
+      end: ms(element.trim?.endTime ?? element.duration),
+    };
+    row.sourceDur = ms(sourceDurationOf(element));
+    const speed = speedOf(element);
+    if (speed !== 1) {
+      row.speed = speed;
+    }
+    // Same rule as `speed`: reported only when it is not the default, so a
+    // list stays compact under the tool-output cap while a project someone has
+    // mixed is still visible at a glance.
+    const volumeDb = volumeDbOf(element);
+    if (volumeDb !== 0) {
+      row.volumeDb = volumeDb;
+    }
+  }
+
+  // Same rule as `speed` and `volumeDb`: only when it is not the default. A
+  // blended clip is unusual and worth seeing in a list — every clip announcing
+  // "source-over" would be noise against the tool-output cap.
+  const blend = blendOf(element);
+  if (blend !== DEFAULT_BLEND) {
+    row.blend = blend;
+  }
+
+  // Two scalars, and only when there is a grade at all. The table itself is
+  // emphatically not reported: a 17³ LUT is 4,913 nodes, and an agent listing
+  // fifty clips would blow the 25k output cap on data it cannot use anyway —
+  // it addresses a filter by id, exactly as it addresses a preset.
+  const lut = lutOf(element);
+  if (lut != null) {
+    row.lut = lut.presetId;
+    if (lut.intensity !== DEFAULT_LUT_INTENSITY) {
+      row.lutIntensity = lut.intensity;
+    }
+  }
+
+  // Only the sliders that are moved, and only when any are. At most fifteen
+  // scalars, so the cap is not at stake — but a list where every clip
+  // announced fifteen zeros would bury the one clip that was actually graded.
+  const adjust = adjustOf(element);
+  if (adjust != null) {
+    row.adjust = adjust;
+  }
+
+  // The shape name alone, and only when there is a mask. A masked clip is
+  // unusual enough to be worth a word in a list — it explains why a clip an
+  // agent can see in the document is not all there in the picture — and the
+  // shape is the only part of it that reads at a glance. The placement is in
+  // the detail view; the drawn path is in neither, for the reason the LUT table
+  // is in neither.
+  const mask = maskOf(element);
+  if (mask != null) {
+    row.mask = mask.shape;
+  }
+
+  // Whether the clip's lettering is revealed a piece at a time, in a word. Like
+  // the mask's shape it explains a clip that is in the document but not all
+  // there in the picture — which for a reveal is the *usual* state at any given
+  // frame, and would otherwise read as a broken font or a bad trim.
+  const reveal = revealOf(element);
+  if (reveal != null) {
+    row.reveal = reveal.unit;
+  }
+
+  // Both only when set, like `blend`. A mirrored or reversed clip explains a
+  // picture that does not match its source file at a glance, and is otherwise
+  // indistinguishable in a list. `reversed` is a flag only: the forward source
+  // it remembers is a path the agent has no use for and would pay for in
+  // output tokens on every row.
+  const mirror = mirrorOf(element);
+  if (mirror.h || mirror.v) {
+    row.mirror = `${mirror.h ? "h" : ""}${mirror.v ? "v" : ""}`;
+  }
+  if (isReversed(element)) {
+    row.reversed = true;
+  }
+
+  // Only when the clip is actually cropped, for `mirror`'s reason: a reframed
+  // clip explains a picture that does not match its source at a glance, and
+  // four numbers on every row of a long list would not pay for themselves.
+  // Rounded to whole percentages: the agent is choosing which clip to look at,
+  // not reproducing the framing.
+  const crop = cropOf(element);
+  if (isCropped(crop)) {
+    const percent = (value: number) => Math.round(value * 100);
+    row.crop =
+      `${percent(crop.x)},${percent(crop.y)} ` +
+      `${percent(crop.width)}x${percent(crop.height)}%`;
+  }
+
+  // Only when rounded, for `mirror`'s reason, and not while the panel's eye
+  // has the corners off, since the row describes what is on screen. The
+  // static field: a keyed radius is in the detail view's animation block.
+  const cornerRadius = cornerRadiusOf(element);
+  if (cornerRadius > 0 && !cornerRadiusOffOf(element)) {
+    row.cornerRadius = cornerRadius;
+  }
+
+  switch (element.filetype) {
+    case "text": {
+      row.text = truncate(element.text, TEXT_PREVIEW_CHARS);
+      row.fontsize = element.fontsize;
+      row.color = element.textcolor;
+      break;
+    }
+    // A transition and an effect have no appearance of their own to describe —
+    // they are operations on frames other clips drew. The preset is the whole
+    // identity, and a transition's is only meaningful alongside the two clips
+    // it mixes. Before this they came back as `{type, start, dur, end}` and
+    // nothing else, which reads as a clip with no content rather than as a
+    // cross-dissolve. `get_fx` has the parameters.
+    case "transition": {
+      row.presetId = (element as any).presetId;
+      row.fromId = (element as any).fromId;
+      row.toId = (element as any).toId;
+      const program = programRow((element as any).program);
+      if (program != null) {
+        row.program = program;
+      }
+      break;
+    }
+    case "effect": {
+      row.presetId = (element as any).presetId;
+      row.intensity = (element as any).intensity;
+      const program = programRow((element as any).program);
+      if (program != null) {
+        row.program = program;
+      }
+      break;
+    }
+    case "video": {
+      const filters = element.filter?.enable
+        ? (element.filter.list ?? []).map((f) => f.name)
+        : [];
+      if (filters.length > 0) {
+        row.filters = filters;
+      }
+      break;
+    }
+    case "image":
+    case "gif": {
+      row.src = basename(element.localpath);
+      break;
+    }
+    case "shape": {
+      row.fillColor = element.option?.fillColor;
+      // Both only when they say something, so a row for a plain shape is the
+      // row it always was.
+      const fillOpacity = fillOpacityOf(element);
+      if (fillOpacity !== OPAQUE_FILL) {
+        row.fillOpacity = fillOpacity;
+      }
+      const backdrop = backdropRow(element);
+      if (backdrop != null) {
+        row.backdrop = backdrop;
+      }
+      break;
+    }
+    case "group": {
+      row.name = element.name;
+      // A stabilize rig's groups look like two empty nulls otherwise, and an
+      // agent tidying up would delete them. Deleting or ungrouping one is
+      // fine (it dissolves the rig exactly); it should know that is what it is
+      // doing.
+      if (element.rig != null) {
+        row.rig = element.rig;
+      }
+      break;
+    }
+    // The template's identity and how much of it is still empty — and
+    // emphatically **not** its document. A composed template is a whole second
+    // timeline with baked animation lanes in it, so reporting one would blow
+    // the 25k output cap on a single clip, the same reason a LUT's 4,913 nodes
+    // are reported as a preset id. The slots are `<option-template>`'s
+    // business; an agent addresses a template as one clip, which is what it is.
+    // A graphic's name, its preset, and its program as facts: the source can
+    // run to a megabyte, and `get_program` pages through it on request.
+    case "graphic": {
+      row.name = (element as any).name;
+      row.presetId = (element as any).presetId;
+      const program = programRow((element as any).program);
+      if (program != null) {
+        row.program = program;
+      }
+      break;
+    }
+    case "template": {
+      row.name = (element as any).name;
+      row.templateId = (element as any).templateId;
+      const fills = (element as any).fills;
+      const filled =
+        fills != null && typeof fills === "object"
+          ? Object.keys(fills).length
+          : 0;
+      if (filled > 0) {
+        row.filledSlots = filled;
+      }
+      break;
+    }
+    default:
+      break;
+  }
+
+  const animated = animatedProperties(element);
+  if (animated.length > 0) {
+    row.animated = animated;
+  }
+
+  return row;
+}
+
+/** Which properties actually have an active keyframe track. */
+function animatedProperties(element: TimelineElement): AnimatableProperty[] {
+  if (!canAnimate(element)) {
+    return [];
+  }
+  const animation = (element as any).animation;
+  if (animation == null) {
+    return [];
+  }
+  return animatableProperties(element).filter(
+    (property) => animation[property]?.isActivate === true,
+  );
+}
+
+/**
+ * A single clip in full — minus the parts that cannot be sent.
+ *
+ * `animation` becomes a shape summary: which lanes are live, how many
+ * keyframes, and at what times. That is enough for an agent to decide whether
+ * to touch the animation without shipping 36,000 baked samples to find out.
+ */
+export function clipDetail(
+  id: string,
+  element: TimelineElement,
+  trackName?: string,
+  /**
+   * The extension asking, if one is.
+   *
+   * Its own key from `element.ext` is added, and only its own. Claude Code
+   * never passes this, so extension data stays out of the agent's view
+   * entirely: it is somebody else's bookkeeping, it is not in
+   * `commands/writable.ts`, and it would only spend context.
+   */
+  options: { extOwner?: string } = {},
+): Record<string, unknown> {
+  const detail: Record<string, unknown> = {
+    ...clipRow(id, element, trackName),
+    localpath: element.localpath,
+    priority: element.priority,
+  };
+
+  if (options.extOwner != null) {
+    const stored = (element as { ext?: Record<string, unknown> }).ext;
+    if (stored != null && Object.prototype.hasOwnProperty.call(stored, options.extOwner)) {
+      detail.ext = stored[options.extOwner];
+    }
+  }
+
+  if (element.filetype === "graphic") {
+    // The values, with text ones cut short: a `text` parameter may hold a
+    // paragraph. The clock is reported only when a cut moved it.
+    const params: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(element.params ?? {})) {
+      params[key] = typeof value === "string" ? truncate(value, TEXT_PREVIEW_CHARS) : value;
+    }
+    detail.params = params;
+    if (element.clockHead != null) {
+      detail.clockHeadMs = element.clockHead;
+    }
+    if (element.clockTail != null) {
+      detail.clockTailMs = element.clockTail;
+    }
+  }
+
+  if (element.filetype === "text") {
+    detail.text = element.text;
+    detail.fontname = element.fontname;
+    detail.fontweight = element.fontweight;
+    detail.letterSpacing = element.letterSpacing;
+    detail.align = element.options?.align;
+    detail.isBold = element.options?.isBold;
+    detail.isItalic = element.options?.isItalic;
+    detail.outline = element.options?.outline;
+    detail.background = element.background;
+    // The effect blocks are reported through the resolver rather than raw, so
+    // the agent sees the same defaults the renderer will use instead of a
+    // string of `undefined`s on any clip predating text effects. Every field
+    // is a scalar, so this cannot threaten the tool-output size cap.
+    const style = resolveTextStyle(element);
+    detail.shadow = style.shadow;
+    detail.glow = style.glow;
+    detail.fill = style.fill;
+    detail.textOpacity = style.textOpacity;
+    detail.textTransform = style.textTransform;
+    // The count stays exact whatever the list does, so a truncation is visible
+    // rather than silent — the rule the keyframe lanes above follow.
+    const runs = runsOf(element);
+    detail.runCount = runs.length;
+    if (runs.length > 0) {
+      detail.runs = runs.slice(0, MAX_TEXT_RUNS).map((run) => ({
+        from: run.from,
+        to: run.to,
+        // The stretch itself, so the agent can name it back through
+        // `set_text_range_style`'s `match` without counting UTF-16 offsets.
+        text: (element.text ?? "").slice(run.from, run.to),
+        style: run.style,
+      }));
+      if (runs.length > MAX_TEXT_RUNS) {
+        detail.runsTruncated = true;
+      }
+    }
+  }
+
+  if (element.filetype !== "audio") {
+    detail.location = {
+      x: ms((element as any).location?.x ?? 0),
+      y: ms((element as any).location?.y ?? 0),
+    };
+    detail.width = (element as any).width;
+    detail.height = (element as any).height;
+    detail.opacity = (element as any).opacity;
+    detail.rotation = (element as any).rotation;
+  }
+
+  // Unlike `clipRow`, reported whatever its value — and through the resolver,
+  // so a clip written before the field existed reports its effective
+  // "source-over" rather than nothing at all. `clipRow` reports it only when
+  // set, which leaves an agent reading a detail view unable to tell "stacks
+  // normally" from "this kind of clip has no blend mode". The guard answers
+  // that second case: audio and groups paint no layer, so for them the field is
+  // absent rather than "source-over".
+  if (isBlendable(element)) {
+    detail.blend = blendOf(element);
+  }
+
+  // Whatever their value on the types that can carry them, absent on the rest
+  // — the distinction `blend` makes just above.
+  if (isMirrorable(element)) {
+    const mirror = mirrorOf(element);
+    detail.flipH = mirror.h;
+    detail.flipV = mirror.v;
+  }
+
+  // Whatever its value on the types that can carry one, so an agent can tell
+  // "this clip shows its whole frame" from "this clip cannot be cropped".
+  // Fractions of the source frame, which is the unit the field stores and the
+  // one any future `set_crop` would take.
+  if (isCroppable(element)) {
+    const crop = cropOf(element);
+    detail.crop = {
+      x: crop.x,
+      y: crop.y,
+      width: crop.width,
+      height: crop.height,
+    };
+  }
+
+  // Whatever its value on the types that can carry one, for `crop`'s reason:
+  // 0 is "square", absent is "this kind of clip has no corners to round". In
+  // clip pixels, the unit `update_clip` takes.
+  if (isRoundable(element)) {
+    detail.cornerRadius = cornerRadiusOf(element);
+    // Only while it is set: a stored radius that draws nothing needs saying,
+    // or an agent reads 24 off a clip that shows square corners.
+    if (cornerRadiusOffOf(element)) {
+      detail.cornerRadiusOff = true;
+    }
+  }
+
+  // Reported whatever its value on the types that can carry one, and absent on
+  // the types that cannot — the same distinction `blend` makes just above, and
+  // for the same reason: an agent reading a detail view must be able to tell
+  // "ungraded" from "this kind of clip has no filter".
+  if (isGradable(element)) {
+    const lut = lutOf(element);
+    detail.lut = lut == null ? null : lut.presetId;
+    detail.lutIntensity = lut == null ? null : lut.intensity;
+  }
+
+  // `{}` rather than absent on a clip that could carry adjustments and has
+  // none, so "unadjusted" reads differently from "this kind of clip has no
+  // colour controls" — the distinction `lut` makes just above.
+  if (isAdjustable(element)) {
+    detail.adjust = adjustOf(element) ?? {};
+  }
+
+  // Reported whatever its value on the types that can carry one, and absent on
+  // the types that cannot — the same distinction `blend` and `lut` make above.
+  //
+  // The drawn path is **never** sent, and `serialize.test.ts` pins its absence
+  // for the same reason it pins `shape`'s point list: it is unbounded authored
+  // data an agent cannot act on, and `set_mask` deliberately cannot supply one.
+  // Its node count is reported instead, which is the one fact about it that
+  // changes what an agent should do — a `pen` mask with fewer than three nodes
+  // renders as no mask at all.
+  if (isMaskable(element)) {
+    const detailMask = maskOf(element);
+    if (detailMask == null) {
+      detail.mask = null;
+    } else {
+      detail.mask = {
+        shape: detailMask.shape,
+        x: detailMask.location.x,
+        y: detailMask.location.y,
+        width: detailMask.size.width,
+        height: detailMask.size.height,
+        rotation: detailMask.rotation,
+        feather: detailMask.feather,
+        roundness: detailMask.roundness,
+        invert: detailMask.invert === true,
+        ...(detailMask.shape === "pen"
+          ? { pathNodeCount: detailMask.path?.length ?? 0 }
+          : {}),
+      };
+    }
+  }
+
+  // Reported whatever its value on text, and absent on every other type — the
+  // same distinction `blend`, `lut` and `mask` make above.
+  //
+  // The static `progress` is what is sent, not the value at the playhead: a
+  // reveal that is keyframed is *supposed* to differ from it at every frame,
+  // and reporting a sampled number would read as a setting an agent could
+  // write. `get_keyframes` is where the curve lives.
+  if (isRevealable(element)) {
+    const detailReveal = revealOf(element);
+    detail.reveal =
+      detailReveal == null
+        ? null
+        : {
+            unit: detailReveal.unit,
+            progress: detailReveal.progress,
+            fade: detailReveal.fade ?? 0,
+            // Named explicitly, like the three above, and that is the trap
+            // this line exists to close: a field added to `TextReveal` and not
+            // to this projection is stored correctly and reported as absent,
+            // so an agent that sets a movement reads back a reveal that says
+            // it has none. `timeline/textRevealOps.ts#copyReveal` had the same
+            // shape and the same bug.
+            ...(detailReveal.animate == null
+              ? {}
+              : { animate: detailReveal.animate }),
+          };
+  }
+
+  if (element.filetype === "shape") {
+    detail.fillColor = element.option?.fillColor;
+    detail.fillOpacity = fillOpacityOf(element);
+    detail.backdrop = backdropRow(element);
+    detail.oWidth = element.oWidth;
+    detail.oHeight = element.oHeight;
+    // The point list itself is never sent — `previewCanvas.addShapePoint` grows
+    // it without bound, and `serialize.test.ts` pins its absence.
+    detail.shapePointCount = Array.isArray(element.shape) ? element.shape.length : 0;
+    // The recipe is sent whole, unlike the point list, because it is six fields
+    // with a fixed ceiling rather than something that grows with the clicking.
+    // Absent means the shape was drawn by hand, which is what `set_shape`
+    // refuses without a `kind`.
+    const geometry = shapeGeometryOf(element);
+    if (geometry != null) {
+      detail.geometry = geometry;
+    }
+  }
+
+  if (element.filetype === "group") {
+    detail.name = element.name;
+    if (element.rig != null) {
+      detail.rig = element.rig;
+    }
+  }
+
+  if (element.filetype === "audio") {
+    // `clipRow` reports speed only when it is not 1, so an agent reading a
+    // detail view cannot tell "normal speed" from "not applicable".
+    detail.speed = speedOf(element);
+    describeSpeedRamp(element, detail);
+    // Through the resolver, so a clip from a project written before the field
+    // existed reports its effective 0 dB rather than nothing at all.
+    detail.volumeDb = volumeDbOf(element);
+  }
+
+  if (element.filetype === "video") {
+    // Structured, not the raw `k=v:k=v` strings: an agent that has to parse
+    // "r=0:g=255:b=0:f=0.4" to change the threshold will re-emit it wrong.
+    detail.filters = (element.filter?.list ?? []).map(describeFilter);
+    detail.filtersEnabled = element.filter?.enable === true;
+    detail.speed = speedOf(element);
+    describeSpeedRamp(element, detail);
+    detail.codec = element.codec;
+    // What the clip *sounds like now*, not what its file holds: a detached
+    // clip is silent here, and its sound is reported by the audio element that
+    // took it. Reporting the raw `isExistAudio` would have the agent counting
+    // the same audio twice.
+    detail.hasAudio = isAudibleElement(element);
+    detail.volumeDb = volumeDbOf(element);
+    if (element.audioDetached === true) {
+      detail.audioDetached = true;
+    }
+    detail.origin = element.origin;
+    detail.reversed = isReversed(element);
+  }
+
+  // Driven properties, before the animation block, because a link overrides
+  // whatever that block says and a reader that saw the keyframes first would
+  // draw the wrong conclusion from them.
+  const linked = linkedPropertiesOf(element);
+  if (linked.length > 0) {
+    detail.links = linked.map((property) => {
+      const link = linkOf(element, property)!;
+      return {
+        property,
+        from: link.from,
+        in: link.in,
+        out: link.out,
+        ...(link.easing == null ? {} : { easing: link.easing }),
+        ...(link.extend == null ? {} : { extend: link.extend }),
+        ...(link.offset == null ? {} : { offset: link.offset }),
+      };
+    });
+  }
+
+  const animation = (element as any).animation;
+  if (canAnimate(element) && animation != null) {
+    // Keyframes are *stored* relative to the clip's start and every time in
+    // this surface is absolute, so they are rebased here — the same conversion
+    // `get_keyframes` does. They were reported raw, which meant `get_clip` and
+    // `get_keyframes` answered different numbers for the same keyframe on any
+    // clip that did not start at zero, and the one that looked right was
+    // whichever the reader happened to check first.
+    const start = spanStart(element);
+    detail.animation = animatableProperties(element).map((property) => {
+      const track = animation[property] ?? {};
+      const lanes: Record<string, unknown> = {};
+      for (const lane of ["x", "y"] as const) {
+        const list = track[lane];
+        if (!Array.isArray(list)) {
+          continue;
+        }
+        // `count` stays exact while `times` is capped: a truncated list that
+        // did not say so would read as "that is every keyframe", and an agent
+        // editing around the ones it cannot see is the same failure
+        // `paginate`'s `truncated` flag exists to prevent.
+        lanes[lane] = {
+          count: list.length,
+          times: list
+            .slice(0, MAX_KEYFRAME_TIMES)
+            .map((keyframe: any) => ms(start + (keyframe?.p?.[0] ?? 0))),
+          ...(list.length > MAX_KEYFRAME_TIMES
+            ? { truncated: true, note: "Use get_keyframes to page through them." }
+            : {}),
+        };
+      }
+      return {
+        property,
+        active: track.isActivate === true,
+        lanes,
+        // A driven property's keyframes are kept and do not drive it, so a
+        // row that said only `active: true` would be reporting the field
+        // rather than the picture.
+        ...(linked.includes(property as any) ? { drivenByLink: true } : {}),
+      };
+    });
+  }
+
+  return detail;
+}
+
+export function trackRow(
+  track: TimelineTrack,
+  clipCount: number,
+): Record<string, unknown> {
+  return {
+    id: track.id,
+    name: track.name,
+    kind: track.kind,
+    index: track.index,
+    clips: clipCount,
+    // Only when set, so every row nobody hid reads exactly as it did. Said at
+    // all because a hidden row's clips are missing from the contact sheet and
+    // the render, and a model that cannot see why would try to repair it.
+    ...(isTrackHidden(track) ? { hidden: true } : {}),
+  };
+}
+
+/** Total timeline length: the furthest clip end, in ms. */
+export function documentDuration(doc: TimelineDocument): number {
+  let end = 0;
+  for (const element of Object.values(doc.elements)) {
+    end = Math.max(end, spanEnd(element));
+  }
+  return ms(end);
+}
+
+export type Page<T> = {
+  items: T[];
+  total: number;
+  offset: number;
+  truncated: boolean;
+};
+
+/**
+ * Slice a list and say so when something was left out.
+ *
+ * A silently truncated list reads as "that is everything", and an agent that
+ * believes it has seen every clip will confidently edit around the ones it
+ * cannot see. `truncated` plus `total` is what lets it page instead.
+ */
+export function paginate<T>(items: T[], offset: number, limit: number): Page<T> {
+  const start = Math.max(0, Math.floor(offset));
+  const slice = items.slice(start, start + Math.max(0, Math.floor(limit)));
+  return {
+    items: slice,
+    total: items.length,
+    offset: start,
+    truncated: start + slice.length < items.length,
+  };
+}
+
+/**
+ * Say that a clip carries a speed ramp, and what its extremes are.
+ *
+ * The **shape** and not the points. Two reasons, and the first is the rule this
+ * file exists to enforce: a curve can hold sixty-four points and tool output is
+ * capped, so a project of ramped clips would spend its whole budget on numbers
+ * an agent cannot author anyway. The second is that `set_clip_speed` *flattens*
+ * a ramp, so what an agent needs is to know one is there before it destroys it.
+ *
+ * Detail view only. `clipRow` already reports `speed`, which on a ramped clip
+ * is the mean, and that is the right amount for a listing.
+ */
+function describeSpeedRamp(element: any, detail: Record<string, unknown>): void {
+  const curve = speedCurveOf(element);
+  if (curve == null) {
+    return;
+  }
+  const rates = curve.points.map((point) => point.v);
+  detail.speedRamp = {
+    points: curve.points.length,
+    min: Math.round(Math.min(...rates) * 100) / 100,
+    max: Math.round(Math.max(...rates) * 100) / 100,
+    note: "speed is the ramp's average; set_clip_speed replaces the ramp with one rate",
+  };
+}

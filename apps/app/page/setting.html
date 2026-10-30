@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="ko" class="h-100">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, shrink-to-fit=no"
+    />
+
+    <title>CartCut Setting</title>
+
+    <!-- CSS Dependencies — all local, so this window opens offline. The fonts
+         ride in on ../dist/style.css, which declares them; see
+         ../src/sass/style.scss and ../vendor/README.md. -->
+
+    <link rel="stylesheet" href="../vendor/bootstrap.min.css" />
+    <link rel="stylesheet" href="../vendor/noto-sans-kr.css" />
+    <link rel="stylesheet" href="../vendor/devent-designsystem.css" />
+
+    <link rel="stylesheet" href="../dist/style.css" />
+
+    <style>
+      .bg-black {
+        background-color: #090a0a;
+      }
+
+      .btn.active {
+        background-color: #15171a;
+      }
+
+      .tab-content {
+        border-radius: 1rem;
+        padding: 1rem;
+        background-color: #15171a;
+      }
+
+      .top-bar {
+        height: 34px;
+        background-color: #0f1012;
+        border-bottom: 0.05rem #222426 solid;
+        -webkit-app-region: drag;
+        display: flex;
+        color: #6c757d;
+        font-size: 12px;
+        font-weight: 700;
+        justify-content: center;
+        align-items: center;
+      }
+
+      body {
+        padding: 0;
+      }
+    </style>
+  </head>
+
+  <body class="h-100 bg-black">
+    <div class="top-bar">
+      <b>CartCut Setting</b>
+    </div>
+
+    <div class="container p-4">
+      <div class="row">
+        <div class="col-12 d-flex align-items-start">
+          <div
+            class="nav flex-column nav-pills me-3"
+            id="v-pills-tab"
+            role="tablist"
+            aria-orientation="vertical"
+          >
+            <button
+              class="btn text-light active"
+              id="v-pills-home-tab"
+              data-bs-toggle="pill"
+              data-bs-target="#v-pills-home"
+              type="button"
+              role="tab"
+              aria-controls="v-pills-home"
+              aria-selected="true"
+            >
+              Home
+            </button>
+            <button
+              class="btn text-light"
+              id="v-pills-profile-tab"
+              data-bs-toggle="pill"
+              data-bs-target="#v-pills-profile"
+              type="button"
+              role="tab"
+              aria-controls="v-pills-profile"
+              aria-selected="false"
+            >
+              Profile
+            </button>
+          </div>
+
+          <div class="tab-content w-100" id="v-pills-tabContent">
+            <div
+              class="tab-pane fade show active"
+              id="v-pills-home"
+              role="tabpanel"
+              aria-labelledby="v-pills-home-tab"
+            >
+              <p class="text-secondary">ffmpeg 재설치</p>
+              <button
+                class="btn btn-secondary text-light"
+                onclick="window.electronAPI.req.ffmpeg.installFFmpeg()"
+              >
+                Reinstall FFmpeg
+              </button>
+            </div>
+            <div
+              class="tab-pane fade"
+              id="v-pills-profile"
+              role="tabpanel"
+              aria-labelledby="v-pills-profile-tab"
+            >
+              <p class="text-secondary">사용자 로그아웃.</p>
+
+              <button class="btn btn-danger text-light" onclick="logout()">
+                Logout
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div
+      class="toast-container position-fixed bottom-0 start-50 translate-middle"
+      style="z-index: 9000"
+    >
+      <div
+        class="toast fade hide"
+        id="logout"
+        role="alert"
+        data-bs-animation="true"
+        data-bs-autohide="true"
+        data-bs-delay="4000"
+        aria-live="assertive"
+        aria-atomic="true"
+        style="background-color: rgba(37, 38, 43, 0.73)"
+      >
+        <div class="toast-body">
+          <div class="text-center text-light">
+            로그아웃 되었어요. 앱을 다시 실행해주세요.
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Before the bundle and before the inline script below, which reaches for
+         `bootstrap.Toast` as soon as it runs. -->
+    <script src="../vendor/bootstrap.bundle.min.js"></script>
+    <script src="../vendor/devent-designsystem.js"></script>
+
+    <script src="../dist/index.js"></script>
+
+    <script>
+      const logout = () => {
+        window.electronAPI.req.store.delete("token");
+        const logoutToast = bootstrap.Toast.getInstance(
+          document.getElementById("logout"),
+        );
+        logoutToast.show();
+      };
+
+      const initToast = () => {
+        var toastElList = [].slice.call(document.querySelectorAll(".toast"));
+        var toastList = toastElList.map(function (toastEl) {
+          return new bootstrap.Toast(toastEl);
+        });
+      };
+
+      initToast();
+    </script>
+  </body>
+</html>

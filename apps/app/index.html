@@ -1,0 +1,44 @@
+
+
+<!DOCTYPE html>
+<html lang="ko" class="h-100 bg-darker">
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+        <title>나래 무비메이커</title>
+
+
+        <!-- Everything this page loads is on disk: the editor has to open with
+             the machine offline. These are the same files, in the same order,
+             that used to come from jsDelivr and Google Fonts — the order is the
+             cascade, so keep Bootstrap first, the design system after it, and
+             the app's own stylesheet last. Material Symbols is declared in
+             src/sass/style.scss, so webpack emits it next to dist/style.css.
+             See vendor/README.md. Do not reintroduce a CDN here. -->
+        <link rel="stylesheet" href="vendor/bootstrap.min.css">
+        <link rel="stylesheet" href="vendor/noto-sans-kr.css">
+        <link rel="stylesheet" href="vendor/devent-designsystem.css">
+
+        <link rel="stylesheet" href="dist/style.css">
+    </head>
+        <app-root></app-root>
+
+        <!-- The `bundle` build, so Popper comes with it — the editor has two
+             `data-bs-toggle="dropdown"` menus, both in the preview's top bar.
+             The font picker used to be a third; it places itself against the
+             viewport now (features/menu/menuPlacement.ts) because Popper
+             cannot lift a menu out of the option column's own scrollbox.
+
+             It stays a separate <script> rather than an import in the bundle
+             so that `window.bootstrap` cannot be taken down by an error while
+             the bundle evaluates; the E2E harness waits on the two
+             independently. -->
+        <script src="vendor/bootstrap.bundle.min.js"></script>
+        <script src="vendor/devent-designsystem.js"></script>
+
+        <script src="dist/index.js"></script>
+
+
+    </body>
+</html>
+
