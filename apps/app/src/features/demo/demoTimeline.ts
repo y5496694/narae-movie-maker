@@ -29,6 +29,7 @@ export class DemoTimeline extends LitElement {
   }
 
   firstUpdated() {
+    if (new URLSearchParams(location.search).has("naraeTube")) return;
     const env = getLocationEnv();
     // A link naming an example template opens that instead of the preset, in
     // either browser build: `/?template=<slug>`.

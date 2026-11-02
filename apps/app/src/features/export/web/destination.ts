@@ -219,6 +219,16 @@ function memoryDestination(host: DestinationHost, request: SaveRequest): ExportD
 
 /** The real browser, for the app. */
 export function browserDestinationHost(): DestinationHost {
+  const studio = (window as any).naraeTubeDeliverOutput;
+  if (typeof studio === "function") {
+    return {
+      privateRoot: async () => {
+        const storage = navigator.storage as any;
+        return typeof storage?.getDirectory === "function" ? storage.getDirectory() : null;
+      },
+      download: studio,
+    };
+  }
   const picker = (window as any).showSaveFilePicker;
   return {
     ...(typeof picker === "function"

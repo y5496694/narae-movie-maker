@@ -33,5 +33,6 @@ export function locationEnvOf(location: {
 }
 
 export function getLocationEnv(): LocationEnv {
+  if (new URLSearchParams(window.location.search).has("naraeTube")) return "demo";
   return locationEnvOf(window.location);
 }

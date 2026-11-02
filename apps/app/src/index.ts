@@ -33,6 +33,9 @@ import { mediaUrlFor } from "./functions/mediaUrl";
 
 enableIpcWrapper();
 
+import { installNaraeTubeStudio } from "./features/naraeTubeStudio";
+queueMicrotask(() => installNaraeTubeStudio());
+
 // The browser builds only: the fonts installed on this computer, listed without
 // asking when the browser already holds the permission. The desktop app lists
 // them from main.

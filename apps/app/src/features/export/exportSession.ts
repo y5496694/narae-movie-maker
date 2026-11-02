@@ -303,6 +303,7 @@ async function startWebExport(): Promise<void> {
 
   // Only the container is read from this plan, to name the file before the
   // snapshot; the session builds the real one from the snapshot.
+  exportOutcome = null;
   const live = renderOptionStore.getState().options;
   const plan = encodePlanFor(live.exportSettings, {
     width: live.previewSize.w,
