@@ -6,6 +6,7 @@ import { ensurePresetsLoaded } from './fx/presetRegistry';
 import { useTimelineStore } from '../states/timelineStore';
 import { renderOptionStore } from '../states/renderOptionStore';
 import { registerPickedFile, registeredMedia } from './asset/webMedia/mediaRegistry';
+import { studioSourcePath } from './studioAISources';
 
 // Browser AI only receives editing operations, never native calls or executable programs.
 const allowed = new Set(['get_project_overview','list_clips','get_clip','add_text','add_subtitles','update_clip','split_clip','trim_clip','move_clips','delete_clips','duplicate_clips','set_clip_speed','add_track','move_track','set_track_hidden','add_shape','set_crop','set_mirror','rotate_clips','set_color_adjustments','set_clip_decoration','apply_animation_preset','set_animation','add_keyframes','remove_keyframes','configure_project','undo','redo']);
@@ -38,6 +39,16 @@ export function createStudioTools(){
     if(bytes.byteLength>512*1024*1024||!Number.isFinite(startMs)||startMs<0)throw Error('INVALID_MEDIA');
     const path=registerPickedFile(new File([bytes],name,{type}));
     const result:any=await getCommand('add_media')!({items:[{path,startMs,...(durationMs!=null?{durationMs}:{})}],sequential:false});
+    if(result?.ok===false||result?.skipped?.length)throw Error('MEDIA_IMPORT_FAILED');
+    return {revision,result,path};
+   });
+  },
+  async placeMedia(sourceId:string,startMs=0,durationMs=3000,expectedRevision?:number){
+   return queue(async()=>{
+    if(expectedRevision!=null&&expectedRevision!==revision)throw Error('EDITOR_CHANGED');
+    if(!Number.isFinite(startMs)||startMs<0||!Number.isFinite(durationMs)||durationMs<100)throw Error('INVALID_MEDIA');
+    const path=studioSourcePath(sourceId);
+    const result:any=await getCommand('add_media')!({items:[{path,startMs,durationMs}],sequential:false});
     if(result?.ok===false||result?.skipped?.length)throw Error('MEDIA_IMPORT_FAILED');
     return {revision,result,path};
    });

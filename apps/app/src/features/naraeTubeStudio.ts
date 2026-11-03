@@ -1,5 +1,6 @@
 import JSZip from "jszip";
 import { createStudioTools } from "./studioTools";
+import { studioAISources } from "./studioAISources";
 import project from "../functions/project";
 import { useTimelineStore } from "../states/timelineStore";
 import { renderOptionStore } from "../states/renderOptionStore";
@@ -53,6 +54,7 @@ export function installNaraeTubeStudio() {
     engine: "나래 무비메이커 웹 엔진",
     status: () => ({ ...exportStore.getState(), rendering, outcome: getExportOutcome() }),
     snapshot: () => projectSnapshot(),
+    aiSources: () => studioAISources(),
     output: () => delivered,
     cancel: () => cancelExport(),
     async render() {
