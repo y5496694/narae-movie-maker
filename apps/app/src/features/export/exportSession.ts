@@ -260,7 +260,8 @@ export function finishExport(destination: string, settings: unknown): void {
         ? ""
         : `Saved as ${destination}`;
   }
-  rendererModal.progressFinish.show();
+  // Studio owns the preview/download status; output is not a desktop file yet.
+  if(typeof (window as any).naraeTubeDeliverOutput!=="function")rendererModal.progressFinish.show();
 
   if (destination !== "") {
     announceDidExport(destination, settings);

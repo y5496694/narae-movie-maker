@@ -1,4 +1,5 @@
 import JSZip from "jszip";
+import { createStudioTools } from "./studioTools";
 import project from "../functions/project";
 import { useTimelineStore } from "../states/timelineStore";
 import { renderOptionStore } from "../states/renderOptionStore";
@@ -12,7 +13,7 @@ import { compositionsExtraEntries } from "./project/compositionsFile";
 import { timelineViewExtraEntries } from "../states/trackHeightStore";
 import { extensionsExtraEntries } from "./extension/projectDataStore";
 import { markProjectSaved } from "./project/projectDirty";
-import { registerPickedFile, registeredMedia } from "./asset/webMedia/mediaRegistry";
+import { registerPickedFile, registeredMedia, registeredMediaPaths, forgetRegisteredMedia } from "./asset/webMedia/mediaRegistry";
 import { startExport, cancelExport, getExportOutcome } from "./export/exportSession";
 
 // Enabled only by the same-origin Narae Tube host. No identity token enters this frame.
@@ -47,6 +48,7 @@ export function installNaraeTubeStudio() {
     changed();
   });
   host.naraeTubeEditor = {
+    ...createStudioTools(),
     engine: "나래 무비메이커 웹 엔진",
     status: () => ({ ...exportStore.getState(), rendering, outcome: getExportOutcome() }),
     snapshot: () => projectSnapshot(),
@@ -63,7 +65,7 @@ export function installNaraeTubeStudio() {
         return delivered;
       } finally { rendering = false; }
     },
-    async archive(): Promise<Blob> {
+    async archive(metadata: unknown = {}): Promise<Blob> {
       const snap = projectSnapshot();
       const entries = serializeProjectEntries({ elements: snap.project.main.elements, tracks: snap.project.main.tracks, options: snap.options, anchor: "studio.nmm", compositionCount: Object.keys(snap.project.compositions).length });
       const blob = await buildNgtBlob(entries, { ...compositionsExtraEntries(snap.project.compositions, "studio.nmm"), ...timelineViewExtraEntries(snap.tracks), ...extensionsExtraEntries() });
@@ -77,6 +79,7 @@ export function installNaraeTubeStudio() {
         }
       };
       visit(snap.project);
+      for(const path of registeredMediaPaths())paths.add(path);
       const media: any[] = [];
       let total = blob.size;
       for (const localpath of paths) {
@@ -88,7 +91,7 @@ export function installNaraeTubeStudio() {
         zip.file(entry, item.file);
         media.push({ localpath, entry, name: item.name, type: item.file.type });
       }
-      zip.file("narae-studio.json", JSON.stringify({ version: 1, media }));
+      zip.file("narae-studio.json", JSON.stringify({ version: 1, media, metadata }));
       const result = await zip.generateAsync({ type: "blob", compression: "STORE" });
       if (result.size > maxBytes) throw new Error("프로젝트 보관 용량을 초과했습니다.");
       return result;
@@ -101,9 +104,14 @@ export function installNaraeTubeStudio() {
       if (allEntries.length > 1500 || allEntries.reduce((n, entry: any) => n + (entry._data?.uncompressedSize || 0), 0) > maxBytes) throw new Error("프로젝트 보관 용량을 초과했습니다.");
       const manifest = zip.file("narae-studio.json");
       const mapping = new Map<string, string>();
+      const previousPaths=registeredMediaPaths();
+      let adopted=false;
+      try {
+      let metadata: unknown = {};
       if (manifest) {
         const data = JSON.parse(await manifest.async("string"));
         if (data.version !== 1 || !Array.isArray(data.media) || data.media.length > 1000) throw new Error("프로젝트 형식을 확인해주세요.");
+        metadata = data.metadata ?? {};
         let total = 0;
         for (const item of data.media) {
           if (typeof item.entry !== "string" || !/^studio-media\/\d+$/.test(item.entry)) throw new Error("잘못된 미디어 항목입니다.");
@@ -128,10 +136,14 @@ export function installNaraeTubeStudio() {
       if (!read.ok) throw new Error(readProjectFailureMessage(read));
       if (read.missing) throw new Error("프로젝트 원본을 찾을 수 없습니다. 원본 포함 스튜디오 프로젝트를 선택해주세요.");
       project.adoptDocument(read, "studio.nmm", { compositions, timelineView: await extra("timelineView.json"), extensions: await extra("extensions.json") });
+      adopted=true;
+      forgetRegisteredMedia(previousPaths);
       clearTimeout(changeTimer);
       lastDocument = JSON.stringify(projectSnapshot());
       markProjectSaved();
       delivered = null;
+      return { metadata };
+      } finally {if(!adopted)forgetRegisteredMedia([...mapping.values()]);}
     },
   };
   // Desktop filesystem actions have explicit counterparts in the enclosing studio.

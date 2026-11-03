@@ -103,3 +103,11 @@ export function registeredMedia(localpath: string): RegisteredMedia | null {
 export function clearMediaRegistry(): void {
   byUrl.clear();
 }
+
+/** Studio archives preserve the resource bin, including unplaced imports. */
+export function registeredMediaPaths(): string[] {
+  return [...byUrl].map(([url,item])=>pickedMediaPath(url,item.name,item.file.type));
+}
+export function forgetRegisteredMedia(paths: string[]): void {
+  for(const path of paths){const key=objectUrlOf(path);if(key)byUrl.delete(key);}
+}
