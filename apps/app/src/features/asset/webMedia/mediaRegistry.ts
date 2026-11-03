@@ -27,6 +27,8 @@ export type RegisteredMedia = {
 };
 
 const byUrl = new Map<string, RegisteredMedia>();
+const importListeners=new Set<()=>void>();
+export function observeRegisteredImports(fn:()=>void):()=>void {importListeners.add(fn);return ()=>{importListeners.delete(fn);};}
 
 /** What everything downstream decides a file's kind from, `mediaElement.ts#mediaKindOf`. */
 const EXTENSION_FOR_TYPE: Record<string, string> = {
@@ -90,6 +92,7 @@ export function registerPickedFile(
 ): string {
   const url = createUrl(file);
   byUrl.set(url, { file, name: file.name, ...(handle != null ? { handle } : {}) });
+  for(const notify of importListeners)notify();
   return pickedMediaPath(url, file.name, file.type);
 }
 

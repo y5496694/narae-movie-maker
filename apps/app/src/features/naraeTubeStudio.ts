@@ -13,7 +13,7 @@ import { compositionsExtraEntries } from "./project/compositionsFile";
 import { timelineViewExtraEntries } from "../states/trackHeightStore";
 import { extensionsExtraEntries } from "./extension/projectDataStore";
 import { markProjectSaved } from "./project/projectDirty";
-import { registerPickedFile, registeredMedia, registeredMediaPaths, forgetRegisteredMedia } from "./asset/webMedia/mediaRegistry";
+import { registerPickedFile, registeredMedia, registeredMediaPaths, forgetRegisteredMedia, observeRegisteredImports } from "./asset/webMedia/mediaRegistry";
 import { startExport, cancelExport, getExportOutcome } from "./export/exportSession";
 
 // Enabled only by the same-origin Narae Tube host. No identity token enters this frame.
@@ -24,6 +24,7 @@ export function installNaraeTubeStudio() {
   let delivered: { blob: Blob; name: string } | null = null;
   let rendering = false;
   const maxBytes = 512 * 1024 * 1024;
+  observeRegisteredImports(()=>window.parent.dispatchEvent(new CustomEvent("narae-studio-change")));
   host.naraeTubeDeliverOutput = (blob: Blob, name: string) => {
     if (blob.size > maxBytes) throw new Error("완성 영상은 512MB 이하로 출력해주세요.");
     delivered = { blob, name };
